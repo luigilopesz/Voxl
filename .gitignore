@@ -1,0 +1,18 @@
+# Build output
+/build/
+/out/
+
+# FetchContent dependency cache
+/.deps/
+
+# Runtime artefacts
+*.log
+/saves/
+/screenshots/
+
+# Editor / IDE
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+compile_commands.json
