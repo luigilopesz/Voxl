@@ -32,6 +32,7 @@ target_sources(voxl_engine PRIVATE
     gameplay/Player.cpp
 
     mesh/GreedyMesher.cpp
+    mesh/SubVoxelMesher.cpp
 
     physics/Collision.cpp
     physics/Raycast.cpp
@@ -54,6 +55,7 @@ target_sources(voxl_engine PRIVATE
     world/Chunk.cpp
     world/ChunkManager.cpp
     world/ChunkStorage.cpp
+    world/SubVoxel.cpp
     world/TerrainGenerator.cpp
     world/World.cpp
 )

@@ -30,6 +30,8 @@
 #include "gameplay/Hotbar.hpp"
 #include "gameplay/Player.hpp"
 #include "mesh/GreedyMesher.hpp"
+#include "mesh/SubVoxelMesher.hpp"
+#include "physics/SubVoxelAccess.hpp"
 #include "platform/Input.hpp"
 #include "platform/Window.hpp"
 #include "render/Camera.hpp"
@@ -43,13 +45,63 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace voxl {
+
+/// Scripted startup state for the visual review harness (tools/visual_review.ps1,
+/// results in docs/VISUAL_REVIEW.md).
+///
+/// WHY THIS EXISTS. The two defects LOD and sub-voxel damage produce - a crack at
+/// a level boundary, and a carved surface shaded or textured unlike the blocks
+/// beside it - are only findable by comparing the SAME framing under different
+/// settings. A first-person camera driven by hand cannot reproduce a framing, so
+/// the reviewer would be comparing two different pictures. Every field is inert
+/// by default and reachable only from argv, so a normal run is unchanged.
+///
+/// Nothing here is a gameplay feature and none of it is persisted. Delete the
+/// whole struct, `Application::applyDebugStartup` and `updateDebugScript` when the
+/// LOD and sub-voxel work stops needing visual regression shots.
+struct DebugStartup {
+    /// Which carve pattern `updateDebugScript` cuts into the terrain once it has
+    /// streamed in. See the definition for the geometry of each.
+    enum class Carve : std::uint8_t { None, Crater, Tunnel, Both };
+
+    bool      hasPosition = false;
+    glm::vec3 position{0.0f};  ///< player feet, world space
+
+    bool  hasRotation  = false;
+    float yawDegrees   = 0.0f;
+    float pitchDegrees = 0.0f;
+
+    /// Suspends player physics. A camera parked in mid-air for a long LOD view
+    /// otherwise falls out of frame before the capture lands.
+    bool freezePlayer = false;
+
+    bool showOverlay = false;  ///< open the F3 panel at startup
+    bool hideHud     = false;  ///< hide the hotbar and crosshair for clean shots
+
+    bool         lodEnabled = true;
+    bool         hasBands   = false;
+    std::int32_t bandStart[kLodMax] = {5, 9, 14};
+
+    Carve     carve = Carve::None;
+    BlockPos  carveAnchor{0, 0, 0};
+    bool      hasCarveAnchor = false;
+
+    [[nodiscard]] bool any() const noexcept
+    {
+        return hasPosition || hasRotation || freezePlayer || showOverlay || hideHud ||
+               !lodEnabled || hasBands || carve != Carve::None;
+    }
+};
 
 struct ApplicationConfig {
     WindowConfig    window{};
     StreamingConfig streaming{};
     TerrainSettings terrain{};
+    DebugStartup    debug{};
 
     /// Upload budget per frame. Chunk meshes are uploaded from the job system's
     /// main-thread queue; without a cap, the burst that follows a teleport
@@ -114,6 +166,20 @@ private:
 
     void setCursorCaptured(bool captured);
 
+    /// F6: carves the sub-voxel under the crosshair. A debug affordance until a
+    /// real mining verb exists; see the definition.
+    void carveTargetSubVoxel();
+
+    /// Applies `ApplicationConfig::debug` to the player, the overlay and the LOD
+    /// policy. Called after spawnPlayer() and before warmUp(), so the world
+    /// streams around the scripted camera at the scripted levels rather than
+    /// around the spawn point.
+    void applyDebugStartup();
+
+    /// Feeds the scripted carve pattern to the world a batch at a time. No-op
+    /// unless `--carve` was given.
+    void updateDebugScript();
+
     [[nodiscard]] DebugOverlayFrame buildOverlayFrame(float cpuMs, float uploadMs) const;
 
     ApplicationConfig m_config;
@@ -130,6 +196,14 @@ private:
 
     Renderer m_renderer;
     World    m_world;
+
+    /// Sub-voxel occupancy reader handed to the collider each step.
+    ///
+    /// A member rather than a local because it owns a std::function, and building
+    /// one per fixed step would allocate inside the physics loop. Constructed
+    /// before the first update but only ever invoked afterwards, so the fact that
+    /// it captures `this` while the object is still being built is safe.
+    physics::ChunkSubVoxelAccess m_subVoxelAccess;
 
     Camera           m_camera;
     Player           m_player;
@@ -163,6 +237,23 @@ private:
     /// Simulation is held until the chunk under the player exists, otherwise the
     /// spawn falls through a world that has not streamed in yet.
     bool m_simulationStarted = false;
+
+    // ---- scripted visual review (see DebugStartup) ----
+
+    /// The scripted rig: blocks to place first, then sub-voxels to remove.
+    ///
+    /// Fed in batches, and the carve does not start until the build has fully
+    /// landed. Every edit that arrives while a neighbour is meshing goes into
+    /// World's bounded deferral queue, so issuing ten thousand in one frame would
+    /// overflow it and drop cells out of the middle of the shape - a hole that
+    /// looks exactly like a mesher bug, which is the last thing a defect hunt
+    /// needs.
+    std::vector<std::pair<BlockPos, BlockId>>       m_debugBuild;
+    std::vector<std::pair<BlockPos, std::uint16_t>> m_debugCarves;
+    std::size_t m_debugBuildCursor = 0;
+    std::size_t m_debugCarveCursor = 0;
+    bool        m_debugRigPlanned  = false;
+    bool        m_debugRigDone     = false;
 };
 
 }  // namespace voxl

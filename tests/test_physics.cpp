@@ -911,3 +911,263 @@ TEST_CASE("player crosshair pick", "[gameplay][player]")
     CHECK(hit.face == Direction::PosY);
     CHECK(hit.placement == BlockPos{hit.block.x, kFloorBlockY + 1, hit.block.z});
 }
+
+// ======================================================= sub-voxel physics ==
+//
+// The sub-voxel collision path had no coverage at all: `isSubVoxelBlocking`,
+// the damaged-block branch of `overlapsSolid` and the `nearestSubVoxelGap`
+// branch of `sweepAxisAgainstWorld` were reachable only from a live world. A
+// bug in any of them is a player who walks through a wall or is stopped by
+// empty air, and neither shows up in a screenshot - so they are driven here
+// directly, from a hand-authored occupancy grid.
+
+namespace {
+
+/// Hand-authored sub-voxel damage.
+///
+/// Obeying the world/SubVoxel.hpp invariant is the caller's job here exactly as
+/// it is in ChunkStorage: an entry must have 0 < popcount < 512 and a material
+/// equal to the parent block's id.
+class TestSubVoxels final : public physics::SubVoxelAccess {
+public:
+    /// Materialises a full grid on first touch, then clears one bit - the same
+    /// "damage starts from intact" order Chunk::breakSubVoxel uses.
+    void carve(const BlockPos& pos, BlockId material, std::int32_t sx, std::int32_t sy,
+               std::int32_t sz)
+    {
+        const auto it = m_grids.try_emplace(pos, SubVoxelGrid::solid(material)).first;
+        it->second.clear(subVoxelIndex(sx, sy, sz));
+    }
+
+    /// Carves an inclusive sub-voxel box out of one block.
+    void carveRange(const BlockPos& pos, BlockId material, std::int32_t x0, std::int32_t y0,
+                    std::int32_t z0, std::int32_t x1, std::int32_t y1, std::int32_t z1)
+    {
+        for (std::int32_t y = y0; y <= y1; ++y) {
+            for (std::int32_t z = z0; z <= z1; ++z) {
+                for (std::int32_t x = x0; x <= x1; ++x) {
+                    carve(pos, material, x, y, z);
+                }
+            }
+        }
+    }
+
+    [[nodiscard]] std::size_t remaining(const BlockPos& pos) const
+    {
+        const auto it = m_grids.find(pos);
+        return it == m_grids.end() ? kSubVoxelCount : it->second.count();
+    }
+
+    [[nodiscard]] const SubVoxelGrid* subVoxelsAt(const BlockPos& pos) const noexcept override
+    {
+        const auto it = m_grids.find(pos);
+        return it == m_grids.end() ? nullptr : &it->second;
+    }
+
+private:
+    std::unordered_map<BlockPos, SubVoxelGrid> m_grids;
+};
+
+}  // namespace
+
+TEST_CASE("an empty sub-voxel accessor is indistinguishable from none",
+          "[physics][subvoxel]")
+{
+    TestWorld world;
+    world.fill(-2, kFloorBlockY, -2, 2, kFloorBlockY, 2, blocks::Stone);
+
+    const physics::VoxelCollider plain{world, registry()};
+    TestSubVoxels                damage;
+    const physics::VoxelCollider aware{world, registry(), &damage};
+
+    const Box box     = playerBox(0.5f, kFloorTop, 0.5f);
+    const Box sunk    = box.translated(glm::vec3{0.0f, -0.5f, 0.0f});
+    const Box raised  = box.translated(glm::vec3{0.0f, 1.0f, 0.0f});
+
+    // The whole "untouched terrain pays nothing" claim rests on this.
+    CHECK(plain.isBlockWhole(BlockPos{0, kFloorBlockY, 0}));
+    CHECK(aware.isBlockWhole(BlockPos{0, kFloorBlockY, 0}));
+    CHECK(plain.overlapsSolid(sunk) == aware.overlapsSolid(sunk));
+    CHECK(physics::isSupported(plain, box) == physics::isSupported(aware, box));
+
+    const physics::AxisMove plainDrop =
+        physics::sweepAxisAgainstWorld(plain, raised, physics::kAxisY, -2.0f);
+    const physics::AxisMove awareDrop =
+        physics::sweepAxisAgainstWorld(aware, raised, physics::kAxisY, -2.0f);
+    CHECK(plainDrop.travelled == Approx(awareDrop.travelled));
+    CHECK(plainDrop.blocked == awareDrop.blocked);
+}
+
+TEST_CASE("isSubVoxelBlocking reads the grid and falls back to the block id",
+          "[physics][subvoxel]")
+{
+    TestWorld world;
+    world.set(0, kFloorBlockY, 0, blocks::Stone);
+    world.set(1, kFloorBlockY, 0, blocks::Stone);
+
+    TestSubVoxels damage;
+    damage.carve(BlockPos{0, kFloorBlockY, 0}, blocks::Stone, 3, 4, 5);
+    const physics::VoxelCollider collider{world, registry(), &damage};
+
+    const BlockPos damaged{0, kFloorBlockY, 0};
+    const BlockPos intact{1, kFloorBlockY, 0};
+
+    CHECK_FALSE(collider.isSubVoxelBlocking(damaged, 3, 4, 5));
+    CHECK(collider.isSubVoxelBlocking(damaged, 3, 4, 4));
+    CHECK_FALSE(collider.isBlockWhole(damaged));
+
+    // No entry means uniform: every sub-voxel of an intact solid block is solid.
+    CHECK(collider.isBlockWhole(intact));
+    CHECK(collider.isSubVoxelBlocking(intact, 0, 0, 0));
+    CHECK(collider.isSubVoxelBlocking(intact, 7, 7, 7));
+
+    // Air is never blocking, and out-of-range coordinates degrade to empty
+    // space rather than indexing past the grid.
+    CHECK_FALSE(collider.isSubVoxelBlocking(BlockPos{5, kFloorBlockY, 5}, 0, 0, 0));
+    CHECK_FALSE(collider.isSubVoxelBlocking(damaged, -1, 0, 0));
+    CHECK_FALSE(collider.isSubVoxelBlocking(damaged, kSubVoxelResolution, 0, 0));
+    CHECK_FALSE(collider.isSubVoxelBlocking(damaged, 0, 0, kSubVoxelResolution));
+}
+
+TEST_CASE("a box inside a carved alcove does not overlap the damaged block",
+          "[physics][subvoxel]")
+{
+    TestWorld world;
+    world.set(0, kFloorBlockY, 0, blocks::Stone);
+
+    TestSubVoxels damage;
+    // Hollow out the upper half of the block: sub-voxel rows 4..7 in y.
+    damage.carveRange(BlockPos{0, kFloorBlockY, 0}, blocks::Stone, 0, 4, 0, 7, 7, 7);
+    REQUIRE(damage.remaining(BlockPos{0, kFloorBlockY, 0}) == kSubVoxelCount / 2);
+
+    const physics::VoxelCollider collider{world, registry(), &damage};
+    const float                  base = static_cast<float>(kFloorBlockY);
+
+    const Box inAlcove{glm::vec3{0.1f, base + 0.6f, 0.1f}, glm::vec3{0.9f, base + 0.9f, 0.9f}};
+    CHECK_FALSE(collider.overlapsSolid(inAlcove));
+
+    const Box inMaterial{glm::vec3{0.1f, base + 0.1f, 0.1f}, glm::vec3{0.9f, base + 0.4f, 0.9f}};
+    CHECK(collider.overlapsSolid(inMaterial));
+
+    // Without the accessor the whole cube is solid, which is the behaviour the
+    // damaged branch has to differ from for this test to mean anything.
+    const physics::VoxelCollider blind{world, registry()};
+    CHECK(blind.overlapsSolid(inAlcove));
+}
+
+TEST_CASE("a sweep stops at the surviving material, not at the block face",
+          "[physics][subvoxel]")
+{
+    TestWorld world;
+    world.set(2, kFloorBlockY, 0, blocks::Stone);
+
+    TestSubVoxels damage;
+    // Carve the four sub-voxel slabs nearest the approach side, so the surviving
+    // surface sits half a block behind the cube face at x == 2.
+    damage.carveRange(BlockPos{2, kFloorBlockY, 0}, blocks::Stone, 0, 0, 0, 3, 7, 7);
+    const physics::VoxelCollider collider{world, registry(), &damage};
+
+    const float base = static_cast<float>(kFloorBlockY);
+    const Box   box{glm::vec3{0.0f, base + 0.1f, 0.1f}, glm::vec3{1.0f, base + 0.9f, 0.9f}};
+
+    const physics::AxisMove move = physics::sweepAxisAgainstWorld(collider, box, physics::kAxisX, 2.0f);
+    CHECK(move.blocked);
+    // Material starts at x = 2.5 and the leading face is at x = 1.0.
+    CHECK(move.travelled == Approx(1.5f - physics::kCollisionSkin).margin(1.0e-4f));
+
+    const physics::VoxelCollider blind{world, registry()};
+    const physics::AxisMove blindMove = physics::sweepAxisAgainstWorld(blind, box, physics::kAxisX, 2.0f);
+    CHECK(blindMove.blocked);
+    CHECK(blindMove.travelled == Approx(1.0f - physics::kCollisionSkin).margin(1.0e-4f));
+}
+
+TEST_CASE("a bored-out block lets a body pass straight through", "[physics][subvoxel]")
+{
+    TestWorld world;
+    world.fill(2, kFloorBlockY, -1, 2, kFloorBlockY + 2, 1, blocks::Stone);
+
+    TestSubVoxels  damage;
+    const BlockPos hole{2, kFloorBlockY, 0};
+    // Everything except one corner sub-voxel, which keeps the entry legal
+    // (0 < popcount < 512) and sits outside the box's y/z span.
+    damage.carveRange(hole, blocks::Stone, 1, 0, 0, 7, 7, 7);
+    damage.carveRange(hole, blocks::Stone, 0, 1, 0, 0, 7, 7);
+    damage.carveRange(hole, blocks::Stone, 0, 0, 1, 0, 0, 7);
+    REQUIRE(damage.remaining(hole) == 1);
+
+    const physics::VoxelCollider collider{world, registry(), &damage};
+    const float                  base = static_cast<float>(kFloorBlockY);
+    const Box box{glm::vec3{0.0f, base + 0.2f, 0.2f}, glm::vec3{0.9f, base + 0.9f, 0.9f}};
+
+    const physics::AxisMove move = physics::sweepAxisAgainstWorld(collider, box, physics::kAxisX, 1.5f);
+    CHECK_FALSE(move.blocked);
+    CHECK(move.travelled == Approx(1.5f));
+
+    // The blocks above are untouched, so a body one block higher is still
+    // stopped - the hole is exactly as wide as it was carved.
+    const Box higher = box.translated(glm::vec3{0.0f, 1.0f, 0.0f});
+    const physics::AxisMove blockedMove =
+        physics::sweepAxisAgainstWorld(collider, higher, physics::kAxisX, 1.5f);
+    CHECK(blockedMove.blocked);
+    // Leading face at x = 0.9, intact cube face at x = 2.0.
+    CHECK(blockedMove.travelled == Approx(1.1f - physics::kCollisionSkin).margin(1.0e-4f));
+}
+
+TEST_CASE("carving the ground out from under a body removes its support",
+          "[physics][subvoxel]")
+{
+    TestWorld world;
+    world.fill(-2, kFloorBlockY, -2, 2, kFloorBlockY, 2, blocks::Stone);
+
+    TestSubVoxels                damage;
+    const physics::VoxelCollider collider{world, registry(), &damage};
+    const Box                    box = playerBox(0.5f, kFloorTop, 0.5f);
+    REQUIRE(physics::isSupported(collider, box));
+
+    // Remove the top sub-voxel layer of every block under the feet.
+    for (std::int32_t bx = 0; bx <= 1; ++bx) {
+        for (std::int32_t bz = 0; bz <= 1; ++bz) {
+            damage.carveRange(BlockPos{bx, kFloorBlockY, bz}, blocks::Stone, 0, 7, 0, 7, 7, 7);
+        }
+    }
+    CHECK_FALSE(physics::isSupported(collider, box));
+
+    const physics::AxisMove drop = physics::sweepAxisAgainstWorld(collider, box, physics::kAxisY, -1.0f);
+    CHECK(drop.blocked);
+    CHECK(drop.travelled == Approx(-(kSubVoxelSize - physics::kCollisionSkin)).margin(1.0e-4f));
+}
+
+TEST_CASE("a full move resolves against damaged geometry without tunnelling",
+          "[physics][subvoxel]")
+{
+    TestWorld world;
+    world.fill(-4, kFloorBlockY, -4, 4, kFloorBlockY, 4, blocks::Stone);
+    world.fill(2, kFloorBlockY + 1, -4, 2, kFloorBlockY + 3, 4, blocks::Stone);
+
+    TestSubVoxels damage;
+    // Chip the player-facing half off every wall block the body can reach.
+    for (std::int32_t by = kFloorBlockY + 1; by <= kFloorBlockY + 3; ++by) {
+        for (std::int32_t bz = -1; bz <= 1; ++bz) {
+            damage.carveRange(BlockPos{2, by, bz}, blocks::Stone, 0, 0, 0, 3, 7, 7);
+        }
+    }
+    const physics::VoxelCollider collider{world, registry(), &damage};
+
+    const physics::MotionParams params;
+    Box                         box = playerBox(0.5f, kFloorTop, 0.5f);
+
+    // Four seconds of walking straight into the wall. If the sub-voxel gap were
+    // ever reported larger than it is, the body ends up inside the material and
+    // the next step reports startedStuck.
+    for (int step = 0; step < 240; ++step) {
+        const physics::MoveResult result = physics::moveAabb(
+            collider, box, glm::vec3{6.0f, 0.0f, 0.0f}, 1.0f / 60.0f, params, true);
+        box = result.box;
+        REQUIRE_FALSE(result.startedStuck);
+    }
+
+    CHECK_FALSE(collider.overlapsSolid(box));
+    // Resting against the carved surface at x = 2.5, not the cube face at 2.0.
+    CHECK(box.max.x <= 2.5f);
+    CHECK(box.max.x > 2.4f);
+}

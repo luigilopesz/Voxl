@@ -140,6 +140,17 @@ bool Renderer::loadShaders()
         return false;
     }
 
+    // Deliberately NOT part of the validity test above. The sub-voxel pass draws
+    // player-carved damage, which most worlds have none of; losing it must cost
+    // the damage geometry, not the entire world. ShaderProgram already logs the
+    // compile/link failure in full, so this is a one-line note on top.
+    m_subVoxelProgram = m_shaders.load("subvoxel");
+    if (m_subVoxelProgram == nullptr) {
+        VOXL_LOG_ERROR("Renderer: subvoxel program unavailable; sub-voxel damage will not draw");
+    } else {
+        m_subVoxelUniforms.chunkOrigin = m_subVoxelProgram->uniformLocation("uChunkOrigin");
+    }
+
     m_chunkUniforms.chunkOrigin = m_chunkProgram->uniformLocation("uChunkOrigin");
     m_chunkUniforms.alphaCutoff = m_chunkProgram->uniformLocation("uAlphaCutoff");
     m_waterUniforms.chunkOrigin = m_waterProgram->uniformLocation("uChunkOrigin");
@@ -275,6 +286,22 @@ void Renderer::applyOpaqueState()
     glDisable(GL_BLEND);
 }
 
+void Renderer::applySubVoxelState()
+{
+    // Identical to opaque, and stated in full rather than inherited: the passes
+    // are independent of each other's ordering by design, and "it happens to
+    // follow the opaque pass" is exactly the assumption that breaks the first
+    // time someone reorders drawWorld().
+    //
+    // Back-face culling stays ON. A carved cavity's inward-facing surfaces are
+    // emitted by the mesher as real quads with outward normals, so there is
+    // nothing here that relies on seeing a back face.
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+}
+
 void Renderer::applyCutoutState()
 {
     // Same as opaque. Cutout differs only in the shader's discard, which is why
@@ -311,7 +338,19 @@ void Renderer::drawWorld()
     m_chunkProgram->setFloat(m_chunkUniforms.alphaCutoff, 0.0f);
     m_chunks.drawLayer(RenderLayer::Opaque, *m_chunkProgram, m_chunkUniforms.chunkOrigin);
 
+    // Sub-voxel damage: same depth buffer, same block texture array (already
+    // bound above), different vertex packing and therefore a different program.
+    // ChunkRenderer returns without touching any state when nothing on screen is
+    // damaged, but the program switch and the state call are per pass, so guard
+    // them on the visible count rather than paying them every frame.
+    if (m_subVoxelProgram != nullptr && m_chunks.visibleSubVoxelCount() != 0) {
+        applySubVoxelState();
+        m_subVoxelProgram->use();
+        m_chunks.drawSubVoxels(*m_subVoxelProgram, m_subVoxelUniforms.chunkOrigin);
+    }
+
     applyCutoutState();
+    m_chunkProgram->use();
     m_chunkProgram->setFloat(m_chunkUniforms.alphaCutoff, kCutoutThreshold);
     m_chunks.drawLayer(RenderLayer::Cutout, *m_chunkProgram, m_chunkUniforms.chunkOrigin);
 

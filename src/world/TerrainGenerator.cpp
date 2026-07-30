@@ -241,6 +241,105 @@ struct SampleGrid {
     }
 };
 
+// ----------------------------------------------------------- LOD sampling --
+
+/// Cells of padding a level-L sample grid needs on each side so that the
+/// vertical bound below covers every tree that can reach into the chunk. Zero
+/// when the level places no trees, which is the whole point: the coarse levels
+/// that dominate the chunk count sample nothing outside their own footprint.
+[[nodiscard]] constexpr std::int32_t lodPadCells(LodLevel level, bool withTrees) noexcept
+{
+    if (!withTrees) {
+        return 0;
+    }
+    const std::int32_t cell  = lodCellSize(level);
+    const std::int32_t reach = kMaxStructureRadius + cell - 1;
+    return (reach + cell - 1) / cell;
+}
+
+/// Worst-case padded span, over every level that can place trees, so the coarse
+/// column grid can live on the stack. Level 1 is the widest: 16 cells plus two
+/// rings of padding.
+constexpr std::int32_t kLodMaxSpan =
+    lodGridSize(kLodTreeMaxLevel) + 2 * lodPadCells(kLodTreeMaxLevel, true);
+constexpr std::size_t kMaxLodColumns =
+    static_cast<std::size_t>(kLodMaxSpan) * static_cast<std::size_t>(kLodMaxSpan);
+
+/// Column samples on the level-L cell lattice for a chunk plus `pad` rings.
+///
+/// Lookups are by world coordinate and are quantised to the lattice, which is
+/// global (chunk origins are multiples of 32, hence of every cell size), so two
+/// chunks asking about the same world column at the same level land on the same
+/// cell and therefore the same sample.
+struct LodSampleGrid {
+    std::array<ColumnSample, kMaxLodColumns> cells{};
+    std::int32_t shift       = 0;  ///< log2 of the cell size
+    std::int32_t cellOriginX = 0;  ///< chunk origin, in cells
+    std::int32_t cellOriginZ = 0;
+    std::int32_t pad         = 0;
+    std::int32_t span        = 0;
+
+    [[nodiscard]] const ColumnSample& atCell(std::int32_t cx, std::int32_t cz) const noexcept
+    {
+        const std::int32_t ix = cx + pad;
+        const std::int32_t iz = cz + pad;
+        VOXL_ASSERT(ix >= 0 && ix < span && iz >= 0 && iz < span, "lod cell outside the grid");
+        return cells[static_cast<std::size_t>(iz) * static_cast<std::size_t>(span) +
+                     static_cast<std::size_t>(ix)];
+    }
+};
+
+/// Cells in one chunk at the finest coarse level - the worst case the per-cell
+/// scratch buffer has to hold. Level 1 is 16^3; every coarser level is smaller.
+constexpr std::size_t kMaxLodCells = lodCellCount(static_cast<LodLevel>(kLodFull + 1));
+
+[[nodiscard]] constexpr std::size_t lodCellIndex(std::int32_t cx, std::int32_t cy, std::int32_t cz,
+                                                 std::int32_t gridSize) noexcept
+{
+    return static_cast<std::size_t>((cy * gridSize + cz) * gridSize + cx);
+}
+
+/// Which material covers most of a coarse chunk.
+///
+/// A linear table rather than a map: a chunk holds a handful of distinct ids, so
+/// the scan is shorter than a hash would be to set up. Overflowing the table
+/// only costs a worse guess - the result is a fill hint, never a correctness
+/// input - so it degrades instead of failing.
+struct LodMaterialTally {
+    static constexpr std::size_t     kCapacity = 12;
+    std::array<BlockId, kCapacity>      ids{};
+    std::array<std::int32_t, kCapacity> counts{};
+    std::size_t                         size = 0;
+
+    void add(BlockId id) noexcept
+    {
+        for (std::size_t i = 0; i < size; ++i) {
+            if (ids[i] == id) {
+                ++counts[i];
+                return;
+            }
+        }
+        if (size < kCapacity) {
+            ids[size]    = id;
+            counts[size] = 1;
+            ++size;
+        }
+    }
+
+    [[nodiscard]] BlockId dominant() const noexcept
+    {
+        BlockId      best      = blocks::Air;
+        std::int32_t bestCount = 0;
+        for (std::size_t i = 0; i < size; ++i) {
+            if (counts[i] > bestCount) {
+                bestCount = counts[i];
+                best      = ids[i];
+            }
+        }
+        return best;
+    }
+};
+
 // ============================================================================
 //  Biome table
 // ============================================================================
@@ -374,8 +473,8 @@ struct TreeShape {
 /// `overwriteLeaves` distinguishes trunks (which may replace their own canopy)
 /// from leaves (which only fill air). Both refuse to overwrite terrain, so a
 /// tree never punches a hole through a hillside.
-bool placeStructureVoxel(Chunk& chunk, std::int32_t worldX, std::int32_t worldY, std::int32_t worldZ,
-                         BlockId id, bool overwriteLeaves)
+bool placeOneStructureVoxel(Chunk& chunk, std::int32_t worldX, std::int32_t worldY,
+                            std::int32_t worldZ, BlockId id, bool overwriteLeaves)
 {
     if (worldY < kWorldMinY || worldY > kWorldMaxY) {
         return false;
@@ -397,15 +496,49 @@ bool placeStructureVoxel(Chunk& chunk, std::int32_t worldX, std::int32_t worldY,
     return true;
 }
 
+/// Level-aware structure write: fills the whole level-L cell that contains the
+/// voxel, one block at a time so the "never overwrite terrain" rule still holds
+/// per block. At kLodFull the cell is one block and this is the identity.
+///
+/// WHY QUANTISE AT ALL: a coarse chunk is consumed one sample per cell, so a
+/// lone trunk voxel sitting in a 2-block cell is a coin flip between "there is a
+/// tree here" and "there is not". Inflating it to the cell is the same
+/// bias-toward-solid trade Lod.hpp makes for terrain - a slightly chunky tree is
+/// invisible at these distances, a tree that half exists is not.
+bool placeStructureVoxel(Chunk& chunk, std::int32_t worldX, std::int32_t worldY, std::int32_t worldZ,
+                         BlockId id, bool overwriteLeaves, LodLevel level)
+{
+    if (level == kLodFull) {
+        return placeOneStructureVoxel(chunk, worldX, worldY, worldZ, id, overwriteLeaves);
+    }
+
+    const std::int32_t shift = static_cast<std::int32_t>(level);
+    const std::int32_t cell  = lodCellSize(level);
+    const std::int32_t x0    = (worldX >> shift) << shift;
+    const std::int32_t y0    = (worldY >> shift) << shift;
+    const std::int32_t z0    = (worldZ >> shift) << shift;
+
+    bool placed = false;
+    for (std::int32_t dy = 0; dy < cell; ++dy) {
+        for (std::int32_t dz = 0; dz < cell; ++dz) {
+            for (std::int32_t dx = 0; dx < cell; ++dx) {
+                placed |= placeOneStructureVoxel(chunk, x0 + dx, y0 + dy, z0 + dz, id,
+                                                 overwriteLeaves);
+            }
+        }
+    }
+    return placed;
+}
+
 void emitTree(Chunk& chunk, std::int32_t anchorX, std::int32_t anchorZ, std::int32_t surfaceY,
-              const TreeShape& shape, std::uint64_t seed)
+              const TreeShape& shape, std::uint64_t seed, LodLevel level)
 {
     const std::int32_t baseY = surfaceY + 1;
     const std::int32_t h     = shape.trunkHeight;
 
     // Trunk first so the canopy's air test naturally skips the trunk column.
     for (std::int32_t dy = 0; dy < h; ++dy) {
-        placeStructureVoxel(chunk, anchorX, baseY + dy, anchorZ, blocks::Wood, true);
+        placeStructureVoxel(chunk, anchorX, baseY + dy, anchorZ, blocks::Wood, true, level);
     }
 
     // Layer descriptor: vertical offset from baseY, and the ring radius.
@@ -457,7 +590,8 @@ void emitTree(Chunk& chunk, std::int32_t anchorX, std::int32_t anchorZ, std::int
                         continue;
                     }
                 }
-                placeStructureVoxel(chunk, anchorX + dx, y, anchorZ + dz, blocks::Leaves, false);
+                placeStructureVoxel(chunk, anchorX + dx, y, anchorZ + dz, blocks::Leaves, false,
+                                    level);
             }
         }
     }
@@ -482,12 +616,27 @@ void emitTree(Chunk& chunk, std::int32_t anchorX, std::int32_t anchorZ, std::int
 ///      total order restricted to a subset. Two overlapping trees therefore
 ///      resolve in the same order from either side of a border, so the winner at
 ///      a contested voxel is a pure function of that voxel.
-void placeTrees(Chunk& chunk, const SampleGrid& grid, const TerrainSettings& settings)
+///
+/// LOD: `columnAt` is how the pass reads the height field, and at coarse levels
+/// it samples the exact column rather than a cell centre. That is deliberate and
+/// cheap - tree candidates are sparse (one per 5x5 cell), so a few dozen exact
+/// samples buy EXACTLY the same set of trees, in the same places, as level 0.
+/// Only the base height is snapped, to the coarse ground the tree stands on, and
+/// only the voxel writes are cell-quantised. Deciding tree existence from a cell
+/// centre instead would make trees blink in and out as a chunk changed level.
+template <typename ColumnAt>
+void placeTrees(Chunk& chunk, std::int32_t originX, std::int32_t originZ,
+                const TerrainSettings& settings, LodLevel level, ColumnAt&& columnAt)
 {
-    const std::int32_t padMinX = grid.originX - kMaxStructureRadius;
-    const std::int32_t padMaxX = grid.originX + kChunkSize - 1 + kMaxStructureRadius;
-    const std::int32_t padMinZ = grid.originZ - kMaxStructureRadius;
-    const std::int32_t padMaxZ = grid.originZ + kChunkSize - 1 + kMaxStructureRadius;
+    // Widened by one cell short of the full cell: a quantised structure voxel
+    // fills its whole cell, so an anchor kMaxStructureRadius + cell - 1 blocks
+    // outside the chunk can still reach in. At kLodFull the widening is zero and
+    // this is the original bound.
+    const std::int32_t reach   = kMaxStructureRadius + lodCellSize(level) - 1;
+    const std::int32_t padMinX = originX - reach;
+    const std::int32_t padMaxX = originX + kChunkSize - 1 + reach;
+    const std::int32_t padMinZ = originZ - reach;
+    const std::int32_t padMaxZ = originZ + kChunkSize - 1 + reach;
 
     const std::int32_t cellMinX = floorDiv(padMinX, kTreeCellSize);
     const std::int32_t cellMaxX = floorDiv(padMaxX, kTreeCellSize);
@@ -511,8 +660,8 @@ void placeTrees(Chunk& chunk, const SampleGrid& grid, const TerrainSettings& set
                 continue;
             }
 
-            const ColumnSample& site    = grid.at(anchorX, anchorZ);
-            const float         density = biomeDescription(site.biome).treeDensity;
+            const ColumnSample site    = columnAt(anchorX, anchorZ);
+            const float        density = biomeDescription(site.biome).treeDensity;
             if (density <= 0.0f) {
                 continue;
             }
@@ -530,16 +679,23 @@ void placeTrees(Chunk& chunk, const SampleGrid& grid, const TerrainSettings& set
             }
 
             const std::int32_t slope =
-                std::max({std::abs(grid.at(anchorX + 1, anchorZ).surfaceY - site.surfaceY),
-                          std::abs(grid.at(anchorX - 1, anchorZ).surfaceY - site.surfaceY),
-                          std::abs(grid.at(anchorX, anchorZ + 1).surfaceY - site.surfaceY),
-                          std::abs(grid.at(anchorX, anchorZ - 1).surfaceY - site.surfaceY)});
+                std::max({std::abs(columnAt(anchorX + 1, anchorZ).surfaceY - site.surfaceY),
+                          std::abs(columnAt(anchorX - 1, anchorZ).surfaceY - site.surfaceY),
+                          std::abs(columnAt(anchorX, anchorZ + 1).surfaceY - site.surfaceY),
+                          std::abs(columnAt(anchorX, anchorZ - 1).surfaceY - site.surfaceY)});
             if (slope > kMaxTreeSlope) {
                 continue;
             }
 
+            // Stand the trunk on the ground this level actually built, not on the
+            // exact height field, or a coarse tree floats or sinks by up to half
+            // a cell. Identity at kLodFull.
+            const std::int32_t groundY = lodTerrainTop(
+                columnAt(lodSampleCoord(anchorX, level), lodSampleCoord(anchorZ, level)).surfaceY,
+                level);
+
             const TreeShape shape = treeShapeFor(site.biome, cellHash);
-            emitTree(chunk, anchorX, anchorZ, site.surfaceY, shape, settings.seed);
+            emitTree(chunk, anchorX, anchorZ, groundY, shape, settings.seed, level);
         }
     }
 }
@@ -755,26 +911,35 @@ BiomeId TerrainGenerator::biomeAt(std::int32_t worldX, std::int32_t worldZ) cons
 bool TerrainGenerator::carvesCave(std::int32_t worldX, std::int32_t worldY, std::int32_t worldZ,
                                   std::int32_t surfaceY) const noexcept
 {
-    if (worldY <= kCaveFloorY) {
+    return carvesCaveSpan(worldX, worldY, worldZ, worldY, worldY, surfaceY);
+}
+
+bool TerrainGenerator::carvesCaveSpan(std::int32_t worldX, std::int32_t noiseY, std::int32_t worldZ,
+                                      std::int32_t shallowestY, std::int32_t deepestY,
+                                      std::int32_t surfaceY) const noexcept
+{
+    if (deepestY <= kCaveFloorY) {
         return false;  // bedrock floor is never carved
     }
-    const std::int32_t depth = surfaceY - worldY;
+    const std::int32_t depth = surfaceY - shallowestY;
     if (depth < kCaveSurfaceMargin) {
         return false;  // never break through into the sky
     }
 
     // Two independent fades: caves thin out as they approach the surface and as
     // they approach the world floor. Both reach exactly zero, so there is no
-    // discontinuity at the hard rejections above.
+    // discontinuity at the hard rejections above. Both are evaluated at the
+    // worst block of the span, so a coarse cell can only ever carve LESS than
+    // the blocks it covers would individually - never more.
     const float fade = saturate(static_cast<float>(depth - kCaveSurfaceMargin) / kCaveSurfaceFade) *
-                       saturate(static_cast<float>(worldY - kCaveFloorY) / kCaveFloorFade);
+                       saturate(static_cast<float>(deepestY - kCaveFloorY) / kCaveFloorFade);
     if (fade <= 0.0f) {
         return false;
     }
 
     const float fx = static_cast<float>(worldX);
     const float fz = static_cast<float>(worldZ);
-    const float fy = static_cast<float>(worldY) * kCaveVerticalSquash;
+    const float fy = static_cast<float>(noiseY) * kCaveVerticalSquash;
 
     // Field A is evaluated first and rejects the overwhelming majority of voxels,
     // so field B costs almost nothing in aggregate. This ordering is the reason
@@ -785,8 +950,8 @@ bool TerrainGenerator::carvesCave(std::int32_t worldX, std::int32_t worldY, std:
         return true;
     }
 
-    if (worldY < kCavernTopY) {
-        const float cavern = m_noise->cavern.GetNoise(fx, static_cast<float>(worldY) * 0.85f, fz);
+    if (shallowestY < kCavernTopY) {
+        const float cavern = m_noise->cavern.GetNoise(fx, static_cast<float>(noiseY) * 0.85f, fz);
         if (cavern > kCavernThreshold + (1.0f - fade) * 0.55f) {
             return true;
         }
@@ -903,11 +1068,214 @@ void TerrainGenerator::generate(Chunk& chunk) const
     }
 
     if (m_settings.generateTrees) {
-        placeTrees(chunk, grid, m_settings);
+        placeTrees(chunk, grid.originX, grid.originZ, m_settings, kLodFull,
+                   [&grid](std::int32_t x, std::int32_t z) -> const ColumnSample& {
+                       return grid.at(x, z);
+                   });
     }
 
     // One O(volume) sweep reclaims the palette slots that carving and structure
     // overwrites left unreferenced, and collapses uniform sections back to 8 bytes.
+    storage.optimise();
+    chunk.markDirty();
+}
+
+// ============================================================================
+//  Level-of-detail generation
+// ============================================================================
+
+void TerrainGenerator::generate(Chunk& chunk, LodLevel level) const
+{
+    VOXL_CHECK(level < kLodCount, "lod level {} out of range", static_cast<int>(level));
+    if (level == kLodFull) {
+        generate(chunk);  // identical by construction, not by coincidence
+        return;
+    }
+    generateCoarse(chunk, level);
+}
+
+void TerrainGenerator::generateCoarse(Chunk& chunk, LodLevel level) const
+{
+    const ChunkPos& pos = chunk.position();
+    VOXL_CHECK(pos.y >= 0 && pos.y < kWorldSectionCount, "chunk section y={} outside the world", pos.y);
+    VOXL_ASSERT(level > kLodFull && level < kLodCount, "generateCoarse called at level 0");
+
+    const std::int32_t cell  = lodCellSize(level);
+    const std::int32_t half  = cell >> 1;
+    const std::int32_t grid  = lodGridSize(level);
+    const bool         trees = m_settings.generateTrees && lodPlacesTrees(level);
+
+    const BlockPos     origin      = pos.originBlock();
+    const std::int32_t sectionMinY = origin.y;
+    const std::int32_t seaLevel    = m_settings.seaLevel;
+
+    ChunkStorage& storage = chunk.storage();
+    // Same reset-first rule as the full-resolution path: regenerating a chunk at
+    // a new level must not leave any of the old level's voxels behind.
+    storage.fill(blocks::Air);
+    storage.fillLight(0, 0);
+
+    LodSampleGrid columns;
+    columns.shift       = static_cast<std::int32_t>(level);
+    columns.pad         = lodPadCells(level, trees);
+    columns.span        = grid + 2 * columns.pad;
+    columns.cellOriginX = origin.x >> columns.shift;
+    columns.cellOriginZ = origin.z >> columns.shift;
+    VOXL_ASSERT(static_cast<std::size_t>(columns.span) * static_cast<std::size_t>(columns.span) <=
+                    kMaxLodColumns,
+                "lod sample grid larger than its worst-case bound");
+
+    // A coarse cell's terrain top can sit up to `half - 1` blocks above the
+    // sampled surface, and a quantised tree adds at most one more cell on top of
+    // structureTopY, so `+ cell` is a sound bound in both cases.
+    std::int32_t highestTop = kWorldMinY;
+    for (std::int32_t iz = 0; iz < columns.span; ++iz) {
+        for (std::int32_t ix = 0; ix < columns.span; ++ix) {
+            const std::int32_t cx = ix - columns.pad;
+            const std::int32_t cz = iz - columns.pad;
+            ColumnSample&      c  = columns.cells[static_cast<std::size_t>(iz) *
+                                            static_cast<std::size_t>(columns.span) +
+                                        static_cast<std::size_t>(ix)];
+            c = sampleColumn(origin.x + cx * cell + half, origin.z + cz * cell + half);
+            highestTop = std::max(highestTop, (trees ? c.structureTopY : c.surfaceY) + cell);
+        }
+    }
+
+    if (sectionMinY > std::max(highestTop, seaLevel)) {
+        if (m_settings.seedSunlight) {
+            storage.fillLight(ChunkStorage::kMaxLightLevel, 0);
+        }
+        chunk.markDirty();
+        return;
+    }
+
+    // PASS 1 - decide every cell. Kept separate from the writes so the dominant
+    // material can be chosen before anything is stored: filling the section with
+    // it up front turns the majority of the 32768 per-block writes into nothing
+    // at all, and those writes - not the noise - are what otherwise stops the
+    // cost from falling any further past level 2.
+    std::array<BlockId, kMaxLodCells> cellIds{};
+    LodMaterialTally                  tally;
+
+    for (std::int32_t cz = 0; cz < grid; ++cz) {
+        for (std::int32_t cx = 0; cx < grid; ++cx) {
+            const ColumnSample& sample  = columns.atCell(cx, cz);
+            const std::int32_t  centreX = origin.x + cx * cell + half;
+            const std::int32_t  centreZ = origin.z + cz * cell + half;
+            const SurfaceMaterials materials =
+                resolveMaterials(sample, centreX, centreZ, seaLevel, m_settings.seed);
+
+            const bool freezes = sample.temperature < kFreezingTemperature;
+
+            for (std::int32_t cy = 0; cy < grid; ++cy) {
+                const std::int32_t cellMinY = sectionMinY + cy * cell;
+                const std::int32_t cellMaxY = cellMinY + cell - 1;
+                const std::int32_t centreY  = cellMinY + half;
+
+                BlockId id = blocks::Air;
+
+                if (cellMinY == kWorldMinY) {
+                    // The bottom cell is bedrock outright. It replaces both the
+                    // solid floor and the scattered shelf above it: every block
+                    // down there is opaque rock at full resolution too, it is
+                    // unreachable, and a uniform cell is what a cell-sampling
+                    // consumer needs to see a floor at all.
+                    id = blocks::Bedrock;
+                } else if (centreY <= sample.surfaceY) {
+                    const std::int32_t depth = sample.surfaceY - centreY;
+                    // The topmost solid cell always takes the surface material.
+                    // Choosing it by `depth == 0` as the fine path does would
+                    // give grass to only one cell in 2^L and turn a green world
+                    // brown at distance - the most visible LOD defect there is.
+                    if (centreY + cell > sample.surfaceY) {
+                        id = materials.surface;
+                    } else if (depth <= materials.subsurfaceDepth) {
+                        id = materials.subsurface;
+                    } else if (depth <= materials.subsurfaceDepth + materials.fillerDepth) {
+                        id = materials.filler;
+                    } else {
+                        id = blocks::Stone;
+                    }
+
+                    if (m_settings.generateCaves && isCarveable(id) &&
+                        carvesCaveSpan(centreX, centreY, centreZ, cellMaxY, cellMinY,
+                                       sample.surfaceY)) {
+                        id = blocks::Air;
+                    }
+                } else if (cellMaxY <= seaLevel) {
+                    // Water fills only cells that are ENTIRELY submerged, so the
+                    // ocean surface lands on a cell boundary at or just below
+                    // sea level instead of stepping up to half a cell above it
+                    // and drowning the beaches. With the default sea level this
+                    // is one block low at every coarse level - the same one
+                    // block at all of them, so there is no step between levels.
+                    id = (freezes && cellMaxY + cell > seaLevel) ? blocks::Ice : blocks::Water;
+                }
+
+                cellIds[lodCellIndex(cx, cy, cz, grid)] = id;
+                tally.add(id);
+            }
+        }
+    }
+
+    // A coarse chunk holds a handful of distinct materials, and usually one of
+    // them - stone underground, air near the sky, water at sea - covers most of
+    // it. Seeding the section with that one collapses to a single 8-byte uniform
+    // value and leaves only the minority cells to write.
+    const BlockId dominant = tally.dominant();
+    storage.fill(dominant);
+
+    // PASS 2 - expand the cells into blocks.
+    for (std::int32_t cz = 0; cz < grid; ++cz) {
+        for (std::int32_t cx = 0; cx < grid; ++cx) {
+            const std::int32_t surfaceY = columns.atCell(cx, cz).surfaceY;
+
+            for (std::int32_t cy = 0; cy < grid; ++cy) {
+                const BlockId id         = cellIds[lodCellIndex(cx, cy, cz, grid)];
+                const bool    writeBlock = id != dominant;
+
+                for (std::int32_t by = 0; by < cell; ++by) {
+                    const std::int32_t localY = cy * cell + by;
+                    const std::int32_t worldY = sectionMinY + localY;
+
+                    std::uint8_t sunlight = 0;
+                    if (m_settings.seedSunlight && worldY > surfaceY) {
+                        sunlight = worldY > seaLevel
+                                       ? ChunkStorage::kMaxLightLevel
+                                       : static_cast<std::uint8_t>(std::max(
+                                             0, static_cast<int>(ChunkStorage::kMaxLightLevel) -
+                                                    2 * (seaLevel - worldY + 1)));
+                    }
+                    if (!writeBlock && sunlight == 0) {
+                        continue;
+                    }
+
+                    for (std::int32_t bz = 0; bz < cell; ++bz) {
+                        // x is the fastest-varying axis of localIndex, so a cell
+                        // row is a contiguous run and the index just increments.
+                        std::size_t index = localIndex(cx * cell, localY, cz * cell + bz);
+                        for (std::int32_t bx = 0; bx < cell; ++bx, ++index) {
+                            if (writeBlock) {
+                                storage.set(index, id);
+                            }
+                            if (sunlight != 0) {
+                                storage.setLight(index, ChunkStorage::packLight(sunlight, 0));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (trees) {
+        // Exact columns, on demand. Candidates are sparse enough that this costs
+        // far less than the padded full-resolution grid the fine path builds,
+        // and it is what makes the level-1 tree set identical to level 0's.
+        placeTrees(chunk, origin.x, origin.z, m_settings, level,
+                   [this](std::int32_t x, std::int32_t z) { return sampleColumn(x, z); });
+    }
+
     storage.optimise();
     chunk.markDirty();
 }

@@ -7,7 +7,8 @@
 namespace voxl {
 namespace {
 
-/// Attribute locations, matching `layout(location = ...)` in chunk.vert.
+/// Attribute locations, matching `layout(location = ...)` in chunk.vert and in
+/// subvoxel.vert. Both formats are two uint32 lanes, so the numbering is shared.
 constexpr GLuint kAttribData0 = 0;
 constexpr GLuint kAttribData1 = 1;
 
@@ -17,6 +18,19 @@ constexpr GLuint kAttribData1 = 1;
 }
 
 }  // namespace
+
+// -------------------------------------------------------- SubVoxelGeometry --
+
+void ChunkRenderer::SubVoxelGeometry::release() noexcept
+{
+    vertices.destroy();
+    indices.destroy();
+    indexCount = 0;
+    triangles  = 0;
+    byteSize   = 0;
+}
+
+// ------------------------------------------------------------- lifecycle --
 
 ChunkRenderer::ChunkRenderer()
 {
@@ -29,14 +43,30 @@ ChunkRenderer::ChunkRenderer()
     m_vertexArray.setIntegerAttribute(kAttribData1, 1, GL_UNSIGNED_INT,
                                       offsetof(PackedVertex, data1), kVertexBinding);
 
+    m_subVoxelVertexArray.create();
+    m_subVoxelVertexArray.setIntegerAttribute(kAttribData0, 1, GL_UNSIGNED_INT,
+                                              offsetof(PackedSubVoxelVertex, data0),
+                                              kVertexBinding);
+    m_subVoxelVertexArray.setIntegerAttribute(kAttribData1, 1, GL_UNSIGNED_INT,
+                                              offsetof(PackedSubVoxelVertex, data1),
+                                              kVertexBinding);
+
     for (std::vector<VisibleMesh>& list : m_visible) {
         list.reserve(1024);
     }
+    // Damaged chunks are a handful even in a heavily mined world, so this list
+    // is deliberately sized two orders of magnitude below the others.
+    m_visibleSubVoxel.reserve(64);
 }
 
 ChunkRenderer::~ChunkRenderer()
 {
     clear();
+}
+
+std::size_t ChunkRenderer::lodIndex(LodLevel level) noexcept
+{
+    return std::min<std::size_t>(static_cast<std::size_t>(level), kLodCount - 1u);
 }
 
 Aabb ChunkRenderer::worldBounds(const ChunkMeshData& mesh)
@@ -53,7 +83,23 @@ Aabb ChunkRenderer::worldBounds(const ChunkMeshData& mesh)
     return Aabb{base + mesh.boundsMin, base + mesh.boundsMax};
 }
 
-void ChunkRenderer::upload(const ChunkMeshData& mesh)
+void ChunkRenderer::refreshBounds(ChunkMesh& mesh) noexcept
+{
+    mesh.bounds = mesh.subVoxel.empty() ? mesh.meshBounds : Aabb::fromChunk(mesh.position);
+}
+
+void ChunkRenderer::releaseBlockGeometry(ChunkMesh& mesh) noexcept
+{
+    m_gpuBytes -= std::min(m_gpuBytes, mesh.byteSize);
+    mesh.vertices.destroy();
+    mesh.indices.destroy();
+    mesh.ranges.fill(LayerRange{});
+    mesh.byteSize = 0;
+}
+
+// -------------------------------------------------------- whole-block mesh --
+
+void ChunkRenderer::upload(const ChunkMeshData& mesh, LodLevel lod)
 {
     std::size_t totalVertexBytes = 0;
     std::size_t totalIndexBytes  = 0;
@@ -63,22 +109,39 @@ void ChunkRenderer::upload(const ChunkMeshData& mesh)
     }
 
     if (totalIndexBytes == 0) {
-        // Nothing to draw. Evicting rather than keeping an empty record means the
-        // draw loop never has to test for it, and a chunk that was mined out
-        // gives its VRAM back immediately.
-        remove(mesh.position);
+        // Nothing whole-block to draw. Evicting rather than keeping an empty
+        // record means the draw loop never has to test for it, and a chunk that
+        // was mined out gives its VRAM back immediately - but a chunk mined down
+        // to a single damaged block has no whole-block quads left and must still
+        // draw its sub-voxel geometry, so the record survives in that case.
+        const auto found = m_meshes.find(mesh.position);
+        if (found == m_meshes.end()) {
+            return;
+        }
+        ChunkMesh& target = found->second;
+        releaseBlockGeometry(target);
+        if (target.subVoxel.empty()) {
+            m_meshes.erase(found);
+            return;
+        }
+        target.contentVersion = mesh.contentVersion;
+        target.lod            = lod;
+        target.meshBounds     = Aabb::fromChunk(mesh.position);
+        refreshBounds(target);
+        ++m_stats.uploadsTotal;
         return;
     }
 
     auto [iterator, inserted] = m_meshes.try_emplace(mesh.position);
     ChunkMesh& target         = iterator->second;
     if (!inserted) {
-        m_gpuBytes -= target.byteSize;
+        m_gpuBytes -= std::min(m_gpuBytes, target.byteSize);
     }
 
     target.position       = mesh.position;
     target.contentVersion = mesh.contentVersion;
-    target.bounds         = worldBounds(mesh);
+    target.lod            = lod;
+    target.meshBounds     = worldBounds(mesh);
 
     // Size the buffers once, then write each layer straight into its slice. This
     // avoids staging the concatenation in a scratch vector: the mesh data is
@@ -107,8 +170,76 @@ void ChunkRenderer::upload(const ChunkMeshData& mesh)
 
     target.byteSize = totalVertexBytes + totalIndexBytes;
     m_gpuBytes += target.byteSize;
+    refreshBounds(target);
     ++m_stats.uploadsTotal;
 }
+
+// ----------------------------------------------------------- sub-voxels --
+
+void ChunkRenderer::uploadSubVoxels(const ChunkPos& position, const SubVoxelMeshData& mesh)
+{
+    const std::size_t vertexBytes = mesh.vertices.size() * sizeof(PackedSubVoxelVertex);
+    const std::size_t indexBytes  = mesh.indices.size() * sizeof(std::uint32_t);
+
+    if (indexBytes == 0) {
+        removeSubVoxels(position);
+        return;
+    }
+
+    // A chunk can acquire damage before (or without) its whole-block mesh: the
+    // upload order between the two streams is whatever the job system drains
+    // first. Creating the record here with the full chunk box keeps the geometry
+    // visible until upload() supplies tighter bounds.
+    auto [iterator, inserted] = m_meshes.try_emplace(position);
+    ChunkMesh& target         = iterator->second;
+    if (inserted) {
+        target.position   = position;
+        target.meshBounds = Aabb::fromChunk(position);
+    }
+
+    SubVoxelGeometry& geometry = target.subVoxel;
+    m_gpuBytes -= std::min(m_gpuBytes, geometry.byteSize);
+    m_subVoxelGpuBytes -= std::min(m_subVoxelGpuBytes, geometry.byteSize);
+
+    geometry.vertices.upload(mesh.vertices.data(), vertexBytes);
+    geometry.indices.upload(mesh.indices.data(), indexBytes);
+    geometry.indexCount = static_cast<std::uint32_t>(mesh.indices.size());
+    geometry.triangles  = static_cast<std::uint32_t>(mesh.triangleCount());
+    geometry.byteSize   = vertexBytes + indexBytes;
+
+    m_gpuBytes += geometry.byteSize;
+    m_subVoxelGpuBytes += geometry.byteSize;
+
+    refreshBounds(target);
+}
+
+void ChunkRenderer::removeSubVoxels(const ChunkPos& position)
+{
+    const auto found = m_meshes.find(position);
+    if (found == m_meshes.end()) {
+        return;
+    }
+    ChunkMesh&        target   = found->second;
+    SubVoxelGeometry& geometry = target.subVoxel;
+    if (geometry.empty() && geometry.byteSize == 0) {
+        return;
+    }
+
+    m_gpuBytes -= std::min(m_gpuBytes, geometry.byteSize);
+    m_subVoxelGpuBytes -= std::min(m_subVoxelGpuBytes, geometry.byteSize);
+    geometry.release();
+
+    if (!target.hasBlockGeometry()) {
+        // The record only existed to carry the damage; repairing it fully takes
+        // the chunk out of residency rather than leaving an empty shell that the
+        // cull loop still has to visit.
+        m_meshes.erase(found);
+        return;
+    }
+    refreshBounds(target);
+}
+
+// -------------------------------------------------------------- residency --
 
 void ChunkRenderer::remove(const ChunkPos& position)
 {
@@ -116,8 +247,11 @@ void ChunkRenderer::remove(const ChunkPos& position)
     if (found == m_meshes.end()) {
         return;
     }
-    // Erasing runs the GpuBuffer destructors, which delete the GL objects.
-    m_gpuBytes -= std::min(m_gpuBytes, found->second.byteSize);
+    // Erasing runs the GpuBuffer destructors - all four of them - which delete
+    // the GL objects. Both streams therefore always die together with the chunk.
+    const ChunkMesh& target = found->second;
+    m_gpuBytes -= std::min(m_gpuBytes, target.byteSize + target.subVoxel.byteSize);
+    m_subVoxelGpuBytes -= std::min(m_subVoxelGpuBytes, target.subVoxel.byteSize);
     m_meshes.erase(found);
 }
 
@@ -126,13 +260,21 @@ void ChunkRenderer::clear()
     for (std::vector<VisibleMesh>& list : m_visible) {
         list.clear();
     }
+    m_visibleSubVoxel.clear();
     m_meshes.clear();
-    m_gpuBytes = 0;
+    m_gpuBytes         = 0;
+    m_subVoxelGpuBytes = 0;
 }
 
 bool ChunkRenderer::contains(const ChunkPos& position) const
 {
     return m_meshes.find(position) != m_meshes.end();
+}
+
+bool ChunkRenderer::hasSubVoxels(const ChunkPos& position) const
+{
+    const auto found = m_meshes.find(position);
+    return found != m_meshes.end() && !found->second.subVoxel.empty();
 }
 
 std::optional<std::uint32_t> ChunkRenderer::uploadedVersion(const ChunkPos& position) const
@@ -144,6 +286,17 @@ std::optional<std::uint32_t> ChunkRenderer::uploadedVersion(const ChunkPos& posi
     return found->second.contentVersion;
 }
 
+std::optional<LodLevel> ChunkRenderer::uploadedLod(const ChunkPos& position) const
+{
+    const auto found = m_meshes.find(position);
+    if (found == m_meshes.end()) {
+        return std::nullopt;
+    }
+    return found->second.lod;
+}
+
+// -------------------------------------------------------------- per frame --
+
 void ChunkRenderer::beginFrame() noexcept
 {
     m_stats.drawCalls         = 0;
@@ -151,6 +304,10 @@ void ChunkRenderer::beginFrame() noexcept
     m_stats.chunksVisible     = 0;
     m_stats.chunksCulled      = 0;
     m_stats.drawCallsPerLayer.fill(0);
+    m_stats.drawCallsPerLod.fill(0);
+    m_stats.trianglesPerLod.fill(0);
+    m_stats.subVoxelDrawCalls = 0;
+    m_stats.subVoxelTriangles = 0;
 }
 
 void ChunkRenderer::cull(const Frustum& frustum, const glm::vec3& eyePosition)
@@ -158,16 +315,34 @@ void ChunkRenderer::cull(const Frustum& frustum, const glm::vec3& eyePosition)
     for (std::vector<VisibleMesh>& list : m_visible) {
         list.clear();
     }
+    m_visibleSubVoxel.clear();
 
     std::uint32_t visible = 0;
     std::uint32_t culled  = 0;
 
+    m_stats.chunksResidentPerLod.fill(0);
+    m_stats.chunksVisiblePerLod.fill(0);
+    m_stats.subVoxelChunksResident = 0;
+    m_stats.subVoxelChunksVisible  = 0;
+
     for (const auto& [position, mesh] : m_meshes) {
+        const std::size_t level = lodIndex(mesh.lod);
+        ++m_stats.chunksResidentPerLod[level];
+        const bool damaged = !mesh.subVoxel.empty();
+        if (damaged) {
+            ++m_stats.subVoxelChunksResident;
+        }
+
+        // ONE frustum test per chunk feeds both passes. Testing the sub-voxel
+        // geometry separately - against its own tighter box, say - would let a
+        // carved surface survive a frame in which its parent chunk was culled,
+        // which reads on screen as debris floating in the void.
         if (!frustum.intersects(mesh.bounds)) {
             ++culled;
             continue;
         }
         ++visible;
+        ++m_stats.chunksVisiblePerLod[level];
 
         // Squared distance to the box centre. The centre (rather than the
         // nearest point) is stable as the camera moves, which keeps the sort
@@ -179,6 +354,10 @@ void ChunkRenderer::cull(const Frustum& frustum, const glm::vec3& eyePosition)
             if (mesh.ranges[i].indexCount != 0) {
                 m_visible[i].push_back(VisibleMesh{&mesh, distanceSq});
             }
+        }
+        if (damaged) {
+            m_visibleSubVoxel.push_back(VisibleMesh{&mesh, distanceSq});
+            ++m_stats.subVoxelChunksVisible;
         }
     }
 
@@ -195,11 +374,15 @@ void ChunkRenderer::cull(const Frustum& frustum, const glm::vec3& eyePosition)
               m_visible[layerIndex(RenderLayer::Cutout)].end(), nearFirst);
     std::sort(m_visible[layerIndex(RenderLayer::Translucent)].begin(),
               m_visible[layerIndex(RenderLayer::Translucent)].end(), farFirst);
+    // Sub-voxel geometry is opaque, so it wants the same front-to-back order for
+    // the same reason: early-Z rejects the fragments behind it.
+    std::sort(m_visibleSubVoxel.begin(), m_visibleSubVoxel.end(), nearFirst);
 
-    m_stats.chunksVisible  = visible;
-    m_stats.chunksCulled   = culled;
-    m_stats.chunksResident = static_cast<std::uint32_t>(m_meshes.size());
-    m_stats.gpuBytes       = m_gpuBytes;
+    m_stats.chunksVisible    = visible;
+    m_stats.chunksCulled     = culled;
+    m_stats.chunksResident   = static_cast<std::uint32_t>(m_meshes.size());
+    m_stats.gpuBytes         = m_gpuBytes;
+    m_stats.subVoxelGpuBytes = m_subVoxelGpuBytes;
 }
 
 std::size_t ChunkRenderer::visibleCount(RenderLayer layer) const noexcept
@@ -241,11 +424,65 @@ void ChunkRenderer::drawLayer(RenderLayer layer, const ShaderProgram& program,
 
         ++drawCalls;
         triangles += range.triangles;
+
+        const std::size_t level = lodIndex(mesh.lod);
+        ++m_stats.drawCallsPerLod[level];
+        m_stats.trianglesPerLod[level] += range.triangles;
     }
 
     m_stats.drawCalls += drawCalls;
     m_stats.drawCallsPerLayer[layerIndex(layer)] += drawCalls;
     m_stats.trianglesRendered += triangles;
+}
+
+void ChunkRenderer::drawSubVoxels(const ShaderProgram& program, GLint chunkOriginLocation)
+{
+    // The early out is the feature's entire performance story. Nearly every
+    // chunk is undamaged, and binding a VAO plus issuing a zero-index draw per
+    // chunk would cost more than the geometry it renders.
+    if (m_visibleSubVoxel.empty()) {
+        return;
+    }
+
+    m_subVoxelVertexArray.bind();
+
+    std::uint32_t drawCalls = 0;
+    std::uint64_t triangles = 0;
+    for (const VisibleMesh& entry : m_visibleSubVoxel) {
+        const ChunkMesh&        mesh     = *entry.mesh;
+        const SubVoxelGeometry& geometry = mesh.subVoxel;
+
+        m_subVoxelVertexArray.bindVertexBuffer(kVertexBinding, geometry.vertices.id(), 0,
+                                               static_cast<GLsizei>(sizeof(PackedSubVoxelVertex)));
+        m_subVoxelVertexArray.bindElementBuffer(geometry.indices.id());
+
+        // Sub-voxel positions are chunk-local in SUB-VOXEL units; subvoxel.vert
+        // scales them back into block space before adding this origin, so the
+        // uniform carries the same world-space block origin as the main pass.
+        const BlockPos origin = mesh.position.originBlock();
+        program.setVec3(chunkOriginLocation,
+                        glm::vec3{static_cast<float>(origin.x), static_cast<float>(origin.y),
+                                  static_cast<float>(origin.z)});
+
+        glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(geometry.indexCount), GL_UNSIGNED_INT,
+                       nullptr);
+
+        ++drawCalls;
+        triangles += geometry.triangles;
+
+        const std::size_t level = lodIndex(mesh.lod);
+        ++m_stats.drawCallsPerLod[level];
+        m_stats.trianglesPerLod[level] += geometry.triangles;
+    }
+
+    // Counted into the frame totals as well as the breakdown: these are real
+    // draw calls in the opaque pass, and a debug overlay whose "draw calls"
+    // figure excluded them would understate the frame.
+    m_stats.drawCalls += drawCalls;
+    m_stats.drawCallsPerLayer[layerIndex(RenderLayer::Opaque)] += drawCalls;
+    m_stats.trianglesRendered += triangles;
+    m_stats.subVoxelDrawCalls += drawCalls;
+    m_stats.subVoxelTriangles += triangles;
 }
 
 }  // namespace voxl

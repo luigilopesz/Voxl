@@ -20,10 +20,41 @@
 // The chunk map is guarded by a shared_mutex. Reads are short (a hash lookup and
 // a shared_ptr copy) and never overlap a mesh job's multi-millisecond scan,
 // because a mesher works from a ChunkNeighbourhood snapshot instead of the map.
+//
+// LEVEL OF DETAIL
+// ---------------
+// Each resident chunk carries a LodLevel (world/Lod.hpp) chosen from its
+// horizontal distance to the player. Changing that level means regenerating the
+// voxels and rebuilding the geometry, which is far too slow to do in place while
+// the player is looking at the result.
+//
+// So a transition is a SHADOW REBUILD. A brand-new Chunk object is created off
+// to the side at the same position, generated at the new level and meshed on a
+// worker; only when its geometry is ready does one main-thread closure swap the
+// map slot and hand the new mesh to the renderer. Until that instant the old
+// chunk is still in the map and its old mesh is still on the GPU, so the chunk
+// never disappears for a frame - which is the single most visible way to get
+// this wrong.
+//
+// Two properties make the shadow safe, and both are worth stating plainly:
+//
+//  * The shadow is invisible to everything else until the swap, so the terrain
+//    job writes voxels nobody can read. There is no "write while a neighbour is
+//    meshing" hazard on the generate half at all.
+//  * The *mesh* half still reads a one-voxel skirt out of the 26 live
+//    neighbours, so the main thread must not write them while it runs. That is
+//    guaranteed by putting the LIVE chunk into ChunkState::Meshing for the
+//    duration: World::isEditBlocked() already refuses to write any chunk whose
+//    own 3x3x3 contains a Meshing chunk, which is exactly this set. Reusing that
+//    one CAS is also what makes "a chunk can only be rebuilding at one level at
+//    a time" true by construction - there is no second busy flag to keep in
+//    step, and an ordinary remesh and a LOD rebuild contend for the same
+//    Ready -> Meshing transition.
 
 #include "core/JobSystem.hpp"
 #include "world/BlockAccess.hpp"
 #include "world/Chunk.hpp"
+#include "world/Lod.hpp"
 #include "world/VoxelTypes.hpp"
 
 #include <array>
@@ -62,7 +93,14 @@ struct StreamingConfig {
     /// Membership is by squared distance, so the loaded region is a cylinder
     /// rather than a square: the corners of a square are 1.41x further away and
     /// cost 27% more chunks for terrain the player can barely see.
-    std::int32_t loadRadius = 8;
+    ///
+    /// 20 rather than the pre-LOD 8. The old value was chosen when every chunk
+    /// was meshed and drawn at full resolution; with `lod` enabled, everything
+    /// past 14 chunks is built from 4x4x4-block cells and contributes roughly a
+    /// sixty-fourth of the geometry it used to. 20 is also the smallest radius
+    /// that gives LodPolicy's outermost band (bandStart[2] == 14) a ring wide
+    /// enough to be worth having; anything less and level 3 is never used.
+    std::int32_t loadRadius = 20;
 
     /// Extra radius a chunk must leave before it is retired. MUST be >= 1:
     /// unloading at exactly `loadRadius` makes a player walking along the
@@ -83,10 +121,18 @@ struct StreamingConfig {
     /// Caps on work in flight. Without them, the first update after a teleport
     /// submits thousands of jobs at once, and the nearest chunk ends up queued
     /// behind hundreds of distant ones that were scheduled in the same burst.
-    std::size_t maxGenerateJobsInFlight = 64;
+    std::size_t maxGenerateJobsInFlight = 96;
     std::size_t maxMeshJobsInFlight     = 32;
-    /// Jobs dispatched per update, across both kinds.
-    std::size_t maxScheduledPerUpdate = 24;
+
+    /// Jobs dispatched per update, across every kind.
+    ///
+    /// Raised from the pre-LOD 24 because the load volume grew 6.25x while the
+    /// chunks that fill the new space cost a small fraction of an old one to
+    /// generate and mesh. At 24 a cold start takes ~420 updates to fill a radius
+    /// of 20, which is seven seconds of terrain visibly arriving; at 48 it is
+    /// three and a half, and the per-update work is still below what 24
+    /// full-resolution chunks used to cost.
+    std::size_t maxScheduledPerUpdate = 48;
     /// Chunks retired per update. Retiring is cheap but the release callback
     /// deletes GPU buffers, which is not.
     std::size_t maxUnloadsPerUpdate = 16;
@@ -95,6 +141,41 @@ struct StreamingConfig {
     /// [0, 1). 0.5 means a chunk dead ahead is treated as half as far as one
     /// directly behind at the same range.
     float viewBias = 0.5f;
+
+    // ------------------------------------------------------ level of detail --
+
+    /// Which resolution a chunk is generated and meshed at, by distance. Set
+    /// `lod.enabled = false` to pin the whole world to level 0 for a
+    /// like-for-like comparison against the pre-LOD renderer.
+    LodPolicy lod{};
+
+    /// LOD rebuilds STARTED per update.
+    ///
+    /// A transition regenerates a chunk and rebuilds its geometry, so it costs
+    /// roughly what streaming a brand-new chunk costs. A band edge at radius 14
+    /// is ~88 columns, i.e. ~700 chunk sections, and letting a whole edge flip in
+    /// one update is a multi-frame stall on the workers plus a burst of uploads
+    /// on the main thread. Four per update drains that edge in about three
+    /// seconds of continuous walking, and because the old mesh keeps being drawn
+    /// the whole time the delay is invisible - a chunk a little too coarse for a
+    /// second or two is not a defect a player can see at 450 blocks.
+    std::size_t maxLodTransitionsPerUpdate = 4;
+
+    /// Rebuild jobs allowed to be in flight at once, across all updates. Bounds
+    /// how much worker time LOD can steal from ordinary streaming when the
+    /// player is moving fast enough to keep the per-update cap saturated.
+    std::size_t maxLodJobsInFlight = 8;
+
+    /// Refuse to change the level of a chunk the player has edited.
+    ///
+    /// A rebuild regenerates terrain from the seed, which would silently erase
+    /// the edit. Chunk::needsSave() is the marker and it is exact: the terrain
+    /// generator writes through ChunkStorage and never sets it, only
+    /// Chunk::setBlock does. Until a persistence layer exists to re-apply edits
+    /// on top of a regenerated chunk, an edited chunk simply keeps the level it
+    /// was edited at - a handful of full-resolution chunks in the distance is a
+    /// far cheaper bug than a player's build dissolving when they walk away.
+    bool preserveEditedChunks = true;
 
     [[nodiscard]] std::int32_t unloadRadius() const noexcept
     {
@@ -151,8 +232,14 @@ struct WorldStats {
     /// Reported by the renderer after culling; the world does no culling itself.
     std::size_t visibleChunks = 0;
 
+    /// Resident chunks per LodLevel, indexed by level. The debug overlay shows
+    /// this as the LOD distribution; a healthy walk has all four buckets
+    /// populated and the level-0 bucket roughly constant.
+    std::array<std::size_t, kLodCount> chunksByLod{};
+
     std::size_t generateJobsInFlight = 0;
     std::size_t meshJobsInFlight     = 0;
+    std::size_t lodJobsInFlight      = 0;
     std::size_t pendingUploads       = 0;
     /// Edits waiting for their chunk to leave a worker-owned state. World only.
     std::size_t deferredEdits = 0;
@@ -161,12 +248,26 @@ struct WorldStats {
     std::size_t gpuMeshBytes  = 0;
     std::size_t triangles     = 0;
 
+    /// Partially destroyed blocks summed over resident chunks, and what their
+    /// sparse side tables cost. Both are zero for untouched terrain, which is the
+    /// claim the sub-voxel design rests on - so they are worth being able to read
+    /// rather than assume.
+    std::size_t damagedBlocks = 0;
+    std::size_t subVoxelBytes = 0;
+
     std::uint64_t chunksCreated  = 0;
     std::uint64_t chunksUnloaded = 0;
     std::uint64_t meshesUploaded = 0;
     /// Meshes thrown away because the chunk was retired or edited mid-job. A
     /// number that climbs steadily means the streaming radii are thrashing.
     std::uint64_t meshesDropped = 0;
+
+    /// LOD rebuilds that completed and swapped in. Divided by elapsed time this
+    /// is the transition rate; if it grows without the player moving, the
+    /// hysteresis band is too narrow for the band edges in use.
+    std::uint64_t lodTransitions = 0;
+    /// Rebuilds finished after their chunk had already been retired or replaced.
+    std::uint64_t lodTransitionsDropped = 0;
 
     ChunkPos     centre{};
     std::int32_t loadRadius   = 0;
@@ -207,6 +308,12 @@ public:
     [[nodiscard]] const StreamingConfig& config() const noexcept { return m_config; }
     /// Clamps the padding to at least one chunk; see StreamingConfig.
     void setConfig(const StreamingConfig& config);
+
+    [[nodiscard]] const LodPolicy& lodPolicy() const noexcept { return m_config.lod; }
+    /// Replaces the selection policy. Resident chunks are not rebuilt here; the
+    /// next update() picks up the new bands through the ordinary transition path,
+    /// so the change is spread over several frames like any other.
+    void setLodPolicy(const LodPolicy& policy);
 
     // ---- residency (any thread) ----
 
@@ -253,6 +360,25 @@ public:
 
     [[nodiscard]] static std::int64_t horizontalDistanceSq(const ChunkPos& a,
                                                            const ChunkPos& b) noexcept;
+
+    /// Floor of the horizontal distance in chunks - the unit LodPolicy speaks.
+    ///
+    /// Computed as an exact integer square root rather than a rounded
+    /// `std::sqrt`, because the level a chunk lands in must be a pure function
+    /// of two integers: a chunk that flips level because a double rounded the
+    /// other way on a different machine is a determinism bug that only shows up
+    /// as a mesh count differing between two runs of the same seed.
+    [[nodiscard]] static std::int32_t horizontalDistanceChunks(const ChunkPos& a,
+                                                               const ChunkPos& b) noexcept;
+
+    /// Level the policy wants for `chunk` given the player is at `centre`.
+    /// `current` is the chunk's present level, which engages the hysteresis; pass
+    /// the two-argument form only for chunks that are actually resident.
+    [[nodiscard]] LodLevel desiredLod(const ChunkPos& centre, const ChunkPos& chunk,
+                                      LodLevel current) const noexcept;
+    /// Level for a chunk that has no present level yet.
+    [[nodiscard]] LodLevel desiredLod(const ChunkPos& centre, const ChunkPos& chunk) const noexcept;
+
     [[nodiscard]] bool inLoadRange(const ChunkPos& centre, const ChunkPos& chunk) const noexcept;
     /// True while a chunk is close enough to keep. Strictly wider than
     /// `inLoadRange` - that gap is the anti-thrash hysteresis.
@@ -290,7 +416,7 @@ private:
         std::size_t triangles = 0;
     };
 
-    enum class WorkKind : std::uint8_t { Generate, Mesh };
+    enum class WorkKind : std::uint8_t { Generate, Mesh, LodRebuild };
 
     struct Candidate {
         float      score = 0.0f;
@@ -298,6 +424,8 @@ private:
         ChunkPtr   chunk;
         WorkKind   kind  = WorkKind::Generate;
         ChunkState state = ChunkState::Empty;
+        /// Only meaningful for WorkKind::LodRebuild.
+        LodLevel targetLod = kLodFull;
     };
 
     // update() steps
@@ -305,8 +433,39 @@ private:
     void dispatch();
     void retireDistant(const ChunkPos& centre, std::uint64_t frameIndex);
 
+    /// Level `chunk` should be rebuilt to, or its current level when it must
+    /// stay put. Returning "no change" rather than a bool keeps every reason a
+    /// rebuild is refused - wrong state, no generator, player edits, policy
+    /// hysteresis - in one place instead of scattered through collect().
+    [[nodiscard]] LodLevel lodTargetFor(const ChunkPtr& chunk, ChunkState state,
+                                        std::int32_t distanceInChunks) const noexcept;
+
     bool dispatchGenerate(const ChunkPtr& chunk, JobPriority priority);
     bool dispatchMesh(const Candidate& candidate, JobPriority priority);
+
+    /// Starts a shadow rebuild at `candidate.targetLod`. See the LEVEL OF DETAIL
+    /// section of the file header for why it is a shadow and not an in-place
+    /// regeneration.
+    bool dispatchLodRebuild(const Candidate& candidate, JobPriority priority);
+
+    /// Main-thread tail of a rebuild: publishes `shadow` in place of `live` and
+    /// uploads its mesh, both inside this one call so no frame can observe the
+    /// position without geometry. MAIN THREAD.
+    void finishLodRebuild(const ChunkPtr& live, const ChunkPtr& shadow,
+                          const ChunkMeshUpload& result);
+
+    /// Flags the 26 chunks around `position` for a remesh.
+    ///
+    /// Called after a LOD swap, and not optional. Skirts (Lod.hpp) hide the
+    /// crack a level mismatch opens along a seam, but they do not fix face
+    /// culling: the mesher decides per chunk face whether the neighbour across
+    /// it renders at the same resolution, and only culls against it when it
+    /// does. Every neighbour of a chunk that just changed level made that
+    /// decision against the OLD level, so its border faces are wrong in the
+    /// direction that shows - culled where they should now be drawn. Because a
+    /// mesh is only rebuilt when something dirties the chunk, the resulting hole
+    /// would be permanent.
+    void markNeighboursDirty(const ChunkPos& position);
 
     /// True when `chunk` is still the object the map holds for its position.
     /// Comparing addresses rather than positions is the whole point: a retired
@@ -322,7 +481,8 @@ private:
     [[nodiscard]] std::size_t jobsInFlight() const noexcept
     {
         return m_generateInFlight.load(std::memory_order_acquire) +
-               m_meshInFlight.load(std::memory_order_acquire);
+               m_meshInFlight.load(std::memory_order_acquire) +
+               m_lodInFlight.load(std::memory_order_acquire);
     }
 
     JobSystem&      m_jobs;
@@ -350,6 +510,10 @@ private:
 
     std::atomic<std::size_t> m_generateInFlight{0};
     std::atomic<std::size_t> m_meshInFlight{0};
+    /// LOD rebuilds are counted apart from ordinary meshing so they can have
+    /// their own in-flight budget; jobsInFlight() sums all three, which is what
+    /// keeps waitForPendingJobs() and the destructor honest.
+    std::atomic<std::size_t> m_lodInFlight{0};
     std::atomic<std::size_t> m_pendingUploads{0};
     std::atomic<std::size_t> m_queuedChunks{0};
     std::atomic<std::size_t> m_visibleChunks{0};
@@ -358,6 +522,8 @@ private:
     std::atomic<std::uint64_t> m_chunksUnloaded{0};
     std::atomic<std::uint64_t> m_meshesUploaded{0};
     std::atomic<std::uint64_t> m_meshesDropped{0};
+    std::atomic<std::uint64_t> m_lodTransitions{0};
+    std::atomic<std::uint64_t> m_lodTransitionsDropped{0};
 
     /// Only the sleep/wake handshake for waitForPendingJobs; the counters above
     /// are atomics so stats() never contends with a worker.

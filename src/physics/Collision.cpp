@@ -66,6 +66,142 @@ struct BlockRange {
     return range;
 }
 
+// ---------------------------------------------------------------- sub-voxels --
+//
+// Everything below runs ONLY for a block that actually carries damage. Untouched
+// terrain never reaches it, which is what keeps the pre-sub-voxel cost intact.
+
+/// Sub-voxel index span of a box's overlap with one block along one axis.
+///
+/// Clamped to the block rather than rejected, so a box that extends past the
+/// block simply covers the whole span. Floors both ends, matching blockRangeOf's
+/// treatment one level up: the two must agree or a box could overlap a block and
+/// none of its sub-voxels.
+struct SubRange {
+    std::int32_t min = 0;
+    std::int32_t max = kSubVoxelResolution - 1;
+};
+
+[[nodiscard]] SubRange subRangeOf(float boxMin, float boxMax, std::int32_t block) noexcept
+{
+    constexpr float resolution = static_cast<float>(kSubVoxelResolution);
+    const float     base       = static_cast<float>(block);
+
+    SubRange range{};
+    range.min = std::clamp(floorToInt((boxMin - base) * resolution), 0, kSubVoxelResolution - 1);
+    range.max = std::clamp(floorToInt((boxMax - base) * resolution), 0, kSubVoxelResolution - 1);
+    if (range.max < range.min) {
+        range.max = range.min;
+    }
+    return range;
+}
+
+/// True when any sub-voxel still present in `grid` overlaps `box`.
+[[nodiscard]] bool gridOverlapsBox(const SubVoxelGrid& grid, const Aabb& box,
+                                   const BlockPos& block) noexcept
+{
+    const SubRange rangeX = subRangeOf(box.min.x, box.max.x, block.x);
+    const SubRange rangeY = subRangeOf(box.min.y, box.max.y, block.y);
+    const SubRange rangeZ = subRangeOf(box.min.z, box.max.z, block.z);
+
+    for (std::int32_t sy = rangeY.min; sy <= rangeY.max; ++sy) {
+        for (std::int32_t sz = rangeZ.min; sz <= rangeZ.max; ++sz) {
+            for (std::int32_t sx = rangeX.min; sx <= rangeX.max; ++sx) {
+                if (grid.test(subVoxelIndex(sx, sy, sz))) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+struct SubVoxelGap {
+    bool  found = false;
+    /// Signed distance from the box's leading face to the nearest solid
+    /// sub-voxel face, in the same units and sign convention the whole-block
+    /// sweep uses.
+    float gap = 0.0f;
+};
+
+/// Gap to the nearest solid sub-voxel of a damaged block along one axis.
+///
+/// `probe` is the shrunk box, used only for the two axes the sweep does not move
+/// along. Testing them explicitly is what makes this correct: at whole-block
+/// granularity "the block is in the swept range" already implied the solid part
+/// overlapped, but only part of a damaged block is solid, so that implication is
+/// gone. Without this test a carved tunnel would still stop the player.
+///
+/// `box` is the original, unshrunk box, because that is what the whole-block path
+/// measures the gap from - using the probe here would make a body come to rest a
+/// skin further out beside damage than beside intact terrain.
+[[nodiscard]] SubVoxelGap nearestSubVoxelGap(const SubVoxelGrid& grid, const Aabb& box,
+                                             const Aabb& probe, const BlockPos& block, int axis,
+                                             bool positive) noexcept
+{
+    const int other0 = (axis + 1) % 3;
+    const int other1 = (axis + 2) % 3;
+
+    const std::int32_t blockCoord[3]{block.x, block.y, block.z};
+
+    const SubRange spanA = subRangeOf(probe.min[other0], probe.max[other0], blockCoord[other0]);
+    const SubRange spanB = subRangeOf(probe.min[other1], probe.max[other1], blockCoord[other1]);
+
+    // Walk the sweep axis from the facing side inward. The gap is monotonic in
+    // the slice index, so the first slice holding a solid sub-voxel that overlaps
+    // the box is the nearest one and nothing behind it can be closer - which is
+    // what makes the early return exact rather than an approximation.
+    for (std::int32_t step = 0; step < kSubVoxelResolution; ++step) {
+        const std::int32_t n = positive ? step : kSubVoxelResolution - 1 - step;
+
+        const float sliceLow =
+            static_cast<float>(blockCoord[axis]) + static_cast<float>(n) * kSubVoxelSize;
+
+        // Skip slices that are not ahead of the leading face.
+        //
+        // A body can legitimately be standing INSIDE a damaged block: carve the
+        // top sub-voxel layer out from under it and it settles with its feet
+        // below the block's upper boundary. Measuring against a slice it is
+        // already overlapping yields a negative gap, which the caller reads as
+        // "no room to move" and clamps the whole step to zero - so the player
+        // could never jump or walk out of a shallow scoop. Aabb::axisGap
+        // documents this same conflation of penetration with clearance as
+        // forbidden for the whole-block path; the sub-voxel path has to honour
+        // it too. Only slices strictly beyond the leading face can block motion.
+        if (positive) {
+            if (sliceLow < box.max[axis]) {
+                continue;
+            }
+        } else if (sliceLow + kSubVoxelSize > box.min[axis]) {
+            continue;
+        }
+
+        bool solid = false;
+        for (std::int32_t a = spanA.min; a <= spanA.max && !solid; ++a) {
+            for (std::int32_t b = spanB.min; b <= spanB.max; ++b) {
+                std::int32_t sub[3]{};
+                sub[axis]   = n;
+                sub[other0] = a;
+                sub[other1] = b;
+                if (grid.test(subVoxelIndex(sub[0], sub[1], sub[2]))) {
+                    solid = true;
+                    break;
+                }
+            }
+        }
+        if (!solid) {
+            continue;
+        }
+
+        SubVoxelGap result{};
+        result.found = true;
+        result.gap =
+            positive ? sliceLow - box.max[axis] : box.min[axis] - (sliceLow + kSubVoxelSize);
+        return result;
+    }
+    return SubVoxelGap{};
+}
+
 [[nodiscard]] float lerp(float a, float b, float t) noexcept
 {
     return a + (b - a) * t;
@@ -168,16 +304,46 @@ struct StepAttempt {
 
 // ------------------------------------------------------------- collider ----
 
+bool VoxelCollider::isSubVoxelBlocking(const BlockPos& block, std::int32_t sx, std::int32_t sy,
+                                       std::int32_t sz) const noexcept
+{
+    // Out of range degrades to empty space rather than being an error, so a
+    // carving brush or a probe that walks off the edge of a grid just finds
+    // nothing there.
+    if (!isSubVoxelPos(sx, sy, sz) || !isBlocking(block)) {
+        return false;
+    }
+    const SubVoxelGrid* grid = subVoxelsAt(block);
+    // No entry means uniform, and the block already tested as blocking, so every
+    // sub-voxel of it is solid. This is the SubVoxel.hpp invariant's fallback and
+    // it is not optional - assuming an entry exists reports intact terrain as air.
+    return grid == nullptr || grid->test(subVoxelIndex(sx, sy, sz));
+}
+
 bool VoxelCollider::overlapsSolid(const Aabb& box, float skin) const noexcept
 {
     if (!box.valid()) {
         return false;
     }
+    const Aabb       probe = box.shrunk(skin);
     const BlockRange range = blockRangeOf(box, skin);
     for (std::int32_t y = range.min[kAxisY]; y <= range.max[kAxisY]; ++y) {
         for (std::int32_t z = range.min[kAxisZ]; z <= range.max[kAxisZ]; ++z) {
             for (std::int32_t x = range.min[kAxisX]; x <= range.max[kAxisX]; ++x) {
-                if (isBlocking(BlockPos{x, y, z})) {
+                const BlockPos pos{x, y, z};
+                if (!isBlocking(pos)) {
+                    continue;
+                }
+                // Fast path first and unchanged: nullptr is every block in
+                // untouched terrain, and it costs one null test when no
+                // SubVoxelAccess was supplied at all.
+                const SubVoxelGrid* grid = subVoxelsAt(pos);
+                if (grid == nullptr) {
+                    return true;
+                }
+                // A damaged block only overlaps where it still has material, so a
+                // box sitting inside a carved alcove is not in contact with it.
+                if (gridOverlapsBox(*grid, probe, pos)) {
                     return true;
                 }
             }
@@ -267,6 +433,7 @@ AxisMove sweepAxisAgainstWorld(const VoxelCollider& world, const Aabb& box, int 
     const bool  positive = request > 0.0f;
 
     const BlockRange range = blockRangeForSweep(box, axis, request, skin);
+    const Aabb       probe = box.shrunk(skin);
 
     // Every voxel in `range` already strictly overlaps the box on the two static
     // axes, because only `axis` was extended. So the inner test reduces to a
@@ -282,10 +449,25 @@ AxisMove sweepAxisAgainstWorld(const VoxelCollider& world, const Aabb& box, int 
                     continue;
                 }
                 const std::int32_t coordinate[3]{x, y, z};
-                const float        low = static_cast<float>(coordinate[axis]);
+
                 // Facing face of the voxel: its near side when moving up the
                 // axis, its far side when moving down.
-                const float gap = positive ? low - box.max[axis] : box.min[axis] - (low + 1.0f);
+                float gap = 0.0f;
+                if (const SubVoxelGrid* grid = world.subVoxelsAt(pos); grid == nullptr) {
+                    const float low = static_cast<float>(coordinate[axis]);
+                    gap = positive ? low - box.max[axis] : box.min[axis] - (low + 1.0f);
+                } else {
+                    // A damaged block's facing surface is wherever its material
+                    // still is, which may be several sub-voxels in - or nowhere at
+                    // all, if the box is passing through a carved channel.
+                    const SubVoxelGap hit =
+                        nearestSubVoxelGap(*grid, box, probe, pos, axis, positive);
+                    if (!hit.found) {
+                        continue;
+                    }
+                    gap = hit.gap;
+                }
+
                 // Stop a skin short so the resting box never strictly overlaps.
                 // Negative gaps mean pre-existing penetration; clamping to 0
                 // refuses to push deeper without shoving the body out.

@@ -1,6 +1,7 @@
 #pragma once
 
-// The frame: GL pipeline state, the sky, and the three chunk passes.
+// The frame: GL pipeline state, the sky, the three chunk passes and the
+// sub-voxel damage pass.
 //
 // STATE DISCIPLINE: GL state is set once per pass, never per draw. Every pass
 // below states the complete set of state it depends on, and `endFrame()` leaves
@@ -155,8 +156,14 @@ public:
     /// last would need depth testing against geometry that has already blended.
     void drawSky();
 
-    /// Opaque, then cutout, then translucent. Call after `chunks().cull(...)`,
-    /// which `beginFrame` does for you using the camera it was given.
+    /// Opaque, then the sub-voxel damage pass, then cutout, then translucent.
+    /// Call after `chunks().cull(...)`, which `beginFrame` does for you using
+    /// the camera it was given.
+    ///
+    /// The sub-voxel pass sits inside the opaque block, after the whole-block
+    /// geometry: it shares the depth buffer and the block texture array, and
+    /// running it before cutout means alpha-tested foliage still depth-tests
+    /// against carved surfaces correctly.
     void drawWorld();
 
     /// Restores the neutral state described in the header comment.
@@ -169,6 +176,14 @@ public:
     /// failed compile logs and keeps the working program.
     std::size_t reloadShaders();
 
+    /// False when assets/shaders/subvoxel.{vert,frag} could not be loaded. The
+    /// rest of the renderer stays valid and the damage pass is simply skipped -
+    /// a missing optional pass must not black out the world.
+    [[nodiscard]] bool subVoxelPassAvailable() const noexcept
+    {
+        return m_subVoxelProgram != nullptr;
+    }
+
     [[nodiscard]] const RenderStats& stats() const noexcept { return m_stats; }
 
     /// Colour the sky renders at the horizon, for anything that has to match it.
@@ -178,6 +193,7 @@ private:
     bool loadShaders();
     void detectFramebufferEncoding();
     void applyOpaqueState();
+    void applySubVoxelState();
     void applyCutoutState();
     void applyTranslucentState();
 
@@ -194,8 +210,11 @@ private:
     ShaderProgram* m_chunkProgram = nullptr;
     ShaderProgram* m_waterProgram = nullptr;
     ShaderProgram* m_skyProgram   = nullptr;
+    /// Optional: null when subvoxel.{vert,frag} is absent or failed to compile.
+    ShaderProgram*       m_subVoxelProgram = nullptr;
     ChunkProgramUniforms m_chunkUniforms{};
     ChunkProgramUniforms m_waterUniforms{};
+    ChunkProgramUniforms m_subVoxelUniforms{};
 
     TextureArray  m_blockTextures;
     ChunkRenderer m_chunks;

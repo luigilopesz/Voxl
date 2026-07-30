@@ -1,13 +1,18 @@
-// Compile-time verification of the Chunk lifecycle contract.
+// Chunk's out-of-line members, plus compile-time verification of its lifecycle
+// contract.
 //
-// WHY THIS FILE HAS NO FUNCTION DEFINITIONS
-// -----------------------------------------
-// Chunk is defined entirely in-class in world/Chunk.hpp. Its members are either
-// atomic loads/stores that must inline (the streaming scheduler queries state()
-// and needsRemesh() for every resident chunk, every frame) or one-line forwards
-// into ChunkStorage. There is no body left to move out of line.
+// WHY ALMOST NOTHING IS DEFINED HERE
+// ----------------------------------
+// Chunk is defined in-class in world/Chunk.hpp. Its members are either atomic
+// loads/stores that must inline (the streaming scheduler queries state() and
+// needsRemesh() for every resident chunk, every frame) or one-line forwards into
+// ChunkStorage. The only exceptions are the two sub-voxel edit entry points at
+// the bottom of this file: they are the single place where SubVoxelStore and
+// ChunkStorage are kept consistent, they are called at most a few times per
+// player action, and inlining a two-container invariant into every call site is
+// how that invariant ends up being reimplemented slightly differently elsewhere.
 //
-// What lives here is the check that the transition diagram in the header comment
+// The rest of this file is the check that the transition diagram in the header comment
 // still describes the code underneath it. isLegalChunkTransition() is a
 // hand-written switch, and the only runtime guard on it is the VOXL_ASSERT in
 // tryTransition(), which is compiled out of every non-Debug build. Below, the
@@ -218,6 +223,87 @@ static_assert(!std::is_move_constructible_v<Chunk>, "Chunk must not be movable")
 static_assert(!std::is_move_assignable_v<Chunk>, "Chunk must not be move-assignable");
 
 }  // namespace
+
+// ---------------------------------------------------------------- sub-voxels --
+//
+// These two functions are the only supported way to move a sub-voxel. They own
+// the coupling between two containers that each hold half of the invariant in
+// world/SubVoxel.hpp: SubVoxelStore knows which sub-voxels are present but not
+// what the block is, ChunkStorage knows the block id but not the damage. Every
+// path below leaves both agreeing.
+//
+// MAIN THREAD ONLY, and subject to World::isEditBlocked() exactly like setBlock:
+// a mesh job for any chunk in the surrounding 3x3x3 is reading this chunk's
+// palette and sub-voxel table through a snapshot, and mutating either one under
+// it is a use-after-free.
+
+SubVoxelEdit Chunk::breakSubVoxel(std::size_t blockIndex, std::size_t subIndex)
+{
+    VOXL_ASSERT(blockIndex < kChunkVolume, "block index out of range");
+    VOXL_ASSERT(subIndex < kSubVoxelCount, "sub-voxel index out of range");
+
+    const BlockId id = m_storage.get(blockIndex);
+    if (id == blocks::Air) {
+        // Air has no sub-voxels to carve, and the invariant guarantees there is
+        // no store entry to clean up either.
+        return SubVoxelEdit::Unchanged;
+    }
+
+    const SubVoxelEdit result = m_subVoxels.remove(blockIndex, id, subIndex);
+    if (result == SubVoxelEdit::Unchanged) {
+        // Nothing moved, so do not bump the content version: a spurious version
+        // change discards an in-flight mesh job's perfectly good result.
+        return result;
+    }
+
+    if (result == SubVoxelEdit::BlockRemoved) {
+        // The store already dropped the entry; the block must follow it to air
+        // or the two would disagree about a block that has nothing left in it.
+        m_storage.set(blockIndex, blocks::Air);
+    }
+
+    // Same bookkeeping as setBlock(). A carve that does not dirty the chunk is
+    // invisible on screen until something unrelated triggers a remesh.
+    touch();
+    return result;
+}
+
+SubVoxelEdit Chunk::restoreSubVoxel(std::size_t blockIndex, std::size_t subIndex, BlockId material)
+{
+    VOXL_ASSERT(blockIndex < kChunkVolume, "block index out of range");
+    VOXL_ASSERT(subIndex < kSubVoxelCount, "sub-voxel index out of range");
+
+    const BlockId current = m_storage.get(blockIndex);
+    const bool    wasAir  = current == blocks::Air;
+
+    // `material` only decides what an empty space is refilled with; an existing
+    // block keeps its own id, because the store's material must equal it.
+    const BlockId id = wasAir ? material : current;
+    if (id == blocks::Air) {
+        return SubVoxelEdit::Unchanged;  // nothing to restore, and nothing to restore it as
+    }
+
+    if (!wasAir && !m_subVoxels.isPartial(blockIndex)) {
+        // Solid with no entry means whole by the invariant, so every sub-voxel
+        // is already present. This test is also what lets SubVoxelStore::add()
+        // treat an absent entry as air without being able to see ChunkStorage.
+        return SubVoxelEdit::Unchanged;
+    }
+
+    const SubVoxelEdit result = m_subVoxels.add(blockIndex, id, subIndex);
+    if (result == SubVoxelEdit::Unchanged) {
+        return result;
+    }
+
+    if (wasAir) {
+        // The block gained its first sub-voxel, so it is no longer air. The
+        // store now holds a partial entry whose material must match this write.
+        m_storage.set(blockIndex, id);
+    }
+
+    touch();
+    return result;
+}
 
 namespace detail {
 

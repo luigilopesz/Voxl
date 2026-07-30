@@ -5,9 +5,14 @@ include(Catch)
 add_executable(voxl_tests
     test_chunkstorage.cpp
     test_jobsystem.cpp
+    test_lod_mesh.cpp
+    test_lod_stream.cpp
+    test_lod_terrain.cpp
     test_log.cpp
     test_mesher.cpp
     test_physics.cpp
+    test_subvoxel.cpp
+    test_subvoxel_mesh.cpp
     test_terrain.cpp
     test_world.cpp
 )

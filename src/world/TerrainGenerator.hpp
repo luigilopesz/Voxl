@@ -14,6 +14,7 @@
 // worker threads may call the const members concurrently on one shared instance.
 
 #include "world/Block.hpp"
+#include "world/Lod.hpp"
 #include "world/VoxelTypes.hpp"
 
 #include <cstddef>
@@ -67,6 +68,69 @@ inline constexpr std::int32_t kMaxStructureRadius = 3;
 /// topmost voxel is at `s + kMaxStructureHeight`. Used to clamp the height field
 /// away from the world ceiling so no structure is ever truncated.
 inline constexpr std::int32_t kMaxStructureHeight = 12;
+
+// ---------------------------------------------------------- LOD sampling --
+//
+// A level-L chunk is filled in 2^L cubes whose boundaries lie on the GLOBAL
+// lattice of multiples of 2^L (chunk origins are multiples of 32, so the
+// lattice never shifts from chunk to chunk). Every cell is decided by sampling
+// the very same continuous fields the full-resolution generator uses, at the
+// cell centre. Nothing about the noise setup changes with the level - that is
+// the only way a chunk regenerated at a finer level keeps its mountains, coasts
+// and rivers in the same place instead of visibly rearranging the world as the
+// player walks toward it.
+
+/// World coordinate at which the continuous fields are sampled for the level-L
+/// cell containing `worldCoord`. Level 0 is the identity, which is what makes
+/// the coarse and fine paths provably agree at the sample points.
+///
+/// The arithmetic right shift floors, so the lattice is continuous across zero;
+/// truncating division would fold the cells either side of the origin together.
+[[nodiscard]] constexpr std::int32_t lodSampleCoord(std::int32_t worldCoord, LodLevel level) noexcept
+{
+    const std::int32_t shift = static_cast<std::int32_t>(level);
+    return ((worldCoord >> shift) << shift) + (lodCellSize(level) >> 1);
+}
+
+/// Topmost block of the level-L terrain in a cell column whose centre sample
+/// reported `surfaceY`. Cells are solid while their centre is at or below the
+/// surface, so the visible top steps in 2^L increments. Level 0 is the identity.
+[[nodiscard]] constexpr std::int32_t lodTerrainTop(std::int32_t surfaceY, LodLevel level) noexcept
+{
+    const std::int32_t cell = lodCellSize(level);
+    const std::int32_t half = cell >> 1;
+    // Floor division: the top solid cell is the highest k with k*cell + half <= surfaceY.
+    const std::int32_t shifted = surfaceY - half;
+    const std::int32_t k       = shifted >> static_cast<std::int32_t>(level);
+    return k * cell + cell - 1;
+}
+
+/// Coarsest level that still emits trees.
+///
+/// WHERE THE DECORATION LINE IS DRAWN, AND WHY. A decoration is worth
+/// generating only while its smallest meaningful feature is at least one cell
+/// across, because a coarse chunk is consumed one sample per cell: anything
+/// thinner either disappears or gets inflated to a whole cell, and both read as
+/// noise rather than as the object.
+///   - Trunks are 1 block and canopies 3-5 blocks across. At level 1 (2-block
+///     cells) a quantised tree is still recognisably a tree, and level 1 starts
+///     only five chunks out, where a tree line is very much visible - dropping
+///     it there would draw a hard "forest ends here" ring around the player.
+///     At level 2 (4-block cells) the whole canopy collapses into one or two
+///     cells, i.e. a cube: strictly less faithful than the bare terrain
+///     silhouette, so trees stop at level 1.
+///   - The scattered bedrock shelf (single hashed voxels below y=4) and the
+///     one-voxel ice skin on freezing water are pure single-block detail. The
+///     bedrock scatter is dropped at every coarse level - it is buried under the
+///     world floor and unreachable. The ice skin is NOT dropped but promoted to
+///     the whole top water cell, because losing it would change a frozen ocean's
+///     colour at the LOD boundary, which is a seam the player does see.
+inline constexpr LodLevel kLodTreeMaxLevel = 1;
+
+[[nodiscard]] constexpr bool lodPlacesTrees(LodLevel level) noexcept
+{
+    return level <= kLodTreeMaxLevel;
+}
 
 /// Static, tuned description of one biome. Read-only after start-up.
 struct BiomeDescription {
@@ -161,6 +225,22 @@ public:
     /// one. Leaves the chunk marked dirty for meshing.
     void generate(Chunk& chunk) const;
 
+    /// Fills `chunk` at the requested level of detail.
+    ///
+    /// `kLodFull` forwards to generate(chunk) and is byte-for-byte identical to
+    /// it; higher levels fill the chunk in 2^level cubes decided from the same
+    /// continuous fields, sampled at cell centres (see lodSampleCoord).
+    ///
+    /// Same threading rules as generate(chunk): the caller owns the chunk, and
+    /// the generator does not touch the chunk's state machine. It also does NOT
+    /// call Chunk::setLod - recording the level is the streaming owner's job,
+    /// because that is a main-thread-only write.
+    ///
+    /// Deterministic per level: the result is a pure function of (chunk
+    /// position, level, seed), so two threads generating the same chunk at the
+    /// same level produce identical voxels.
+    void generate(Chunk& chunk, LodLevel level) const;
+
     /// Pure function of (worldX, worldZ, seed). The whole generator is built on
     /// this; it allocates nothing and is safe to call from any thread.
     [[nodiscard]] ColumnSample sampleColumn(std::int32_t worldX, std::int32_t worldZ) const noexcept;
@@ -179,6 +259,23 @@ private:
     /// venting into the sky.
     [[nodiscard]] bool carvesCave(std::int32_t worldX, std::int32_t worldY, std::int32_t worldZ,
                                  std::int32_t surfaceY) const noexcept;
+
+    /// Cave test for a whole span of blocks that will share one decision.
+    ///
+    /// The 3D fields are sampled ONCE, at (worldX, noiseY, worldZ), but the two
+    /// safety fades are evaluated at the worst block in the span: `shallowestY`
+    /// (nearest the surface) for the roof margin and `deepestY` for the bedrock
+    /// floor. Feeding the fades the centre instead would let a level-3 cell,
+    /// whose centre sits four blocks below the surface, carve away blocks the
+    /// full-resolution generator protects - a hole punched straight through a
+    /// hillside that only appears at distance. With shallowestY == deepestY ==
+    /// noiseY this is exactly carvesCave().
+    [[nodiscard]] bool carvesCaveSpan(std::int32_t worldX, std::int32_t noiseY, std::int32_t worldZ,
+                                      std::int32_t shallowestY, std::int32_t deepestY,
+                                      std::int32_t surfaceY) const noexcept;
+
+    /// Implementation of generate(chunk, level) for level > kLodFull.
+    void generateCoarse(Chunk& chunk, LodLevel level) const;
 
     TerrainSettings m_settings;
     /// Held behind a pointer purely to keep FastNoiseLite out of this header;

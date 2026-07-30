@@ -114,6 +114,26 @@ template <typename... Ts>
     return total;
 }
 
+/// Formats an optional count into `buffer`, or returns the placeholder when it
+/// is empty. Lets several optionals be packed into one line without four
+/// separate branches at the call site.
+template <std::size_t N>
+[[nodiscard]] const char* countOrDash(std::array<char, N>& buffer,
+                                      const std::optional<std::size_t>& value)
+{
+    if (!value.has_value()) {
+        return kUnavailable;
+    }
+    std::snprintf(buffer.data(), buffer.size(), "%zu", *value);
+    return buffer.data();
+}
+
+/// Row labels for the LOD table. The cell size in parentheses is the thing that
+/// actually explains the level to a reader, so it is spelled out rather than
+/// derived - and the assert below is what keeps it honest if kLodCount moves.
+static_assert(kLodCount == 4, "LOD row labels below enumerate exactly four levels");
+constexpr const char* kLodRowLabels[kLodCount]{"L0 1x", "L1 2x", "L2 4x", "L3 8x"};
+
 [[nodiscard]] bool gpuQueryApiAvailable() noexcept
 {
     // glad populates the whole core table in one pass; probing the four entry
@@ -267,6 +287,8 @@ void DebugOverlay::draw(const DebugOverlayFrame& frame)
     drawPerformanceSection(frame);
     drawWorldSection(frame);
     drawRenderSection(frame);
+    drawLodSection(frame);
+    drawSubVoxelSection(frame);
     drawJobSection(frame);
     drawTargetSection(frame);
 
@@ -411,6 +433,66 @@ void DebugOverlay::drawRenderSection(const DebugOverlayFrame& frame)
     labelledBytes("GPU textures", frame.render.textureBytes);
     labelledBytes("GPU total", sumAvailable(frame.render.meshBytes, frame.render.textureBytes));
     labelledBytes("GPU free", frame.render.gpuMemoryAvailableBytes);
+}
+
+void DebugOverlay::drawLodSection(const DebugOverlayFrame& frame)
+{
+    const LodDebugCounters& lod = frame.lod;
+    if (!lod.any() && !lod.enabled.has_value()) {
+        // Nothing is reporting LOD yet. Omitting the section entirely (rather
+        // than printing four rows of dashes) keeps the panel short in a build
+        // where the streaming policy has not been wired up.
+        return;
+    }
+
+    ImGui::SeparatorText("Level of detail");
+
+    if (lod.enabled.has_value() && !*lod.enabled) {
+        ImGui::TextColored(kWarnColour, "LOD disabled - everything pinned to L0");
+    }
+
+    for (std::size_t level = 0; level < kLodCount; ++level) {
+        std::array<char, 24> resident{};
+        std::array<char, 24> visible{};
+        std::array<char, 24> draws{};
+        std::array<char, 24> triangles{};
+        std::array<char, 160> line{};
+        std::snprintf(line.data(), line.size(),
+                      "resident %-6s visible %-6s draws %-6s tris %s",
+                      countOrDash(resident, lod.residentChunks[level]),
+                      countOrDash(visible, lod.visibleChunks[level]),
+                      countOrDash(draws, lod.drawCalls[level]),
+                      countOrDash(triangles, lod.triangles[level]));
+        labelled(kLodRowLabels[level], line.data());
+    }
+}
+
+void DebugOverlay::drawSubVoxelSection(const DebugOverlayFrame& frame)
+{
+    const SubVoxelDebugCounters& sub = frame.subVoxel;
+    const bool reported = sub.damagedBlocks.has_value() || sub.damagedChunks.has_value() ||
+                          sub.drawCalls.has_value() || sub.triangles.has_value() ||
+                          sub.gpuBytes.has_value() || sub.cpuBytes.has_value() ||
+                          !sub.mode.empty();
+    if (!reported) {
+        return;
+    }
+
+    ImGui::SeparatorText("Sub-voxels");
+
+    labelled("Mining mode", sub.mode.empty() ? kUnavailable : sub.mode.c_str());
+
+    std::array<char, 24>  blocks{};
+    std::array<char, 24>  chunks{};
+    std::array<char, 96>  line{};
+    std::snprintf(line.data(), line.size(), "%s in %s chunk(s)",
+                  countOrDash(blocks, sub.damagedBlocks), countOrDash(chunks, sub.damagedChunks));
+    labelled("Damaged blocks", line.data());
+
+    labelledCount("Draw calls", sub.drawCalls);
+    labelledCount("Triangles", sub.triangles);
+    labelledBytes("GPU bytes", sub.gpuBytes);
+    labelledBytes("CPU bytes", sub.cpuBytes);
 }
 
 void DebugOverlay::drawJobSection(const DebugOverlayFrame& frame)

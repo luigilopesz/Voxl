@@ -182,11 +182,23 @@ public:
         glBindVertexArray(0);
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
-        // Core profile only guarantees a line width of 1.0; asking for more on a
-        // driver that refuses it would raise GL_INVALID_VALUE every frame.
-        std::array<GLfloat, 2> widthRange{1.0f, 1.0f};
-        glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, widthRange.data());
-        m_lineWidth = std::clamp(2.0f, widthRange[0], std::max(widthRange[0], widthRange[1]));
+        // Wide lines were REMOVED from the forward-compatible core profile, and
+        // GL_ALIASED_LINE_WIDTH_RANGE does not say so: NVIDIA still reports
+        // [1, 10] there and then rejects glLineWidth(2.0) with GL_INVALID_VALUE.
+        // Asking the range is therefore not a guard at all - it produced one
+        // GL error per frame for every frame the player had a block targeted,
+        // which is most of them. GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT is the
+        // property that actually decides it, so ask that instead and only trust
+        // the range on a context where wide lines still exist.
+        GLint contextFlags = 0;
+        glGetIntegerv(GL_CONTEXT_FLAGS, &contextFlags);
+        if ((contextFlags & GL_CONTEXT_FLAG_FORWARD_COMPATIBLE_BIT) != 0) {
+            m_lineWidth = 1.0f;
+        } else {
+            std::array<GLfloat, 2> widthRange{1.0f, 1.0f};
+            glGetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, widthRange.data());
+            m_lineWidth = std::clamp(2.0f, widthRange[0], std::max(widthRange[0], widthRange[1]));
+        }
 
         m_ready  = true;
         m_failed = false;

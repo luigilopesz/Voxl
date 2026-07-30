@@ -28,16 +28,35 @@
 // voxel in the swept region and takes the nearest, so no thickness of floor can
 // be tunnelled at any speed the clamp allows.
 //
+// SUB-VOXELS
+// ----------
+// A partially destroyed block collides per sub-voxel, so the player can stand in
+// a carved alcove and walk down a carved tunnel. The expansion is strictly
+// opt-in and strictly per block: the collider asks the (optional) SubVoxelAccess
+// for a grid, and only a block that actually has one - 0 < popcount < 512 - is
+// expanded into sub-AABBs. Every other block, which is every block in untouched
+// terrain, takes exactly the single-AABB path it took before this existed.
+//
+// Sub-voxels are 1/8 of a block, so they are eight times easier to tunnel
+// through than a block is. The sweep therefore keeps enumerating: it visits
+// every sub-voxel in the swept region and takes the nearest, rather than
+// stepping. The non-tunnelling argument is the same one as for whole blocks and
+// is independent of speed.
+//
 // UNITS: blocks and seconds throughout. Gravity is in blocks/s^2.
 //
-// Thread safety: VoxelCollider is a non-owning view over a BlockAccess and a
-// BlockRegistry and holds no mutable state, so it is safe wherever the accessor
-// is. All the free functions are pure.
+// Thread safety: VoxelCollider is a non-owning view over a BlockAccess, a
+// BlockRegistry and an optional SubVoxelAccess, and holds no mutable state, so
+// it is safe wherever those are. All the free functions are pure.
 
 #include "physics/Aabb.hpp"
+#include "physics/SubVoxelAccess.hpp"
 #include "world/Block.hpp"
 #include "world/BlockAccess.hpp"
+#include "world/SubVoxel.hpp"
 #include "world/VoxelTypes.hpp"
+
+#include <cstdint>
 
 #include <glm/vec3.hpp>
 
@@ -125,16 +144,22 @@ struct FluidState {
 /// Read-only view of the world for collision purposes.
 ///
 /// Holds pointers rather than references so it stays copyable and assignable;
-/// it does NOT own either object and both must outlive it.
+/// it does NOT own any of the objects and all of them must outlive it.
 class VoxelCollider {
 public:
-    VoxelCollider(const BlockAccess& world, const BlockRegistry& registry) noexcept
-        : m_world(&world), m_registry(&registry)
+    /// `subVoxels` is optional. Null means "no block in this world is partially
+    /// destroyed" and reproduces the pre-sub-voxel behaviour exactly, which is
+    /// why it defaults - every existing two-argument call site keeps working and
+    /// keeps its old semantics.
+    VoxelCollider(const BlockAccess& world, const BlockRegistry& registry,
+                  const SubVoxelAccess* subVoxels = nullptr) noexcept
+        : m_world(&world), m_registry(&registry), m_subVoxels(subVoxels)
     {
     }
 
     [[nodiscard]] const BlockAccess&   world() const noexcept { return *m_world; }
     [[nodiscard]] const BlockRegistry& registry() const noexcept { return *m_registry; }
+    [[nodiscard]] const SubVoxelAccess* subVoxelAccess() const noexcept { return m_subVoxels; }
 
     [[nodiscard]] BlockId blockAt(const BlockPos& pos) const noexcept
     {
@@ -143,6 +168,10 @@ public:
 
     /// Only CollisionShape::Cube stops movement. Fluid occupies space but is
     /// passable, which is what makes water swimmable rather than a wall.
+    ///
+    /// This is a whole-block property and stays true for a partially destroyed
+    /// block: the block still stops movement, just not everywhere inside its
+    /// cube. Callers that need the exact volume follow up with subVoxelsAt().
     [[nodiscard]] bool isBlocking(const BlockPos& pos) const noexcept
     {
         return m_registry->get(m_world->getBlock(pos)).collisionShape == CollisionShape::Cube;
@@ -152,6 +181,29 @@ public:
     {
         return m_registry->get(m_world->getBlock(pos)).collisionShape == CollisionShape::Fluid;
     }
+
+    // ---------------------------------------------------------- sub-voxels --
+
+    /// Occupancy grid of a partially destroyed block, or nullptr when the block
+    /// is uniform. Nullptr is the fast path and the overwhelmingly common case.
+    [[nodiscard]] const SubVoxelGrid* subVoxelsAt(const BlockPos& pos) const noexcept
+    {
+        return m_subVoxels == nullptr ? nullptr : m_subVoxels->subVoxelsAt(pos);
+    }
+
+    /// True when the block carries no sub-voxel damage, i.e. when the single
+    /// full-cube test is exact for it. Mirrors Chunk::isBlockWhole, but answers
+    /// through whatever accessor this collider was built with.
+    [[nodiscard]] bool isBlockWhole(const BlockPos& pos) const noexcept
+    {
+        return subVoxelsAt(pos) == nullptr;
+    }
+
+    /// Blocking test at sub-voxel resolution. Out-of-range sub-coordinates are
+    /// not solid rather than an error, so a brush or a probe that walks off the
+    /// edge of a grid degrades to empty space.
+    [[nodiscard]] bool isSubVoxelBlocking(const BlockPos& block, std::int32_t sx, std::int32_t sy,
+                                          std::int32_t sz) const noexcept;
 
     /// True when any blocking voxel strictly overlaps `box`, ignoring overlaps
     /// smaller than the skin.
@@ -167,6 +219,8 @@ public:
 private:
     const BlockAccess*   m_world;
     const BlockRegistry* m_registry;
+    /// Optional; null means nothing is damaged. See the header comment.
+    const SubVoxelAccess* m_subVoxels = nullptr;
 };
 
 // ------------------------------------------------------------- single axis --

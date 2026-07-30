@@ -8,6 +8,8 @@
 #include "core/Log.hpp"
 #include "world/Block.hpp"
 #include "world/ChunkStorage.hpp"
+#include "world/Lod.hpp"
+#include "world/SubVoxel.hpp"
 #include "world/VoxelTypes.hpp"
 
 #include <atomic>
@@ -299,11 +301,56 @@ public:
         m_lastTouchedFrame.store(frame, std::memory_order_relaxed);
     }
 
+    // ------------------------------------------------ level of detail --
+
+    /// Resolution this chunk's voxels were generated at. Level 0 is full
+    /// resolution; see world/Lod.hpp. Read from worker threads during meshing,
+    /// so it is atomic even though it changes rarely.
+    [[nodiscard]] LodLevel lod() const noexcept { return m_lod.load(std::memory_order_acquire); }
+
+    /// Main thread only, and only while the chunk is not busy. Changing the
+    /// level invalidates the voxel data, so the caller must re-generate and
+    /// re-mesh; this only records the intent.
+    void setLod(LodLevel level) noexcept { m_lod.store(level, std::memory_order_release); }
+
+    // ------------------------------------------------------ sub-voxels --
+
+    /// Sparse table of partially destroyed blocks. Empty for untouched terrain,
+    /// which is the case that must stay free - see world/SubVoxel.hpp.
+    [[nodiscard]] SubVoxelStore& subVoxels() noexcept { return m_subVoxels; }
+    [[nodiscard]] const SubVoxelStore& subVoxels() const noexcept { return m_subVoxels; }
+
+    [[nodiscard]] bool hasSubVoxelDamage() const noexcept { return !m_subVoxels.empty(); }
+
+    /// Removes one sub-voxel from the block at `blockIndex`.
+    ///
+    /// This is the ONLY supported way to carve a sub-voxel, because it is the
+    /// single place that keeps SubVoxelStore and ChunkStorage consistent: when
+    /// the last sub-voxel goes, the block itself must become air, and the store
+    /// entry must disappear. Splitting that across two call sites is how the
+    /// invariant in SubVoxel.hpp gets broken.
+    ///
+    /// Main thread only, and subject to the same no-write-while-a-neighbour-is-
+    /// meshing rule as setBlock (see World::isEditBlocked).
+    SubVoxelEdit breakSubVoxel(std::size_t blockIndex, std::size_t subIndex);
+
+    /// Restores one sub-voxel, promoting the block back to solid when the grid
+    /// fills up. `material` is used only when the block is currently air.
+    SubVoxelEdit restoreSubVoxel(std::size_t blockIndex, std::size_t subIndex, BlockId material);
+
+    /// True when the block is solid for collision and face-culling purposes,
+    /// accounting for sub-voxel damage: a partially destroyed block is NOT
+    /// opaque, so its neighbours must draw the faces they would otherwise cull.
+    [[nodiscard]] bool isBlockWhole(std::size_t blockIndex) const noexcept
+    {
+        return !m_subVoxels.isPartial(blockIndex);
+    }
+
     // ------------------------------------------------------------ memory --
 
     [[nodiscard]] std::size_t memoryUsageBytes() const noexcept
     {
-        return sizeof(Chunk) + m_storage.heapBytes();
+        return sizeof(Chunk) + m_storage.heapBytes() + m_subVoxels.memoryUsageBytes();
     }
 
 private:
@@ -317,7 +364,9 @@ private:
 
     const ChunkPos m_position;
     ChunkStorage   m_storage;
+    SubVoxelStore  m_subVoxels;
 
+    std::atomic<LodLevel>      m_lod{kLodFull};
     std::atomic<ChunkState>    m_state{ChunkState::Empty};
     std::atomic<bool>          m_needsRemesh{false};
     std::atomic<bool>          m_needsSave{false};

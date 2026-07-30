@@ -19,6 +19,7 @@
 #include "core/JobSystem.hpp"
 #include "core/Time.hpp"
 #include "world/Block.hpp"
+#include "world/Lod.hpp"
 #include "world/VoxelTypes.hpp"
 
 #include <array>
@@ -70,6 +71,58 @@ struct RenderDebugCounters {
     std::optional<std::size_t> gpuMemoryAvailableBytes;
 };
 
+/// Level-of-detail breakdown. Every array is indexed by `LodLevel`, so entry 0
+/// is full resolution; see world/Lod.hpp.
+///
+/// The whole point of showing four numbers instead of one total is to answer
+/// "where is the budget going". If level 3 - the outermost ring, and by far the
+/// most chunks - still accounts for a third of the triangles, the LOD policy is
+/// not paying for itself, and a single aggregate figure cannot tell you that.
+struct LodDebugCounters {
+    std::array<std::optional<std::size_t>, kLodCount> residentChunks{};
+    std::array<std::optional<std::size_t>, kLodCount> visibleChunks{};
+    std::array<std::optional<std::size_t>, kLodCount> drawCalls{};
+    std::array<std::optional<std::size_t>, kLodCount> triangles{};
+
+    /// From `LodPolicy::enabled`. Shown so a benchmark run pinned to level 0 is
+    /// never mistaken for a broken policy.
+    std::optional<bool> enabled;
+
+    [[nodiscard]] bool any() const noexcept
+    {
+        for (std::size_t i = 0; i < kLodCount; ++i) {
+            if (residentChunks[i].has_value() || visibleChunks[i].has_value() ||
+                drawCalls[i].has_value() || triangles[i].has_value()) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+/// Destructible-block counters.
+///
+/// `damagedBlocks` is a WORLD figure (the sum of `SubVoxelStore::size()` over
+/// resident chunks) while the rest are renderer figures. They are grouped here
+/// anyway because the question being answered - "is the damage system costing
+/// anything yet" - needs both halves side by side.
+struct SubVoxelDebugCounters {
+    std::optional<std::size_t> damagedBlocks;   ///< partially destroyed blocks, CPU side
+    std::optional<std::size_t> damagedChunks;   ///< chunks holding damage geometry
+    std::optional<std::size_t> drawCalls;       ///< a subset of RenderDebugCounters::drawCalls
+    std::optional<std::size_t> triangles;       ///< likewise a subset
+    std::optional<std::size_t> gpuBytes;        ///< included in RenderDebugCounters::meshBytes
+    std::optional<std::size_t> cpuBytes;        ///< SubVoxelStore::memoryUsageBytes() summed
+
+    /// Current mining mode, as a free-form label (e.g. "block" / "sub-voxel").
+    ///
+    /// A string rather than an enum on purpose. The gameplay layer owns whatever
+    /// type this really is and is still being written; the overlay's whole design
+    /// is to avoid inventing APIs for modules in flight (see the file header).
+    /// Empty means "not reported".
+    std::string mode;
+};
+
 /// What the crosshair is currently on. Mirrors the useful half of
 /// `InteractionState` without depending on it, so the overlay stays usable in a
 /// build with no interaction module.
@@ -91,9 +144,11 @@ struct DebugOverlayFrame {
     const Camera*         camera = nullptr;
     const JobSystemStats* jobs   = nullptr;
 
-    WorldDebugCounters  world{};
-    RenderDebugCounters render{};
-    TargetDebugInfo     target{};
+    WorldDebugCounters    world{};
+    RenderDebugCounters   render{};
+    LodDebugCounters      lod{};
+    SubVoxelDebugCounters subVoxel{};
+    TargetDebugInfo       target{};
 
     /// CPU time spent in the frame's own work, excluding the swap/vsync wait.
     /// Distinct from `FrameClock::lastFrameMs()`, which includes it.
@@ -171,6 +226,8 @@ private:
     void drawPerformanceSection(const DebugOverlayFrame& frame);
     void drawWorldSection(const DebugOverlayFrame& frame);
     void drawRenderSection(const DebugOverlayFrame& frame);
+    void drawLodSection(const DebugOverlayFrame& frame);
+    void drawSubVoxelSection(const DebugOverlayFrame& frame);
     void drawJobSection(const DebugOverlayFrame& frame);
     void drawTargetSection(const DebugOverlayFrame& frame);
 

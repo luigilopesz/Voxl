@@ -64,6 +64,21 @@ endif()
 if(VOXL_ENABLE_ASAN)
     if(MSVC)
         target_compile_options(voxl_compile_options INTERFACE /fsanitize=address)
+        # Only first-party targets link voxl::compile_options, so Catch2, imgui
+        # and glfw are built WITHOUT /fsanitize=address. MSVC's ASan turns on
+        # std::vector/std::string container annotations, and mixing annotated and
+        # unannotated translation units is a hard link error, not a warning:
+        #   Catch2.lib(...) : error LNK2038: mismatch detected for
+        #   'annotate_vector': value '0' doesn't match value '1'
+        # which stopped voxl_tests linking at all, i.e. the option could not be
+        # used for the one target it is most wanted on. Turning the annotations
+        # off puts both halves on value 0. The cost is container-overflow
+        # detection inside std::vector/std::string; every other ASan check -
+        # use-after-free, which is the one this codebase's threading rules are
+        # actually about - is unaffected.
+        target_compile_definitions(voxl_compile_options INTERFACE
+            _DISABLE_STRING_ANNOTATION=1
+            _DISABLE_VECTOR_ANNOTATION=1)
     else()
         target_compile_options(voxl_compile_options INTERFACE -fsanitize=address)
         target_link_options(voxl_compile_options INTERFACE -fsanitize=address)

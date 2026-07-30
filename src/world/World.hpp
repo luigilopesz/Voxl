@@ -21,12 +21,16 @@
 #include "world/BlockAccess.hpp"
 #include "world/Chunk.hpp"
 #include "world/ChunkManager.hpp"
+#include "world/Lod.hpp"
+#include "world/SubVoxel.hpp"
 #include "world/VoxelTypes.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
+
+#include <glm/vec3.hpp>
 
 namespace voxl {
 
@@ -124,6 +128,43 @@ public:
     EditResult placeBlock(const BlockPos& pos, BlockId id);
     EditResult breakBlock(const BlockPos& pos) { return setBlock(pos, blocks::Air); }
 
+    // ---- sub-voxel edits (main thread) ----
+    //
+    // setBlock's sibling for partial destruction. Everything setBlock guarantees
+    // applies unchanged: the same vertical-bounds and residency checks, the same
+    // deferral when a worker owns the chunk or one of its neighbours (see
+    // isEditBlocked), and the same seam-neighbour invalidation when the damaged
+    // block sits on a chunk border. A sub-voxel on a border face changes the
+    // neighbour's culling and ambient occlusion exactly as a whole block would.
+    //
+    // The store/storage invariant itself is NOT maintained here - it belongs to
+    // Chunk::breakSubVoxel/restoreSubVoxel, which are the only sanctioned way to
+    // touch it (see world/SubVoxel.hpp). World's job is the world-space view:
+    // finding the chunk, the threading rule, and the neighbours.
+
+    /// Carves one sub-voxel out of the block at `pos`. `subIndex` comes from
+    /// voxl::subVoxelIndex() and must be < kSubVoxelCount. Breaking the last
+    /// sub-voxel turns the block to air, which Chunk::breakSubVoxel handles.
+    EditResult breakSubVoxel(const BlockPos& pos, std::size_t subIndex);
+
+    /// Puts one sub-voxel back. `material` is used only when the block is
+    /// currently air, i.e. when this is the first sub-voxel of a rebuild.
+    EditResult restoreSubVoxel(const BlockPos& pos, std::size_t subIndex, BlockId material);
+
+    /// World-space convenience for the interaction code, which has a ray hit
+    /// point rather than a block-plus-index pair.
+    EditResult breakSubVoxelAt(const glm::vec3& worldPosition);
+    EditResult restoreSubVoxelAt(const glm::vec3& worldPosition, BlockId material);
+
+    /// Damage grid for the block at `pos`, or nullptr when the block is uniform
+    /// (air, or solid and intact). Callers MUST handle nullptr by falling back
+    /// to the block id - see the invariant in world/SubVoxel.hpp.
+    [[nodiscard]] const SubVoxelGrid* subVoxelsAt(const BlockPos& pos) const;
+
+    /// False when the block at `pos` is partially destroyed, so collision and
+    /// face culling must stop treating it as a full cube.
+    [[nodiscard]] bool isBlockWhole(const BlockPos& pos) const;
+
     [[nodiscard]] std::size_t deferredEditCount() const noexcept { return m_deferredEdits.size(); }
 
     // ---- streaming (main thread) ----
@@ -155,6 +196,18 @@ public:
         return m_chunks.captureNeighbourhood(centre);
     }
 
+    // ---- level of detail ----
+
+    [[nodiscard]] const LodPolicy& lodPolicy() const noexcept { return m_chunks.lodPolicy(); }
+    void setLodPolicy(const LodPolicy& policy) { m_chunks.setLodPolicy(policy); }
+
+    /// Resolution the chunk containing `pos` is currently built at, or kLodFull
+    /// when nothing is resident there. Physics and interaction should use this
+    /// to refuse to act on coarse terrain: a level-2 chunk's voxels are a 4x4x4
+    /// approximation and a block break there would carve a hole the size of a
+    /// house once the chunk came back to full resolution.
+    [[nodiscard]] LodLevel lodAt(const BlockPos& pos) const;
+
     // ---- wiring, forwarded for the application's convenience ----
 
     void setGenerator(ChunkGenerateFn generator) { m_chunks.setGenerator(std::move(generator)); }
@@ -172,14 +225,33 @@ public:
     }
 
 private:
+    /// What a deferred edit was, so the retry does the same thing the original
+    /// call would have. One queue for both kinds rather than two, because the
+    /// ORDER matters: a whole-block place over a partially destroyed block and
+    /// the sub-voxel carve that damaged it must be replayed in the order the
+    /// player made them.
+    enum class EditKind : std::uint8_t { Block, SubVoxelBreak, SubVoxelRestore };
+
     struct PendingEdit {
-        BlockPos position{};
-        BlockId  id = blocks::Air;
+        BlockPos      position{};
+        BlockId       id       = blocks::Air;
+        std::uint16_t subIndex = 0;
+        EditKind      kind     = EditKind::Block;
     };
 
     /// Applies the edit to an already-resolved chunk, including the neighbour
     /// dirty marks. Caller has verified the chunk is writable.
     void writeBlock(const ChunkPtr& chunk, const BlockPos& pos, BlockId id);
+
+    /// Sub-voxel counterpart of writeBlock. Returns what the chunk reported so
+    /// the caller can skip dirtying anything when nothing actually changed.
+    SubVoxelEdit writeSubVoxel(const ChunkPtr& chunk, const BlockPos& pos, std::size_t subIndex,
+                               BlockId material, bool restore);
+
+    /// Shared front half of the two public sub-voxel entry points: bounds,
+    /// residency, and the defer-or-apply decision.
+    EditResult editSubVoxel(const BlockPos& pos, std::size_t subIndex, BlockId material,
+                            bool restore);
 
     /// True when writing to `chunk` right now would race a worker thread.
     ///
