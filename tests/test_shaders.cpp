@@ -23,11 +23,24 @@ namespace {
 
 namespace fs = std::filesystem;
 
-/// Injected by tests/CMakeLists.txt so the tests do not depend on the working
-/// directory ctest happens to pick.
+// tests/CMakeLists.txt defines this as the absolute path of the source tree's
+// shader directory. The fallback exists only so the file still compiles under
+// tools/syntax_check.ps1, which drives the compiler directly and therefore has
+// none of the target's compile definitions. It is never the path used by a real
+// run, and shaderDirectory() below refuses to proceed if it resolves to nothing.
+#ifndef VOXL_SHADER_DIR
+#define VOXL_SHADER_DIR "assets/shaders"
+#endif
+
+/// Never returns a directory that does not hold the shaders: a test that
+/// silently found no files would pass every "this text is absent" assertion
+/// below, which is the one failure mode that would make this whole file
+/// worthless.
 [[nodiscard]] fs::path shaderDirectory()
 {
-    return fs::path{VOXL_SHADER_DIR};
+    const fs::path directory{VOXL_SHADER_DIR};
+    REQUIRE(fs::exists(directory / "common.glsl"));
+    return directory;
 }
 
 [[nodiscard]] std::string readFile(const fs::path& path)
@@ -105,6 +118,38 @@ namespace fs = std::filesystem;
     return haystack.find(needle) != std::string_view::npos;
 }
 
+[[nodiscard]] constexpr bool isIdentifierChar(char c) noexcept
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+}
+
+/// True when `source` names a star in CODE - the identifier `star` itself, or one
+/// that starts a camelCase name like `starField` / `starLayer`.
+///
+/// Matching the bare substring would be a false-positive machine: three of the
+/// shaders contain the word "start" in ordinary code, and any future
+/// `startFade` would fail a test that has nothing to do with it. So the match is
+/// anchored on both sides - not preceded by an identifier character, and
+/// followed by either a non-identifier character or an upper-case letter.
+[[nodiscard]] bool mentionsStarIdentifier(std::string_view source)
+{
+    for (std::size_t at = source.find("star"); at != std::string_view::npos;
+         at            = source.find("star", at + 1)) {
+        if (at > 0 && isIdentifierChar(source[at - 1])) {
+            continue;  // inside a longer word, e.g. "restart"
+        }
+        const std::size_t after = at + 4;
+        if (after >= source.size()) {
+            return true;
+        }
+        const char next = source[after];
+        if (!isIdentifierChar(next) || (next >= 'A' && next <= 'Z')) {
+            return true;  // `star`, `star)`, `starField`, `starLayer`
+        }
+    }
+    return false;
+}
+
 /// Every shader source in the tree, so a new file cannot quietly opt out of the
 /// invariants below by not being listed.
 [[nodiscard]] std::vector<fs::path> allShaderSources()
@@ -162,8 +207,7 @@ TEST_CASE("the star field is drawn by exactly one shader", "[shaders][daynight]"
     // and nothing else; see the header note in that file.
     std::vector<std::string> withStars;
     for (const fs::path& path : allShaderSources()) {
-        const std::string source = stripComments(readFile(path));
-        if (contains(source, "star") || contains(source, "Star")) {
+        if (mentionsStarIdentifier(stripComments(readFile(path)))) {
             withStars.push_back(path.filename().string());
         }
     }

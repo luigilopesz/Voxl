@@ -50,6 +50,27 @@
 // chunk being written; a torn whole-file rename would lose the newest state of
 // every chunk in the region at once.
 //
+// SECTOR OWNERSHIP: LEAK, NEVER REUSE
+// ------------------------------------
+// The offset table is the only record of where a payload lives, and it is on
+// disk, which means it can be wrong. The allocator therefore keeps its OWN,
+// in-memory note of the span it handed each entry (Entry::ownedSector /
+// ownedCount) and will only release a span it can match against the table entry
+// being replaced. Two shapes of table damage make an entry unownable:
+//
+//   * IMPLAUSIBLE - it points inside the header/table, or past the end of the
+//     file. The map never reserves those sectors, so there is nothing to free.
+//   * CONTESTED - a second entry claims sectors that overlap it. The map
+//     reserves the span so nobody allocates into it, but cannot tell which of
+//     the claimants holds the real payload, so it vouches for neither.
+//
+// Replacing an unownable entry LEAKS its sectors. That asymmetry is deliberate:
+// a leaked sector costs 4 KB until the next open rebuilds the map from the
+// table and reclaims it, whereas a wrongly reused sector silently overwrites a
+// chunk the player never touched - and silently is the operative word, because
+// the payload that lands on top brings its own valid magic and CRC, so the
+// victim's next read SUCCEEDS and returns someone else's blocks.
+//
 // THREADING
 // ---------
 // Every public method takes the file's own mutex, so concurrent saves of
@@ -426,6 +447,20 @@ public:
     /// Number of table entries currently pointing at a payload. Diagnostics.
     [[nodiscard]] std::size_t storedChunkCount() const;
 
+    /// Data sectors the allocator currently considers occupied, excluding the
+    /// header and offset table. Diagnostics.
+    [[nodiscard]] std::size_t reservedSectorCount() const;
+
+    /// Of those, the ones no table entry is allowed to hand back - see the
+    /// ownership rule at the end of `write()`. Non-zero means a damaged table
+    /// cost this session some disk space; it never means lost data, and the next
+    /// open reclaims all of it. Diagnostics.
+    [[nodiscard]] std::size_t leakedSectorCount() const;
+
+    /// Whether `sector` is currently reserved. Lets a test prove that a sector
+    /// was leaked rather than silently recycled. Diagnostics.
+    [[nodiscard]] bool isSectorReserved(std::uint32_t sector) const;
+
     /// Monotonic counter bumped by every read and write, used by WorldSave's
     /// open-handle cache to pick a victim for eviction.
     [[nodiscard]] std::uint64_t lastUse() const noexcept
@@ -439,11 +474,35 @@ public:
 
 private:
     struct Entry {
+        // ---- the eight bytes that live on disk --------------------------------
         std::uint32_t sector      = 0;
         std::uint16_t sectorCount = 0;
         std::uint8_t  lod         = 0;
         std::uint8_t  flags       = 0;
+
+        // ---- in-memory only: the allocator's own record of what it handed out --
+        //
+        // THIS IS NOT THE SAME THING AS THE FIELDS ABOVE, and the difference is
+        // the whole point. `sector`/`sectorCount` are whatever the file said;
+        // `ownedSector`/`ownedCount` are what the allocator actually reserved for
+        // this entry - set by reserveSectors() on a write, or by
+        // rebuildSectorMap() on open but ONLY for an entry it is willing to vouch
+        // for. `ownedCount == 0` means "the allocator does not vouch for this
+        // entry", which is the state every implausible or contested entry lands
+        // in and which makes releasing its sectors forbidden.
+        std::uint32_t ownedSector = 0;
+        std::uint16_t ownedCount  = 0;
     };
+
+    /// True when the allocator vouches that `entry` exclusively owns exactly the
+    /// span its table fields claim. Anything else - never vouched for, or vouched
+    /// for at a span the table has since been made to disagree with - is not
+    /// releasable.
+    [[nodiscard]] static constexpr bool ownsItsSectors(const Entry& entry) noexcept
+    {
+        return entry.ownedCount != 0 && entry.ownedSector == entry.sector &&
+               entry.ownedCount == entry.sectorCount;
+    }
 
     /// Reads and validates the header and table of an existing file. Caller
     /// holds the mutex. Sets m_openError / m_readOnly / m_healthy.

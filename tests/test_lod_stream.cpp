@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <glm/vec3.hpp>
@@ -70,6 +71,71 @@ void generateFlat(Chunk& chunk)
     }
 }
 
+/// Where a "build" is planted inside its chunk: solid ground, well below
+/// kGroundTop and away from every chunk face, so nothing about it depends on a
+/// seam rule.
+constexpr BlockPos kAuthoredLocal{16, 4, 16};
+
+/// World-space position of the build inside `chunk`.
+[[nodiscard]] BlockPos authoredBlock(const ChunkPos& chunk)
+{
+    const BlockPos origin = chunk.originBlock();
+    return BlockPos{origin.x + kAuthoredLocal.x, origin.y + kAuthoredLocal.y,
+                    origin.z + kAuthoredLocal.z};
+}
+
+/// A stand-in for WorldSave, cut down to the two facts the LOD decision rests
+/// on: which positions hold player work, and that kLodFull is the ONLY level a
+/// save ever holds.
+///
+/// That second fact is not a detail of the fake - it is the whole shape of the
+/// bug. WorldSave::saveChunk refuses to write a coarse chunk (its voxels are a
+/// downsample the seed reproduces) and WorldSave::loadChunk answers "absent" for
+/// one, so a rebuild at any level but 0 regenerates from the seed no matter what
+/// is on disk. `load()` reproduces that refusal exactly rather than approximating
+/// it, because a fake that happily loaded at level 2 would make the broken
+/// behaviour look correct.
+struct FakeDisk {
+    mutable std::mutex                    mutex;
+    std::unordered_map<ChunkPos, BlockId> authored;
+
+    void store(const ChunkPos& position, BlockId marker)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        authored[position] = marker;
+    }
+
+    /// The ChunkDivergedFn half: "this position is player work rather than
+    /// something the seed reproduces". True at every level, exactly like
+    /// WorldSave::hasStoredChunk, which is keyed on position and not on a chunk.
+    [[nodiscard]] bool has(const ChunkPos& position) const
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return authored.find(position) != authored.end();
+    }
+
+    /// The load half of the generator. Runs on a WORKER that owns the chunk.
+    ///
+    /// Writes through ChunkStorage rather than Chunk::setBlock for the same
+    /// reason generateFlat does, and for the same reason WorldSave::decodeChunk
+    /// ends with markSaved(): a chunk that has just come off disk does not
+    /// diverge from it.
+    [[nodiscard]] bool load(Chunk& chunk) const
+    {
+        if (chunk.lod() != kLodFull) {
+            return false;  // only full resolution is ever written
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto it = authored.find(chunk.position());
+        if (it == authored.end()) {
+            return false;
+        }
+        generateFlat(chunk);  // the ground the build stands on
+        chunk.storage().set(kAuthoredLocal.x, kAuthoredLocal.y, kAuthoredLocal.z, it->second);
+        return true;
+    }
+};
+
 /// What the fake renderer holds for one position.
 struct GpuMesh {
     LodLevel      level    = kLodFull;
@@ -86,10 +152,23 @@ struct LodFixture {
     explicit LodFixture(const StreamingConfig& config, unsigned workers = 3)
         : jobs(workers), registry(createDefaultBlockRegistry()), world(jobs, registry, config)
     {
+        // The wiring Application uses: load whatever is on disk first, and only
+        // sample the seed when there is nothing there. `disk` is empty unless a
+        // test puts something in it, so for every other test this is exactly the
+        // plain generateFlat it always was.
         world.setGenerator([this](Chunk& chunk) {
             generateCalls.fetch_add(1, std::memory_order_relaxed);
+            if (disk.load(chunk)) {
+                return;
+            }
             generateFlat(chunk);
         });
+
+        // ChunkDivergedFn, wired the way Application wires WorldSave's. With an
+        // empty disk it answers false for every position, which is the same
+        // behaviour as leaving the predicate unset.
+        world.chunks().setDivergedPredicate(
+            [this](const ChunkPos& position) { return disk.has(position); });
 
         world.setMesher([this](const ChunkNeighbourhood& snapshot) {
             const ChunkPos pos = snapshot.centrePos();
@@ -201,7 +280,11 @@ struct LodFixture {
 
     JobSystem     jobs;
     BlockRegistry registry;
-    World         world;
+    /// Declared BEFORE `world` on purpose: the generator reads it from a worker,
+    /// and ~World is what waits for those workers. A member destroyed before the
+    /// world that can still be running jobs against it is a use-after-free.
+    FakeDisk disk;
+    World    world;
 
     std::atomic<int> generateCalls{0};
     std::atomic<int> incompleteSnapshots{0};
@@ -276,6 +359,72 @@ struct LodFixture {
 
 /// The section every test looks at: the one the view sits in.
 constexpr std::int32_t kSectionY = kSeaLevel / kChunkSize;
+
+/// A ChunkLighter that computes no light at all and parks the job for one chosen
+/// column until it is released.
+///
+/// No LightEngine on purpose. What the retirement test needs is the CLAIM - the
+/// entry ChunkManager puts in its busy-column set for the lifetime of a light job
+/// - and runColumnLight publishes the `lit` flags whatever the callable returns,
+/// so a no-op body produces the identical residency behaviour with none of the
+/// cost or the coupling.
+struct ColumnGate {
+    std::mutex              mutex;
+    std::condition_variable signal;
+    ColumnPos               target{};
+    bool                    parked = false;
+    bool                    open   = false;
+
+    [[nodiscard]] ChunkLighter make()
+    {
+        ChunkLighter lighter;
+        lighter.column = [this](const LightColumnWork& work) {
+            waitIfTarget(work.column);
+            return LightSpill{};
+        };
+        lighter.chunk = [](Chunk&, const ChunkNeighbourhood&, LightSpill&) {};
+        lighter.spill = [](LightSpill&&) {};
+        return lighter;
+    }
+
+    void waitIfTarget(const ColumnPos& column)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!(column == target) || open) {
+            return;
+        }
+        parked = true;
+        signal.notify_all();
+        // BOUNDED, and not out of caution: a worker parked here holds a job the
+        // ChunkManager destructor waits on, so a test that throws out of a
+        // REQUIRE before releasing would hang the whole binary instead of
+        // failing one case.
+        signal.wait_for(lock, std::chrono::seconds{30}, [this] { return open; });
+    }
+
+    [[nodiscard]] bool isParked(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return signal.wait_for(lock, timeout, [this] { return parked; });
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            open = true;
+        }
+        signal.notify_all();
+    }
+};
+
+/// Releases the gate however the test leaves, including through a failed
+/// REQUIRE. Must be declared AFTER the manager it protects, so it runs before
+/// that manager's destructor starts waiting on the job it is holding.
+struct ColumnGateOpener {
+    ColumnGate& gate;
+    ~ColumnGateOpener() { gate.release(); }
+};
 
 }  // namespace
 
@@ -810,4 +959,395 @@ TEST_CASE("a sub-voxel edit against a busy chunk is deferred, not lost", "[world
         CHECK(fixture.world.deferredEditCount() == 0);
         CHECK_FALSE(fixture.world.isBlockWhole(target));
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Retirement and the last-chance save
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a chunk with unsaved changes is not retired while its save would be refused",
+          "[lod][streaming][save][regression]")
+{
+    // THE DEFECT. retireDistant() held a chunk back only while that chunk's OWN
+    // column was being lit, but the save it retires the chunk to perform refuses
+    // on the WIDER neighbourhood the mesh path uses - any of the nine surrounding
+    // columns, or any chunk in the 3x3x3. A chunk beside a lit column therefore
+    // passed the retire test, was erased from the map, and had its last-chance
+    // save refused on the way out. At retirement a refusal is not a retry: there
+    // is no chunk left to retry with, and the edit is simply gone.
+    StreamingConfig config;
+    config.loadRadius              = 1;  // a five-column disc, so the test is exact
+    config.unloadPadding           = 1;
+    config.verticalRadius          = 0;  // one section per column: fast, and enough
+    config.unloadGraceFrames       = 0;
+    config.maxScheduledPerUpdate   = 4096;
+    config.maxGenerateJobsInFlight = 4096;
+    config.maxUnloadsPerUpdate     = 4096;
+    config.lod.enabled             = false;  // kLodFull, the only level a save holds
+
+    JobSystem    jobs(3);
+    ChunkManager manager(jobs, config);
+    ColumnGate   gate;
+    gate.target = ColumnPos{1, 0};
+    const ColumnGateOpener opener{gate};
+
+    manager.setGenerator(generateFlat);
+    manager.setLighter(gate.make());
+
+    // The save layer reduced to the two things that matter here: it refuses while
+    // the manager says a worker may be inside the chunk (WorldSave::setBusyProbe,
+    // which Application wires to isNeighbourhoodBusy), and a refusal on the
+    // retire path loses the data rather than deferring it.
+    std::unordered_set<ChunkPos> written;
+    int                          refusedAtRetire = 0;
+    manager.setRetireHook([&](const ChunkPtr& chunk) {
+        if (!chunk->needsSave()) {
+            return;
+        }
+        if (manager.isNeighbourhoodBusy(chunk->position())) {
+            ++refusedAtRetire;
+            return;
+        }
+        written.insert(chunk->position());
+        chunk->markSaved();
+    });
+
+    const StreamingView here = viewAt(0.5f, static_cast<float>(kSeaLevel) + 2.0f, 0.5f);
+    std::uint64_t       frame = 0;
+
+    // Terrain for every column first. A generate worker only FILES its column as
+    // pending, so this wait really drains and no light job has started yet.
+    manager.update(here, ++frame);
+    REQUIRE(manager.waitForPendingJobs(std::chrono::milliseconds{20000}));
+    jobs.mainThreadQueue().drainAll();
+
+    // Now pump the light sweep until the gate catches column (1, 0).
+    //
+    // Once it is held, column (0, 0) can never be claimed alongside it -
+    // claimColumnLight refuses a column whose face neighbour is already claimed -
+    // so the chunk below is reliably NEXT TO a lit column rather than in one,
+    // which is exactly the arrangement the old own-column test waved through.
+    bool parked = false;
+    for (int pass = 0; pass < 200 && !parked; ++pass) {
+        manager.update(here, ++frame);
+        jobs.mainThreadQueue().drain(std::chrono::microseconds{500});
+        parked = gate.isParked(std::chrono::milliseconds{20});
+    }
+    REQUIRE(parked);
+
+    // The player's edit. Set by hand because this fixture drives ChunkManager
+    // directly; needsSave() is precisely what World::setBlock would have left.
+    const ChunkPos edited{0, kSectionY, 0};
+    const ChunkPtr chunk = manager.find(edited);
+    REQUIRE(chunk != nullptr);
+    REQUIRE(chunk->hasVoxels());
+    chunk->markModified();
+
+    // The disagreement the defect is made of really exists in this arrangement:
+    // the chunk is not busy by any state the retire sweep used to consult, and
+    // the save probe still refuses it.
+    REQUIRE_FALSE(chunk->isBusy());
+    REQUIRE(manager.isNeighbourhoodBusy(edited));
+
+    // Walk far enough away that the whole origin disc is out of keep range.
+    const StreamingView faraway = viewAt(static_cast<float>(64 * kChunkSize),
+                                         static_cast<float>(kSeaLevel) + 2.0f,
+                                         static_cast<float>(64 * kChunkSize));
+    for (int pass = 0; pass < 8; ++pass) {
+        manager.update(faraway, ++frame);
+        jobs.mainThreadQueue().drain(std::chrono::microseconds{500});
+    }
+
+    // WITHOUT THE FIX the chunk is already gone and `refusedAtRetire` is 1.
+    CHECK(refusedAtRetire == 0);
+    CHECK(manager.isResident(edited));
+    CHECK(chunk->needsSave());
+    CHECK(written.count(edited) == 0);  // nothing has reached disk yet either
+
+    // The hold is a delay, not a leak. Release the light job and the chunk
+    // retires normally - with its data written this time.
+    gate.release();
+    for (int pass = 0; pass < 12; ++pass) {
+        manager.update(faraway, ++frame);
+        REQUIRE(manager.waitForPendingJobs(std::chrono::milliseconds{20000}));
+        jobs.mainThreadQueue().drainAll();
+    }
+
+    CHECK(refusedAtRetire == 0);
+    CHECK_FALSE(manager.isResident(edited));
+    CHECK(written.count(edited) == 1);
+    CHECK_FALSE(chunk->needsSave());
+}
+
+TEST_CASE("a walking player never loses an edit to retirement", "[lod][streaming][save]")
+{
+    // The end-to-end form of the defect above, and the guard on its fix.
+    //
+    // The walk deliberately never settles, so generate, mesh and light jobs are
+    // all in flight every time retireDistant runs - which is both the condition
+    // that makes a save refuse and the condition the hold reacts to. Editing a
+    // block per step gives retirement something to lose, and walking on gives it
+    // the chance to lose it.
+    //
+    // The second half of the check matters just as much as the first: the hold is
+    // only sound because it is temporary, so a chunk left out of keep range at
+    // the end would be a leak traded for the lost edit.
+    StreamingConfig config = lodConfig();
+    config.loadRadius        = 5;
+    config.unloadPadding     = 1;  // retire aggressively; the walk has to keep up
+    config.unloadGraceFrames = 0;
+    LodFixture fixture(config);
+    World&     world = fixture.world;
+
+    // WorldSave's two relevant behaviours: it refuses while the manager says a
+    // worker may be inside the chunk, and on the retire path that refusal is
+    // final - there is no chunk left to try again with.
+    std::unordered_set<ChunkPos> written;
+    int                          lostEdits = 0;
+    world.setRetireHook([&](const ChunkPtr& chunk) {
+        if (!chunk->needsSave()) {
+            return;
+        }
+        if (world.chunks().isNeighbourhoodBusy(chunk->position())) {
+            ++lostEdits;
+            return;
+        }
+        written.insert(chunk->position());
+        chunk->markSaved();
+    });
+
+    fixture.settle(viewAtChunk(0, 0));
+
+    std::size_t edits = 0;
+    for (std::int32_t step = 0; step <= 40; ++step) {
+        // A block in the chunk the player is about to walk into, which is a
+        // chunk they will walk away from - and retire - a few steps later.
+        const BlockPos here{step * kChunkSize + 16, kSeaLevel + 4, 16};
+        if (world.setBlock(here, blocks::Glass) != EditResult::Rejected) {
+            ++edits;
+        }
+        for (int pass = 0; pass < 3; ++pass) {
+            world.update(viewAtChunk(step, 0));
+            fixture.jobs.mainThreadQueue().drain(std::chrono::microseconds{500});
+        }
+    }
+    fixture.settle(viewAtChunk(40, 0));
+
+    // Not vacuous: the walk really did edit chunks and really did retire them.
+    REQUIRE(edits > 0);
+    CHECK(written.size() > 0);
+    CHECK(lostEdits == 0);
+
+    // Copied out rather than tested inside forEachChunk: that visitor runs with
+    // the map lock held and must not call back into the manager.
+    std::vector<ChunkPos> resident;
+    world.chunks().forEachChunk(
+        [&resident](const ChunkPos& position, const ChunkPtr&) { resident.push_back(position); });
+
+    const ChunkPos centre   = world.chunks().centre();
+    std::size_t    stranded = 0;
+    for (const ChunkPos& position : resident) {
+        if (!world.chunks().inKeepRange(centre, position)) {
+            INFO("stranded chunk " << position.x << ", " << position.y << ", " << position.z);
+            ++stranded;
+        }
+    }
+    CHECK(stranded == 0);
+}
+
+// ---------------------------------------------------------------------------
+//  Divergent chunks: what a rebuild is allowed to do to player work
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a chunk whose build is on disk is promoted back to full resolution",
+          "[lod][streaming][save][regression]")
+{
+    // THE DEFECT. The divergence signal froze a chunk at whatever level it
+    // happened to be holding, instead of only refusing the rebuilds that would
+    // regenerate it. Because kLodFull is the only level a save holds, a build
+    // streams back in COARSE - the load misses and the seed fills it - and a
+    // frozen chunk can never be refined afterwards. The player walks up to their
+    // own house and it stays blocky, permanently, and the state feeds itself.
+    LodFixture fixture(lodConfig());
+    World&     world = fixture.world;
+
+    // Six chunks out is level 2 under bands 2/5/8, and far enough that walking
+    // back crosses two band edges.
+    const ChunkPos target{6, kSectionY, 0};
+    fixture.disk.store(target, blocks::Glass);
+    const BlockPos build = authoredBlock(target);
+
+    fixture.settle(viewAtChunk(0, 0));
+
+    // A FRESH SESSION OVER A SAVED BUILD, which is the case the dirty flag cannot
+    // express at all: the chunk arrives at the level its distance implies, the
+    // load is refused for being coarse, and what the player sees is seed terrain.
+    REQUIRE(world.chunkAt(target) != nullptr);
+    REQUIRE(world.chunkAt(target)->lod() == 2);
+    REQUIRE(world.getBlock(build) == blocks::Stone);
+
+    // The player walks up to their own house.
+    fixture.settle(viewAtChunk(6, 0));
+
+    const ChunkPtr promoted = world.chunkAt(target);
+    REQUIRE(promoted != nullptr);
+    CHECK(promoted->lod() == kLodFull);
+    // ...and the promotion RELOADED rather than regenerated, which is the only
+    // reason it was safe to allow.
+    CHECK(world.getBlock(build) == blocks::Glass);
+    CHECK(fixture.incompleteSnapshots.load() == 0);
+}
+
+TEST_CASE("a chunk whose build is on disk is never demoted", "[lod][streaming][save][regression]")
+{
+    LodFixture fixture(lodConfig());
+    World&     world = fixture.world;
+
+    const ChunkPos target{0, kSectionY, 0};
+    fixture.disk.store(target, blocks::Glass);
+    const BlockPos build = authoredBlock(target);
+
+    fixture.settle(viewAtChunk(0, 0));
+    REQUIRE(world.chunkAt(target) != nullptr);
+    REQUIRE(world.chunkAt(target)->lod() == kLodFull);
+    REQUIRE(world.getBlock(build) == blocks::Glass);
+
+    // Seven chunks away is two bands plus the hysteresis: an ordinary chunk here
+    // demotes to level 2, and the rebuild that does it samples the seed.
+    fixture.settle(viewAtChunk(7, 0));
+
+    const ChunkPtr held = world.chunkAt(target);
+    REQUIRE(held != nullptr);
+    CHECK(held->lod() == kLodFull);
+    CHECK(world.getBlock(build) == blocks::Glass);
+
+    // Not vacuous: the chunk next door, which has nothing on disk, is the same
+    // distance away and did demote.
+    const ChunkPtr control = world.chunkAt(ChunkPos{0, kSectionY, 1});
+    REQUIRE(control != nullptr);
+    CHECK(control->lod() > kLodFull);
+}
+
+TEST_CASE("a LOD rebuild never starts on a chunk that still owes a save",
+          "[lod][streaming][save][regression]")
+{
+    // THE DEFECT. finishLodRebuild() swaps the shadow into the map and THEN
+    // offers the outgoing object to the retire hook. That offer can be refused -
+    // WorldSave::saveChunk returns false whenever the neighbourhood is busy -
+    // and here, uniquely, a refusal is not a deferral: `live` is dropped on the
+    // next line, so there is no chunk left to retry with and the edit is gone.
+    // It is the same hole retireDistant() was fixed for, reached by the other
+    // road.
+    //
+    // preserveEditedChunks kept it out of reach by freezing every dirty chunk's
+    // level outright, so it only opened for a caller who turned that off. But
+    // the flag decides whether an edit may be REGENERATED over; it was never
+    // meant to authorise discarding one while a save was still owed. The fix is
+    // at dispatch, where the chunk is still whole and refusing costs one
+    // deferred rebuild.
+    StreamingConfig config      = lodConfig();
+    config.preserveEditedChunks = false;
+
+    LodFixture fixture(config);
+    World&     world = fixture.world;
+
+    // Every retire, and whether the position was still resident when it
+    // happened. That is what tells the two callers apart: retireDistant() erases
+    // the chunk BEFORE calling the hook, finishLodRebuild() calls it with the
+    // replacement already in the map. `unloadPadding` is 12 here, so nothing
+    // retires by distance at all and the rebuild path is the only source.
+    struct Retirement {
+        ChunkPos position;
+        bool     stillResident;
+        bool     owedSave;
+    };
+    std::vector<Retirement> retirements;
+    world.chunks().setRetireHook([&](const ChunkPtr& chunk) {
+        retirements.push_back(Retirement{chunk->position(),
+                                         world.chunks().isResident(chunk->position()),
+                                         chunk->needsSave()});
+    });
+
+    const ChunkPos target{0, kSectionY, 0};
+    fixture.settle(viewAtChunk(0, 0));
+    const ChunkPtr edited = world.chunkAt(target);
+    REQUIRE(edited != nullptr);
+    REQUIRE(edited->lod() == kLodFull);
+
+    // The player's edit, with nothing on disk to fall back on: needsSave() is
+    // the only record anywhere that it happened.
+    edited->markModified();
+    REQUIRE(edited->needsSave());
+
+    // Seven chunks away is two bands plus the hysteresis; an ordinary chunk here
+    // demotes to level 2 and the rebuild that does it samples the seed.
+    fixture.settle(viewAtChunk(7, 0));
+
+    // WITHOUT THE FIX the rebuild runs, and this is what it looks like: the hook
+    // is handed a chunk that still owes a save while its replacement is already
+    // the resident one.
+    for (const Retirement& retirement : retirements) {
+        CHECK_FALSE((retirement.owedSave && retirement.stillResident));
+    }
+
+    const ChunkPtr held = world.chunkAt(target);
+    REQUIRE(held != nullptr);
+    CHECK(held.get() == edited.get());  // never swapped out
+    CHECK(held->lod() == kLodFull);
+    CHECK(held->needsSave());
+
+    // Not vacuous: the chunk next door is the same distance out, owes no save,
+    // and did demote.
+    const ChunkPtr control = world.chunkAt(ChunkPos{0, kSectionY, 1});
+    REQUIRE(control != nullptr);
+    CHECK(control->lod() > kLodFull);
+
+    // And the hold is a deferral, not a freeze. Once the save lands - which the
+    // autosave does within an interval - the chunk demotes like any other.
+    edited->markSaved();
+    fixture.settle(viewAtChunk(7, 0));
+    REQUIRE(world.chunkAt(target) != nullptr);
+    CHECK(world.chunkAt(target)->lod() > kLodFull);
+}
+
+TEST_CASE("only the reload is allowed: an intermediate promotion still regenerates",
+          "[lod][streaming][save][regression]")
+{
+    // The guard against fixing the freeze too enthusiastically. A promotion is
+    // not safe because it moves toward level 0 - it is safe because level 0 is
+    // where the reload happens. A rebuild at level 1 or 2 samples the seed just
+    // as a demotion would, so it is refused even though it refines.
+    LodFixture fixture(lodConfig());
+    World&     world = fixture.world;
+
+    const ChunkPos target{6, kSectionY, 0};
+    fixture.disk.store(target, blocks::Glass);
+    const BlockPos build = authoredBlock(target);
+
+    fixture.settle(viewAtChunk(0, 0));
+    REQUIRE(world.chunkAt(target) != nullptr);
+    REQUIRE(world.chunkAt(target)->lod() == 2);
+
+    // Three chunks away the policy wants level 1 for a chunk currently at 2.
+    fixture.settle(viewAtChunk(3, 0));
+
+    const ChunkPtr held = world.chunkAt(target);
+    REQUIRE(held != nullptr);
+    CHECK(held->lod() == 2);
+    // Still the seed's stone, untouched - and still recoverable, because the
+    // position was never overwritten at a level nothing can restore.
+    CHECK(world.getBlock(build) == blocks::Stone);
+
+    // Not vacuous: the chunk beside it, with nothing on disk, took exactly the
+    // intermediate step that was refused here.
+    const ChunkPtr control = world.chunkAt(ChunkPos{6, kSectionY, 1});
+    REQUIRE(control != nullptr);
+    CHECK(control->lod() == 1);
+
+    // ...and walking the rest of the way in still brings the build back, so the
+    // refusal above is a deferral rather than the freeze it replaced.
+    fixture.settle(viewAtChunk(6, 0));
+    REQUIRE(world.chunkAt(target) != nullptr);
+    CHECK(world.chunkAt(target)->lod() == kLodFull);
+    CHECK(world.getBlock(build) == blocks::Glass);
 }

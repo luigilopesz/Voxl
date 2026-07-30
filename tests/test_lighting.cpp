@@ -29,9 +29,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
+#include <set>
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace voxl;
@@ -873,11 +875,15 @@ TEST_CASE("the chunk memo does not outlive the pass that filled it",
         writable = false;
         world.resetCounters();
 
-        const LightSeed        second{BlockPos{probe.x, probe.y + 1, probe.z}, 0, 15};
+        // The chunk's own corner: 48 blocks of L1 distance from the first seed,
+        // so the flood above cannot have reached it and anything found here came
+        // from this pass. Same CHUNK, though, which is what puts the stale memo
+        // in the way.
+        const LightSeed        second{origin, 0, 15};
         const LightUpdateStats after = engine.applySeeds(world, &second, 1);
 
         CHECK(after.writesRefused >= 1);
-        CHECK(blockLightAt(*map.at(position), 16, 17, 16) == 0);
+        CHECK(blockLightAt(*map.at(position), 0, 0, 0) == 0);
     }
 
     SECTION("the memo is live inside a pass and dead outside one")
@@ -970,12 +976,14 @@ struct GatedLighter {
     bool                    gated  = false;
     bool                    inJob  = false;
     bool                    opened = false;
+    /// Every column a light job has entered, in arrival order. Guarded by mutex.
+    std::vector<ColumnPos> entered;
 
     [[nodiscard]] ChunkLighter make()
     {
         ChunkLighter lighter;
         lighter.column = [this](const LightColumnWork& work) {
-            waitForGate();
+            waitForGate(work.column);
             LightEngine engine{*registry};
             return engine.lightColumn(work);
         };
@@ -987,21 +995,45 @@ struct GatedLighter {
         return lighter;
     }
 
-    void waitForGate()
+    /// BOUNDED, and that is not paranoia. A worker parked here holds a job the
+    /// ChunkManager destructor waits on and the JobSystem destructor drains, so
+    /// a gate that is never opened - which is what an early REQUIRE failure
+    /// produces, because Catch2 throws and the test never reaches open() - hangs
+    /// the whole binary rather than failing one case.
+    void waitForGate(const ColumnPos& column)
     {
         std::unique_lock<std::mutex> lock(mutex);
+        entered.push_back(column);
         if (!gated) {
             return;
         }
         inJob = true;
         signal.notify_all();
-        signal.wait(lock, [this] { return opened; });
+        signal.wait_for(lock, std::chrono::seconds{30}, [this] { return opened; });
     }
 
     [[nodiscard]] bool waitUntilInJob()
     {
         std::unique_lock<std::mutex> lock(mutex);
         return signal.wait_for(lock, std::chrono::seconds{10}, [this] { return inJob; });
+    }
+
+    /// Waits until `count` light jobs have reached the gate. Bounded for the same
+    /// reason waitForGate is.
+    [[nodiscard]] bool waitUntilParked(std::size_t count)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return signal.wait_for(lock, std::chrono::seconds{15},
+                               [this, count] { return entered.size() >= count; });
+    }
+
+    /// While the gate is shut nothing ever leaves it, so "entered" and "parked
+    /// right now" are the same set - which is what makes the concurrency
+    /// assertion below exact rather than a sample.
+    [[nodiscard]] std::vector<ColumnPos> parkedColumns()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return entered;
     }
 
     void open()
@@ -1012,6 +1044,14 @@ struct GatedLighter {
         }
         signal.notify_all();
     }
+};
+
+/// Opens the gate on the way out however the test leaves - including through a
+/// failed REQUIRE. Must be declared AFTER the ChunkManager it protects, so it
+/// runs before the manager's destructor waits on the job it is holding.
+struct GateOpener {
+    GatedLighter& lighter;
+    ~GateOpener() { lighter.open(); }
 };
 
 [[nodiscard]] StreamingConfig oneColumnConfig()
@@ -1101,6 +1141,108 @@ TEST_CASE("no light claim is taken from a generate worker", "[light][column][thr
     CHECK(manager.stats().lightSectionsLit >= 1);
 }
 
+TEST_CASE("two face-adjacent columns are never lit at the same time",
+          "[light][column][threading][regression]")
+{
+    // REGRESSION. claimColumnLight fills a job's region with visible() chunks
+    // only, so a column being lit at this instant arrives as a null slot and
+    // LightEngine::loadSection walls it off. That is supposed to be
+    // self-correcting - whichever column is lit SECOND reads the first and
+    // collectSpill spills back whatever should have crossed - but when two
+    // neighbours run together neither is second. Each sees a wall, neither reads
+    // the other, neither spills, and published light is never recomputed, so the
+    // seam between them stays dark for good.
+    //
+    // It was the normal case, not a rare interleaving: sweepPendingLight starts
+    // up to maxLightColumnsPerUpdate columns in one tight main-thread loop, and
+    // the only claim it used to refuse was a column already being lit itself -
+    // never one whose NEIGHBOUR was.
+    //
+    // The observable is the claim set, sampled while every job that has one is
+    // parked. It is exact rather than a sample: claims are taken synchronously
+    // on the main thread inside update(), and none can be released while the
+    // gate is shut.
+    StreamingConfig config = oneColumnConfig();
+    // A disc of 13 columns. Big enough that any maximal independent set has at
+    // least three members, so the refusal cannot starve the sweep down to one
+    // column and make the assertion below vacuous.
+    config.loadRadius               = 2;
+    config.verticalRadius           = 1;  // three sections per column; the test is horizontal
+    config.maxLightColumnsPerUpdate = 4096;
+    config.maxLightJobsInFlight     = 4096;
+
+    const BlockRegistry registry = createDefaultBlockRegistry();
+    GatedLighter        lighter;
+    lighter.registry = &registry;
+    lighter.gated    = true;
+
+    // One worker per column that could possibly be claimed, so "dispatched" and
+    // "parked" cannot differ merely because the pool ran out of threads.
+    JobSystem        jobs(16);
+    ChunkManager     manager(jobs, config);
+    const GateOpener opener{lighter};
+    manager.setGenerator(generateFlat);
+    manager.setLighter(lighter.make());
+
+    std::uint64_t frame = 0;
+
+    // Terrain for every column first. No light job can run yet - the generate
+    // worker only files its column as pending - so this wait really does drain.
+    manager.update(kOriginView, ++frame);
+    REQUIRE(manager.waitForPendingJobs(std::chrono::milliseconds{20000}));
+    jobs.mainThreadQueue().drainAll();
+    REQUIRE(manager.stats().lightJobsInFlight == 0);
+
+    // The sweep. Every claim it takes is still held when this returns.
+    manager.update(kOriginView, ++frame);
+    const std::size_t dispatched = manager.stats().lightJobsInFlight;
+
+    // The situation under test really arose: more than one column went in flight
+    // together, so an adjacent pair was available to be got wrong.
+    REQUIRE(dispatched >= 2);
+    REQUIRE(lighter.waitUntilParked(dispatched));
+
+    const std::vector<ColumnPos> claimed = lighter.parkedColumns();
+    REQUIRE(claimed.size() == dispatched);
+
+    // THE ASSERTION. No two of them share a face.
+    for (std::size_t a = 0; a < claimed.size(); ++a) {
+        for (std::size_t b = a + 1; b < claimed.size(); ++b) {
+            const std::int32_t dx = claimed[a].x - claimed[b].x;
+            const std::int32_t dz = claimed[a].z - claimed[b].z;
+            const bool faceAdjacent = (dx == 0 && (dz == 1 || dz == -1)) ||
+                                      (dz == 0 && (dx == 1 || dx == -1));
+            INFO("columns (" << claimed[a].x << ", " << claimed[a].z << ") and ("
+                             << claimed[b].x << ", " << claimed[b].z
+                             << ") were being lit at the same moment");
+            CHECK_FALSE(faceAdjacent);
+        }
+    }
+
+    // ...and refusing strands nobody: a held-back column stays in m_lightPending
+    // - the refusal deliberately does not erase it - so later sweeps light it.
+    // open() is enough to release every job, present and future: waitForGate
+    // checks `opened` before it sleeps.
+    lighter.open();
+    for (int pass = 0; pass < 16; ++pass) {
+        manager.update(kOriginView, ++frame);
+        REQUIRE(manager.waitForPendingJobs(std::chrono::milliseconds{20000}));
+        jobs.mainThreadQueue().drainAll();
+    }
+
+    // loadRadius 2 is a disc of 13 columns: dx*dx + dz*dz <= 4. Every one of them
+    // must have been lit.
+    const std::vector<ColumnPos> everyEntry = lighter.parkedColumns();
+    const std::set<std::pair<std::int32_t, std::int32_t>> distinct = [&everyEntry] {
+        std::set<std::pair<std::int32_t, std::int32_t>> out;
+        for (const ColumnPos& column : everyEntry) {
+            out.emplace(column.x, column.z);
+        }
+        return out;
+    }();
+    CHECK(distinct.size() == 13);
+}
+
 TEST_CASE("a chunk is not encoded while a light job owns its column",
           "[light][column][save][threading][regression]")
 {
@@ -1111,6 +1253,7 @@ TEST_CASE("a chunk is not encoded while a light job owns its column",
 
     JobSystem    jobs(3);
     ChunkManager manager(jobs, oneColumnConfig());
+    const GateOpener opener{lighter};
     manager.setGenerator(generateFlat);
     manager.setLighter(lighter.make());
 
@@ -1130,6 +1273,10 @@ TEST_CASE("a chunk is not encoded while a light job owns its column",
 
     TempDir   directory("column_claim");
     WorldSave save(jobs, directory.path(), 0xA11CEull);
+    // The wiring Application does at world open. Without it a WorldSave has no
+    // way to see a worker inside a chunk, which is the whole defect.
+    save.setBusyProbe(
+        [&manager](const ChunkPos& position) { return manager.isNeighbourhoodBusy(position); });
 
     // A light job is rewriting this chunk's light array right now. encodeChunk
     // reads the whole chunk, light included, and ChunkStorage materialises that

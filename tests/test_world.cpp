@@ -9,11 +9,13 @@
 #include "world/Block.hpp"
 #include "world/ChunkManager.hpp"
 #include "world/ChunkStorage.hpp"
+#include "world/SubVoxel.hpp"
 #include "world/VoxelTypes.hpp"
 #include "world/World.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -49,6 +51,37 @@ void generateFlat(Chunk& chunk)
                 chunk.storage().set(x, y, z, blocks::Stone);
             }
         }
+    }
+}
+
+/// A straight bore through the rock with a single lamp in it, crossing the
+/// boundary between chunk columns (0, 0) and (1, 0).
+///
+/// Deep underground, so the sky contributes nothing and the ONLY way the far
+/// half of the tunnel can be lit is by block light crossing that boundary.
+constexpr std::int32_t kTunnelY = 70;   // inside section 2, well below the floor
+constexpr std::int32_t kTunnelZ = 16;
+constexpr std::int32_t kLampX   = 24;   // column (0, 0), 8 blocks short of the seam
+
+void generateTunnel(Chunk& chunk)
+{
+    generateFlat(chunk);
+
+    const BlockPos origin = chunk.position().originBlock();
+    if (kTunnelY < origin.y || kTunnelY >= origin.y + kChunkSize) {
+        return;
+    }
+    if (kTunnelZ < origin.z || kTunnelZ >= origin.z + kChunkSize) {
+        return;
+    }
+
+    const std::int32_t localY = kTunnelY - origin.y;
+    const std::int32_t localZ = kTunnelZ - origin.z;
+    for (std::int32_t localX = 0; localX < kChunkSize; ++localX) {
+        chunk.storage().set(localX, localY, localZ, blocks::Air);
+    }
+    if (kLampX >= origin.x && kLampX < origin.x + kChunkSize) {
+        chunk.storage().set(kLampX - origin.x, localY, localZ, blocks::Glowstone);
     }
 }
 
@@ -635,6 +668,74 @@ TEST_CASE("a deferred edit is relit exactly as an immediate one", "[world][light
 }
 
 // ---------------------------------------------------------------------------
+//  Regression: two columns lit at the same time must still exchange light
+// ---------------------------------------------------------------------------
+
+TEST_CASE("light crosses the seam between columns that were lit at the same time",
+          "[world][light][regression]")
+{
+    // REGRESSION. A column light job may only read neighbours that are final in
+    // both voxels and light, so a neighbour column that is in flight at the same
+    // moment arrives as a null slot and the engine treats it as a solid wall.
+    // That is supposed to be self-correcting - whichever column is lit SECOND
+    // reads the first and spills back - but when two neighbours are lit at the
+    // same time neither is second. Each sees a wall, neither reads the other,
+    // neither spills, and since published light is never recomputed the seam
+    // between them stays dark for good.
+    //
+    // Claiming every outstanding column in one sweep is exactly the situation:
+    // after the first settle they are all pending together, so every adjacent
+    // pair goes in flight together. Normal streaming produces the same state at
+    // the loading frontier, several columns at a time.
+    StreamingConfig config = tightConfig();
+    config.loadRadius               = 2;
+    config.maxLightColumnsPerUpdate = 4096;
+    config.maxLightJobsInFlight     = 4096;
+    REQUIRE(config.lighting);
+
+    Fixture fixture(config, 4);
+    fixture.world.setGenerator(generateTunnel);
+
+    const StreamingView view = viewAt(16.5f, 200.0f, 16.5f);
+
+    std::size_t seamsRecorded = 0;
+    for (int step = 0; step < 10; ++step) {
+        fixture.world.update(view);
+        REQUIRE(fixture.world.chunks().waitForPendingJobs(std::chrono::milliseconds{10000}));
+        fixture.jobs.mainThreadQueue().drainAll();
+        // Sampled between the light jobs finishing and the next update settling
+        // what they recorded.
+        seamsRecorded = std::max(seamsRecorded, fixture.world.pendingLightSeams());
+    }
+
+    // The situation under test really arose. Had the columns been lit one after
+    // another, every neighbour would have been readable and nothing recorded.
+    REQUIRE(seamsRecorded > 0);
+
+    // The tunnel is where the generator put it, and it is genuinely enclosed.
+    REQUIRE(fixture.world.getBlock(BlockPos{34, kTunnelY, kTunnelZ}) == blocks::Air);
+    REQUIRE(fixture.world.getBlock(BlockPos{34, kTunnelY + 1, kTunnelZ}) == blocks::Stone);
+    REQUIRE(ChunkStorage::unpackSunlight(
+                fixture.world.getLight(BlockPos{34, kTunnelY, kTunnelZ})) == 0);
+
+    // The lamp end, inside column (0, 0), is lit by its own column's job.
+    REQUIRE(ChunkStorage::unpackBlockLight(
+                fixture.world.getLight(BlockPos{kLampX, kTunnelY, kTunnelZ})) == 15);
+    CHECK(ChunkStorage::unpackBlockLight(
+              fixture.world.getLight(BlockPos{31, kTunnelY, kTunnelZ})) == 8);
+
+    // The far end is in column (1, 0). Nothing crossed the boundary while the two
+    // columns were being lit, so every one of these is zero unless the seam is
+    // reconciled afterwards. One block per step, from 7 at the first cell across.
+    CHECK(ChunkStorage::unpackBlockLight(
+              fixture.world.getLight(BlockPos{32, kTunnelY, kTunnelZ})) == 7);
+    CHECK(ChunkStorage::unpackBlockLight(
+              fixture.world.getLight(BlockPos{34, kTunnelY, kTunnelZ})) == 5);
+    CHECK(ChunkStorage::unpackBlockLight(
+              fixture.world.getLight(BlockPos{38, kTunnelY, kTunnelZ})) == 1);
+}
+
+// ---------------------------------------------------------------------------
 //  Regression: the light seam fan-out must survive both faces of one axis
 // ---------------------------------------------------------------------------
 
@@ -694,4 +795,125 @@ TEST_CASE("a relight spanning a whole section dirties the right neighbours",
     CHECK(chunks.find(shadowed)->needsRemesh());
     CHECK(chunks.find(below)->needsRemesh());
     CHECK(chunks.find(above)->needsRemesh());
+}
+
+// ---------------------------------------------------------------------------
+//  Regression: the last sub-voxel of a block is a full opacity change
+// ---------------------------------------------------------------------------
+
+TEST_CASE("carving the last sub-voxel defers on the relight footprint",
+          "[world][light][subvoxel][regression]")
+{
+    // REGRESSION. World::editSubVoxel skipped the isRelightBlocked footprint test
+    // whenever the block was already partial, on the reasoning that an
+    // already-damaged block is already transparent to the light engine so
+    // chipping it further cannot move light. True of every carve but one: when
+    // the LAST sub-voxel goes, the block becomes air, and writeSubVoxel relights
+    // - a world-height sunlight flood, run against chunks the footprint test
+    // would have excluded. That is invariant 1 violated (no writing to a chunk a
+    // worker may be reading), on the final swing of mining any block, which is
+    // the single most common edit in the game.
+    //
+    // The observable is the deferral: carving the last sub-voxel must be held
+    // back by exactly the same busy chunk that holds back breaking the whole
+    // block, because it does exactly the same thing to the light.
+    StreamingConfig config = tightConfig();
+    config.loadRadius      = 3;
+    REQUIRE(config.lighting);
+
+    Fixture             fixture(config);
+    const StreamingView view = viewAt(16.5f, 200.0f, 16.5f);
+    fixture.settle(view);
+
+    // Four independent blocks in the open air of chunk (0, 6, 0), 16 apart so no
+    // two are inside each other's 15-block light reach, and all far above the
+    // flat floor at kSeaLevel so each one stands in its own full sunlight column.
+    const BlockPos control{8, 200, 8};    // carved to its last sub-voxel, unblocked
+    const BlockPos carved{24, 200, 24};   // carved to its last sub-voxel, blocked
+    const BlockPos whole{8, 200, 24};     // broken outright, blocked - the parity case
+    const BlockPos chipped{24, 200, 8};   // stays partial, blocked - must NOT defer
+    const BlockPos refilled{16, 200, 16}; // air restored to partial, blocked
+
+    for (const BlockPos& pos : {control, carved, whole, chipped}) {
+        REQUIRE(fixture.world.setBlock(pos, blocks::Stone) == EditResult::Applied);
+    }
+    REQUIRE(fixture.world.getBlock(refilled) == blocks::Air);
+
+    // Grind each of the two down to one remaining sub-voxel, index 0. The first
+    // carve crosses whole -> partial and so does run the footprint test; nothing
+    // is busy yet, so it applies. The 510 after it move no light at all.
+    const auto grindToLastSubVoxel = [&fixture](const BlockPos& pos) {
+        for (std::size_t sub = 1; sub < kSubVoxelCount; ++sub) {
+            REQUIRE(fixture.world.breakSubVoxel(pos, sub) == EditResult::Applied);
+        }
+        const SubVoxelGrid* grid = fixture.world.subVoxelsAt(pos);
+        REQUIRE(grid != nullptr);
+        REQUIRE(grid->count() == 1);
+        REQUIRE(grid->test(0));
+    };
+    grindToLastSubVoxel(control);
+    grindToLastSubVoxel(carved);
+
+    // `chipped` only loses one, so it stays comfortably partial.
+    REQUIRE(fixture.world.breakSubVoxel(chipped, 0) == EditResult::Applied);
+
+    // ---- the control: the same last carve, with nothing busy ----
+    REQUIRE(fixture.world.breakSubVoxel(control, 0) == EditResult::Applied);
+    REQUIRE(fixture.world.getBlock(control) == blocks::Air);
+    REQUIRE(fixture.world.subVoxelsAt(control) == nullptr);
+
+    // ---- force the deferral, through the relight footprint alone ----
+    //
+    // Chunk (0, 3, 0) is three sections below the edits: outside the 3x3x3 that
+    // isEditBlocked tests, inside the column a sunlight change would run down.
+    // Every deferral below is therefore attributable to isRelightBlocked and
+    // nothing else.
+    const ChunkPtr blocker = fixture.world.chunkAt(ChunkPos{0, 3, 0});
+    REQUIRE(blocker != nullptr);
+    const ChunkState blockerState = blocker->state();
+    blocker->forceState(ChunkState::Meshing);
+
+    // The parity assertion, and the defect. Breaking the whole block defers;
+    // clearing the last sub-voxel of a block does the same thing to the light and
+    // so must defer identically. Before the fix this returned Applied and flooded
+    // light through the busy chunk.
+    REQUIRE(fixture.world.breakBlock(whole) == EditResult::Deferred);
+    REQUIRE(fixture.world.breakSubVoxel(carved, 0) == EditResult::Deferred);
+    CHECK(fixture.world.getBlock(carved) == blocks::Stone);
+    CHECK(fixture.world.subVoxelsAt(carved) != nullptr);
+
+    // The mirror case: air -> partial puts an opaque-to-air block back into an
+    // open column, so it needs the same test. (This one was already correct, and
+    // is here so a later tightening of the predicate cannot quietly lose it.)
+    REQUIRE(fixture.world.restoreSubVoxel(refilled, 0, blocks::Stone) == EditResult::Deferred);
+
+    // ...and the property the whole optimisation exists for must survive the fix:
+    // chipping a block that stays partial moves no light, so a busy chunk three
+    // sections away has no business stopping it.
+    CHECK(fixture.world.breakSubVoxel(chipped, 1) == EditResult::Applied);
+
+    // One update with the blocker still busy. applyDeferredEdits mirrors
+    // editSubVoxel, so the replay must reach the same verdict rather than letting
+    // the carve through one frame later.
+    fixture.world.update(view);
+    CHECK(fixture.world.deferredEditCount() == 3);
+    CHECK(fixture.world.getBlock(carved) == blocks::Stone);
+
+    // ---- let them through ----
+    blocker->forceState(blockerState);
+    fixture.settle(view);
+
+    CHECK(fixture.world.deferredEditCount() == 0);
+    REQUIRE(fixture.world.getBlock(carved) == blocks::Air);
+    CHECK(fixture.world.subVoxelsAt(carved) == nullptr);
+    CHECK(fixture.world.getBlock(whole) == blocks::Air);
+    CHECK(fixture.world.getBlock(refilled) == blocks::Stone);
+
+    // The point of deferring at all: the deferred carve leaves exactly the light
+    // the immediate one did. `control` and `carved` were prepared identically and
+    // both ended as air, with no other block inside either radius-4 cube.
+    CHECK(lightAround(fixture.world, carved, 4) == lightAround(fixture.world, control, 4));
+    CHECK(ChunkStorage::unpackSunlight(fixture.world.getLight(carved)) == 15);
+    CHECK(ChunkStorage::unpackSunlight(
+              fixture.world.getLight(BlockPos{carved.x, carved.y - 1, carved.z})) == 15);
 }

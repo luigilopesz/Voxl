@@ -280,22 +280,72 @@ void RegionFile::rebuildSectorMap()
         m_sectorUsed[i] = 1u;
     }
 
-    // Anything the table does not point at is free, which is how sectors
-    // orphaned by a crash between "payload written" and "entry committed" come
-    // back into circulation.
-    for (Entry& entry : m_table) {
+    // Both passes below index `claims` with sectors that passed `plausible`, so
+    // the bound they are tested against must be the one `claims` was sized to and
+    // must not move underneath them. Snapshotting it here rather than re-reading
+    // m_sectorUsed.size() makes that independent of whether markSectorsUsed ever
+    // grows the map.
+    const std::size_t mapSectors = m_sectorUsed.size();
+
+    // An entry is only worth looking at if the span it claims could physically
+    // exist in this file. The two rejected shapes are a payload that would sit
+    // inside the header/table, and one that runs past the end of the file; read()
+    // refuses both, and the allocator must not reserve space for either.
+    const auto plausible = [mapSectors](const Entry& entry) noexcept {
         if (entry.sector == 0 || entry.sectorCount == 0) {
-            continue;
+            return false;
         }
         if (entry.sector < kRegionFirstDataSector) {
-            continue;  // nonsense offset; read() rejects it, the allocator ignores it
+            return false;
         }
-        const std::uint64_t end =
-            static_cast<std::uint64_t>(entry.sector) + entry.sectorCount;
-        if (end > m_sectorUsed.size()) {
-            continue;  // points past EOF; read() rejects it, do not reserve space for it
+        const std::uint64_t end = static_cast<std::uint64_t>(entry.sector) + entry.sectorCount;
+        return end <= mapSectors;
+    };
+
+    // PASS 1 - how many entries claim each sector, saturating at two. A sector
+    // claimed twice is contested: the table is damaged and there is no way to
+    // tell which of the claimants holds the real payload.
+    std::vector<std::uint8_t> claims(mapSectors, 0u);
+    for (const Entry& entry : m_table) {
+        if (!plausible(entry)) {
+            continue;
         }
+        const std::size_t end = static_cast<std::size_t>(entry.sector) + entry.sectorCount;
+        for (std::size_t i = entry.sector; i < end; ++i) {
+            claims[i] = static_cast<std::uint8_t>(std::min<int>(claims[i] + 1, 2));
+        }
+    }
+
+    // PASS 2 - reserve, then decide ownership.
+    //
+    // Anything the table does not point at is free, which is how sectors orphaned
+    // by a crash between "payload written" and "entry committed" come back into
+    // circulation.
+    //
+    // A contested sector is still RESERVED - handing it out would overwrite
+    // whichever claimant is the genuine payload - but it is owned by nobody, so
+    // no entry may ever release it. Ownership is recorded per entry precisely so
+    // that write() can check it before freeing anything; see the asymmetry note
+    // there. An implausible entry is not reserved and not owned either: it never
+    // cost the allocator a sector, so replacing it frees nothing.
+    for (Entry& entry : m_table) {
+        entry.ownedSector = 0;
+        entry.ownedCount  = 0;
+        if (!plausible(entry)) {
+            continue;
+        }
+
+        const std::size_t end       = static_cast<std::size_t>(entry.sector) + entry.sectorCount;
+        bool              exclusive = true;
+        for (std::size_t i = entry.sector; i < end; ++i) {
+            exclusive = exclusive && claims[i] == 1u;
+        }
+
         markSectorsUsed(entry.sector, entry.sectorCount);
+        if (exclusive) {
+            entry.ownedSector = entry.sector;
+            entry.ownedCount  = entry.sectorCount;
+        }
     }
 }
 
@@ -461,15 +511,24 @@ void RegionFile::markSectorsUsed(std::uint32_t sector, std::uint16_t count)
 
 void RegionFile::releaseSectors(std::uint32_t sector, std::uint16_t count)
 {
-    const std::size_t end = std::min<std::size_t>(static_cast<std::size_t>(sector) + count,
-                                                  m_sectorUsed.size());
-    for (std::size_t i = sector; i < end; ++i) {
+    // The header and the offset table are never free, whatever a caller believes
+    // it owns. Clamping here rather than trusting the call sites means a single
+    // bad number can waste sectors but can never unmark the file's own structure.
+    const std::size_t begin = std::max<std::size_t>(sector, kRegionFirstDataSector);
+    const std::size_t end   = std::min<std::size_t>(static_cast<std::size_t>(sector) + count,
+                                                    m_sectorUsed.size());
+    for (std::size_t i = begin; i < end; ++i) {
         m_sectorUsed[i] = 0u;
     }
 }
 
 std::uint32_t RegionFile::reserveSectors(std::uint16_t count)
 {
+    // write() derives `count` from a payload that is already known to be
+    // non-empty, so a zero-sector request would mean the caller lost track of its
+    // own record layout.
+    VOXL_ASSERT(count != 0, "the sector allocator was asked for a zero-length span");
+
     // First fit. The number of holes in a region is tiny (one per chunk that
     // grew or shrank since the file was opened), so a linear scan over at most a
     // few tens of thousands of bytes beats maintaining a free list that has to
@@ -477,17 +536,23 @@ std::uint32_t RegionFile::reserveSectors(std::uint16_t count)
     std::size_t run = 0;
     for (std::size_t i = kRegionFirstDataSector; i < m_sectorUsed.size(); ++i) {
         run = m_sectorUsed[i] == 0u ? run + 1 : 0;
-        if (run == count) {
-            const auto start = static_cast<std::uint32_t>(i + 1 - run);
+        if (run >= count) {
+            const auto start = static_cast<std::uint32_t>(i + 1 - count);
             markSectorsUsed(start, count);
             return start;
         }
     }
 
-    const auto start = static_cast<std::uint32_t>(
-        std::max(m_sectorUsed.size(), kRegionFirstDataSector));
-    markSectorsUsed(start, count);
-    return start;
+    // Nothing big enough between the live payloads, so grow the file. `run` is
+    // now the length of the free run trailing the map; starting inside it rather
+    // than past it keeps a grow from stranding the sectors immediately below the
+    // new payload, which would otherwise never be reclaimed until the next open.
+    std::size_t start = std::max(m_sectorUsed.size(), kRegionFirstDataSector);
+    start -= std::min(run, start - kRegionFirstDataSector);
+
+    const auto sector = static_cast<std::uint32_t>(start);
+    markSectorsUsed(sector, count);
+    return sector;
 }
 
 // ------------------------------------------------------------------- read --
@@ -661,7 +726,17 @@ bool RegionFile::write(const ChunkPos& position, std::span<const std::byte> payl
     // state completely; from the line after it, the new one.
     const std::size_t entryIndex = regionEntryIndex(position);
     const Entry       previous   = m_table[entryIndex];
-    const Entry       updated{sector, sectorCount, static_cast<std::uint8_t>(lod), 0u};
+
+    Entry updated;
+    updated.sector      = sector;
+    updated.sectorCount = sectorCount;
+    updated.lod         = static_cast<std::uint8_t>(lod);
+    updated.flags       = 0u;
+    // The allocator just handed this span out, so it can vouch for it. Only the
+    // four fields above reach the disk; the ownership record is in-memory state
+    // that exists to answer exactly one question, three lines below.
+    updated.ownedSector = sector;
+    updated.ownedCount  = sectorCount;
 
     std::array<std::byte, kRegionEntryBytes> encoded{};
     encodeEntry(updated, encoded.data());
@@ -678,8 +753,30 @@ bool RegionFile::write(const ChunkPos& position, std::span<const std::byte> payl
 
     // Only now may the old sectors be handed back: before the commit they were
     // the only valid copy of this chunk.
-    if (previous.sector >= kRegionFirstDataSector && previous.sectorCount != 0) {
-        releaseSectors(previous.sector, previous.sectorCount);
+    //
+    // AND ONLY THE SECTORS THE ALLOCATOR ITSELF HANDED OUT FOR THIS ENTRY. The
+    // asymmetry here is deliberate and is the whole safety argument:
+    //
+    //   - A LEAKED sector costs 4 KB of disk until the next open, which rebuilds
+    //     the map from the table and reclaims it. Nothing is lost.
+    //   - A WRONGLY REUSED sector silently destroys a chunk the player never
+    //     touched, and the destruction is invisible: the payload that lands on
+    //     top carries its own valid magic and CRC, so the victim's next read
+    //     SUCCEEDS and returns somebody else's blocks.
+    //
+    // So when the two disagree, leak. rebuildSectorMap refuses to vouch for an
+    // entry whose span is implausible or is contested by a second entry, and an
+    // entry it did not vouch for may well be pointing straight into a healthy
+    // neighbour's payload. Checking the recorded span against the table entry
+    // also catches the case where the entry was vouched for at a different span
+    // than the one it now claims.
+    if (ownsItsSectors(previous)) {
+        releaseSectors(previous.ownedSector, previous.ownedCount);
+    } else if (previous.sector != 0 || previous.sectorCount != 0) {
+        VOXL_LOG_WARN("region '{}': entry {} claimed sectors [{}, {}) that the allocator does not "
+                      "vouch for; leaking them rather than risking another chunk's payload",
+                      m_path.filename().string(), entryIndex, previous.sector,
+                      static_cast<std::uint64_t>(previous.sector) + previous.sectorCount);
     }
     return true;
 }
@@ -702,6 +799,49 @@ std::size_t RegionFile::storedChunkCount() const
         count += (entry.sector != 0 && entry.sectorCount != 0) ? 1u : 0u;
     }
     return count;
+}
+
+std::size_t RegionFile::reservedSectorCount() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::size_t                 count = 0;
+    for (std::size_t i = kRegionFirstDataSector; i < m_sectorUsed.size(); ++i) {
+        count += m_sectorUsed[i] != 0u ? 1u : 0u;
+    }
+    return count;
+}
+
+std::size_t RegionFile::leakedSectorCount() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    // Paint every sector a trusted entry owns, then count the reserved sectors
+    // nobody painted. Those are the ones no future write may release - see the
+    // asymmetry note in write().
+    std::vector<std::uint8_t> owned(m_sectorUsed.size(), 0u);
+    for (const Entry& entry : m_table) {
+        if (!ownsItsSectors(entry)) {
+            continue;
+        }
+        const std::size_t end =
+            std::min<std::size_t>(static_cast<std::size_t>(entry.ownedSector) + entry.ownedCount,
+                                  owned.size());
+        for (std::size_t i = entry.ownedSector; i < end; ++i) {
+            owned[i] = 1u;
+        }
+    }
+
+    std::size_t count = 0;
+    for (std::size_t i = kRegionFirstDataSector; i < m_sectorUsed.size(); ++i) {
+        count += (m_sectorUsed[i] != 0u && owned[i] == 0u) ? 1u : 0u;
+    }
+    return count;
+}
+
+bool RegionFile::isSectorReserved(std::uint32_t sector) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return sector < m_sectorUsed.size() && m_sectorUsed[sector] != 0u;
 }
 
 }  // namespace voxl

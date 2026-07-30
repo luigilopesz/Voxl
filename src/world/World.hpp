@@ -323,6 +323,26 @@ private:
     /// column of light hanging in the air with nothing to take it away.
     [[nodiscard]] bool isRelightBlocked(const BlockPos& pos) const;
 
+    /// True when the sub-voxel edit about to be made would make writeSubVoxel
+    /// relight, so the caller knows it must test the taller relight footprint.
+    ///
+    /// THIS PREDICATE MUST STAY IN STEP WITH THE RELIGHT CONDITION AT THE FOOT OF
+    /// writeSubVoxel. It used to be approximated by "the block is still whole, or
+    /// this is a restore", on the reasoning that an already-damaged block is
+    /// already transparent to the light engine so chipping it further moves no
+    /// light. That is true of every carve but one: clearing the LAST remaining
+    /// sub-voxel turns the block to air, which is a full opacity change and opens
+    /// the sunlight shaft under it - and it is the final act of mining any block,
+    /// so it is the most common edit in the game. The approximation let that carve
+    /// skip isRelightBlocked and run a world-height flood into chunks a worker
+    /// owns, which is invariant 1 (no writing to a chunk a worker may be reading).
+    ///
+    /// Only safe to call once isEditBlocked() has answered false: it reads the
+    /// chunk's storage and sub-voxel store.
+    [[nodiscard]] static bool subVoxelEditMayRelight(const ChunkPtr& chunk, std::size_t blockIndex,
+                                                     std::size_t subIndex, BlockId material,
+                                                     bool restore);
+
     /// Rebuilds the light around a voxel that just changed, then marks every
     /// chunk whose light moved - and its seam neighbours - for a remesh.
     void relightAround(const BlockPos& pos);

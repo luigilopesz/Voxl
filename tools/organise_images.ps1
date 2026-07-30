@@ -107,6 +107,16 @@ $map = [ordered]@{
     'crop_moon.png'                        = '05-milestone4-daynight-sky/16-crop-moon.png'
     'diff_stars.png'                       = '05-milestone4-daynight-sky/17-difference-star-field.png'
     'diff_terrain_band.png'                = '05-milestone4-daynight-sky/18-difference-terrain-band.png'
+    'sky_dusk.png'                         = '05-milestone4-daynight-sky/19-sky-dome-dusk.png'
+    'crop_dawn_moon_horizon.png'           = '05-milestone4-daynight-sky/20-crop-dawn-moon-at-horizon.png'
+    'crop_night_seam.png'                  = '05-milestone4-daynight-sky/21-crop-night-horizon-seam-check.png'
+    'water_night.png'                      = '05-milestone4-daynight-sky/22-water-at-night.png'
+
+    # ---------------------------- M5: water-at-LOD artefact, found and fixed --
+    'water_lod_artifact_off.png'           = '07-milestone5-water-lod-artifact/01-water-with-lod-disabled-control.png'
+    'water_lod_artifact_on.png'            = '07-milestone5-water-lod-artifact/02-water-with-lod-enabled-artefact.png'
+    'crop_water_lod_off.png'               = '07-milestone5-water-lod-artifact/03-crop-lod-disabled.png'
+    'crop_water_lod_on.png'                = '07-milestone5-water-lod-artifact/04-crop-lod-enabled.png'
 
     # ------------------------------------------------ M4: menus and settings --
     'ml_menu_title.png'                    = '06-milestone4-ui/01-main-menu-title-screen.png'

@@ -46,6 +46,8 @@ using voxl::kChunkVolume;
 using voxl::kLodFull;
 using voxl::kSubVoxelCount;
 using voxl::kSubVoxelWords;
+using voxl::LodLevel;
+using voxl::RegionFile;
 using voxl::RegionHeaderInfo;
 using voxl::SaveError;
 using voxl::SeedSource;
@@ -179,6 +181,68 @@ struct RawEntry {
 {
     const voxl::RegionCoord coord = voxl::toRegionCoord(position);
     return voxl::RegionFile::pathFor(directory, coord.x, coord.z);
+}
+
+// ------------------------------------------------- raw region-layer fixtures --
+
+/// A payload body of `bytes` bytes, filled with a pattern that depends on `tag`.
+///
+/// RegionFile treats a body as opaque - magic, length, CRC and LOD are the only
+/// things it inspects - so the allocator tests below drive it directly with
+/// synthetic bodies instead of going through the chunk codec. That keeps the
+/// sector arithmetic in each test visible and exact.
+[[nodiscard]] std::vector<std::byte> patternBody(std::size_t bytes, std::uint8_t tag)
+{
+    std::vector<std::byte> out(bytes);
+    for (std::size_t i = 0; i < bytes; ++i) {
+        out[i] = static_cast<std::byte>((i * 31u + tag * 7u + 1u) & 0xFFu);
+    }
+    return out;
+}
+
+/// Writes `body` at `position` through the region layer and fails the test if
+/// the write does not succeed cleanly.
+void requireRawWrite(RegionFile& region, const ChunkPos& position,
+                     const std::vector<std::byte>& body)
+{
+    SaveError error = SaveError::Io;
+    REQUIRE(region.write(position, std::span<const std::byte>{body}, kLodFull, error));
+    REQUIRE(error == SaveError::None);
+}
+
+/// Reads `position` back and asserts it is byte-identical to `expected`.
+///
+/// This is the assertion the critical defect breaks: the sectors under a healthy
+/// chunk get handed to somebody else's payload, and because that payload carries
+/// its own valid magic and CRC the read succeeds and returns the WRONG chunk.
+void requireRawReadEquals(RegionFile& region, const ChunkPos& position,
+                          const std::vector<std::byte>& expected)
+{
+    std::vector<std::byte> got;
+    LodLevel               lod   = kLodFull;
+    SaveError              error = SaveError::Io;
+    REQUIRE(region.read(position, got, lod, error) == ChunkLoadStatus::Loaded);
+    REQUIRE(error == SaveError::None);
+    REQUIRE(lod == kLodFull);
+    REQUIRE(got.size() == expected.size());
+
+    // Reported as the index of the first difference rather than as `got ==
+    // expected`, because Catch2 prints both operands of a failed comparison and
+    // these bodies are kilobytes long - the same reason compareContents() counts
+    // voxel mismatches instead of asserting per voxel.
+    std::size_t firstDifference = expected.size();
+    for (std::size_t i = 0; i < expected.size() && firstDifference == expected.size(); ++i) {
+        if (got[i] != expected[i]) {
+            firstDifference = i;
+        }
+    }
+    REQUIRE(firstDifference == expected.size());
+}
+
+/// Bytes that need exactly `sectors` sectors once the payload header is added.
+[[nodiscard]] std::size_t bodyBytesForSectors(std::size_t sectors)
+{
+    return sectors * voxl::kRegionSectorSize - voxl::kChunkPayloadHeaderBytes;
 }
 
 // ---------------------------------------------------------- chunk fixtures --
@@ -1061,6 +1125,222 @@ TEST_CASE("a table entry pointing past the end of the file regenerates",
     REQUIRE(result.status == ChunkLoadStatus::Corrupt);
     REQUIRE(result.error == SaveError::OffsetOutOfRange);
     REQUIRE(restored->isEmpty());
+}
+
+// ===========================================================================
+//  Sector ownership: the allocator may only free what it handed out
+// ===========================================================================
+
+TEST_CASE("overwriting an entry the allocator never trusted cannot free another chunk's sectors",
+          "[persistence][corrupt][allocator]")
+{
+    // THE CRITICAL DEFECT, REPRODUCED.
+    //
+    // rebuildSectorMap deliberately refuses to vouch for a table entry whose span
+    // is implausible or is contested by a second entry. write() used to release
+    // "the previous entry's sectors" straight from the table without asking
+    // whether the allocator agreed those sectors belonged to that entry, so an
+    // entry the map had already written off could free sectors holding a
+    // DIFFERENT, healthy chunk. The next write then landed on top of it - and
+    // because that new payload carries its own valid magic and CRC, reading the
+    // victim chunk SUCCEEDS and quietly returns somebody else's bytes.
+    TempDir dir{"ownership"};
+
+    const std::filesystem::path path = RegionFile::pathFor(dir.path(), 0, 0);
+    const ChunkPos              victim{1, 0, 0};
+    const ChunkPos              healthy{2, 0, 0};
+    const ChunkPos              later{3, 0, 0};
+
+    const std::vector<std::byte> firstVictim = patternBody(bodyBytesForSectors(1), 0x11);
+    const std::vector<std::byte> healthyBody = patternBody(bodyBytesForSectors(2), 0x22);
+    const std::vector<std::byte> newVictim   = patternBody(bodyBytesForSectors(1), 0x33);
+    // Sized to fit exactly the hole a wrong release would open, so a broken
+    // allocator puts this payload right on top of the healthy chunk.
+    const std::vector<std::byte> laterBody = patternBody(bodyBytesForSectors(2), 0x44);
+
+    {
+        RegionFile region(path, 0, 0, kSeed);
+        requireRawWrite(region, victim, firstVictim);
+        requireRawWrite(region, healthy, healthyBody);
+        REQUIRE(region.flush());
+    }
+
+    const RawEntry healthyEntry = readRawEntry(path, healthy);
+    REQUIRE(healthyEntry.sectorCount == std::uint16_t{2});
+    REQUIRE(healthyEntry.sector >= voxl::kRegionFirstDataSector);
+
+    const std::size_t victimEntryOffset =
+        voxl::regionEntryFileOffset(voxl::regionEntryIndex(victim));
+
+    // How many sectors the fix is expected to LEAK. Leaking is the correct
+    // outcome for sectors nobody can prove ownership of; see write().
+    std::size_t expectedLeak = 0;
+
+    SECTION("the entry overlaps a healthy chunk exactly")
+    {
+        // Two entries claiming the same span. The map cannot tell which one is
+        // the real payload, so it must vouch for neither and reserve the span for
+        // both - which means replacing either of them leaks.
+        patchU32(path, victimEntryOffset, healthyEntry.sector);
+        patchU16(path, victimEntryOffset + 4u, healthyEntry.sectorCount);
+        expectedLeak = healthyEntry.sectorCount;
+    }
+    SECTION("the entry starts inside a healthy chunk and runs past the end of the file")
+    {
+        // rebuildSectorMap skips this entry outright, so it never reserved
+        // anything and there is nothing to leak. Releasing it would still have
+        // cleared the healthy chunk's sectors, because releaseSectors clamps the
+        // span to the map instead of rejecting it.
+        patchU32(path, victimEntryOffset, healthyEntry.sector);
+        patchU16(path, victimEntryOffset + 4u, 0xFFFFu);
+        expectedLeak = 0;
+    }
+
+    {
+        RegionFile region(path, 0, 0, kSeed);
+        REQUIRE(region.healthy());
+        REQUIRE(region.openError() == SaveError::None);
+
+        // Only the healthy chunk's two sectors are live: the victim's original
+        // sector is orphaned now that its entry points elsewhere.
+        const std::size_t reservedBefore = region.reservedSectorCount();
+        REQUIRE(reservedBefore == std::size_t{2});
+
+        requireRawWrite(region, victim, newVictim);
+
+        // THE ASSERTION THE DEFECT BREAKS. Replacing an entry the allocator never
+        // vouched for must not put the sectors under it back in the free map.
+        //
+        // CHECK rather than REQUIRE deliberately: these three are the CAUSE, and
+        // the byte-identical read further down is the CONSEQUENCE. Letting the
+        // section run to the end means one failing run reports both, instead of
+        // stopping at the bookkeeping and leaving the reader to guess what it
+        // costs.
+        for (std::uint16_t i = 0; i < healthyEntry.sectorCount; ++i) {
+            CHECK(region.isSectorReserved(healthyEntry.sector + i));
+        }
+        CHECK(region.leakedSectorCount() == expectedLeak);
+        CHECK(region.reservedSectorCount() == reservedBefore + 1u);
+
+        requireRawWrite(region, later, laterBody);
+        REQUIRE(region.flush());
+
+        requireRawReadEquals(region, healthy, healthyBody);
+        requireRawReadEquals(region, victim, newVictim);
+        requireRawReadEquals(region, later, laterBody);
+    }
+
+    // The third payload went somewhere else entirely, not into the healthy
+    // chunk's sectors.
+    REQUIRE(readRawEntry(path, later).sector != healthyEntry.sector);
+
+    // And it all still holds through a fresh handle, which is what a relaunch is.
+    RegionFile reopened(path, 0, 0, kSeed);
+    REQUIRE(reopened.healthy());
+    requireRawReadEquals(reopened, healthy, healthyBody);
+    requireRawReadEquals(reopened, victim, newVictim);
+    requireRawReadEquals(reopened, later, laterBody);
+
+    // The leak is transient by construction: the map is rebuilt from the table on
+    // every open, so sectors no live entry points at come straight back.
+    REQUIRE(reopened.leakedSectorCount() == std::size_t{0});
+}
+
+TEST_CASE("rewriting chunks over and over never double-frees or strands a sector",
+          "[persistence][allocator]")
+{
+    TempDir                     dir{"allocator"};
+    const std::filesystem::path path = RegionFile::pathFor(dir.path(), 0, 0);
+
+    // Eight chunks whose payloads keep changing size, so most rewrites force a
+    // move. Every move frees a span, and a span freed twice - or freed while a
+    // neighbour still occupies it - shows up as one of these reads coming back
+    // with another chunk's bytes.
+    constexpr std::size_t kChunks = 8;
+    std::vector<ChunkPos> positions;
+    for (std::size_t i = 0; i < kChunks; ++i) {
+        positions.push_back(ChunkPos{static_cast<std::int32_t>(i), 0, 0});
+    }
+
+    std::vector<std::vector<std::byte>> expected(kChunks);
+    std::vector<std::size_t>            sectorsOf(kChunks, 0);
+
+    RegionFile region(path, 0, 0, kSeed);
+    Lcg        rng{4242u};
+    for (int round = 0; round < 12; ++round) {
+        for (std::size_t i = 0; i < kChunks; ++i) {
+            sectorsOf[i] = 1u + rng.below(4u);
+            expected[i]  = patternBody(bodyBytesForSectors(sectorsOf[i]),
+                                       static_cast<std::uint8_t>(round * 16 + static_cast<int>(i)));
+            requireRawWrite(region, positions[i], expected[i]);
+        }
+        for (std::size_t i = 0; i < kChunks; ++i) {
+            requireRawReadEquals(region, positions[i], expected[i]);
+        }
+    }
+    REQUIRE(region.flush());
+
+    // The map holds exactly the sectors the live entries span: nothing reserved
+    // twice, nothing reserved that no entry owns.
+    std::size_t live = 0;
+    for (const std::size_t sectors : sectorsOf) {
+        live += sectors;
+    }
+    REQUIRE(region.reservedSectorCount() == live);
+    REQUIRE(region.leakedSectorCount() == std::size_t{0});
+}
+
+TEST_CASE("the sector free map survives a reopen and reuses the hole a move left",
+          "[persistence][allocator]")
+{
+    TempDir                     dir{"freelist"};
+    const std::filesystem::path path = RegionFile::pathFor(dir.path(), 0, 0);
+
+    const ChunkPos a{0, 0, 0};
+    const ChunkPos b{1, 0, 0};
+    const ChunkPos c{2, 0, 0};
+
+    const std::vector<std::byte> smallA = patternBody(bodyBytesForSectors(2), 0x01);
+    const std::vector<std::byte> bodyB  = patternBody(bodyBytesForSectors(1), 0x02);
+    const std::vector<std::byte> bigA   = patternBody(bodyBytesForSectors(3), 0x03);
+    const std::vector<std::byte> bodyC  = patternBody(bodyBytesForSectors(2), 0x04);
+
+    {
+        RegionFile region(path, 0, 0, kSeed);
+        requireRawWrite(region, a, smallA);
+        requireRawWrite(region, b, bodyB);
+        REQUIRE(region.flush());
+    }
+
+    const RawEntry firstA = readRawEntry(path, a);
+    REQUIRE(firstA.sectorCount == std::uint16_t{2});
+
+    {
+        // A grows past its span, so it moves and leaves a two-sector hole behind.
+        RegionFile region(path, 0, 0, kSeed);
+        requireRawWrite(region, a, bigA);
+        REQUIRE(region.flush());
+    }
+    REQUIRE(readRawEntry(path, a).sector != firstA.sector);
+
+    {
+        // A fresh handle rebuilds the map from the table alone. The hole has to
+        // come back, or every save session leaks everything the last one moved.
+        RegionFile region(path, 0, 0, kSeed);
+        REQUIRE(region.healthy());
+        REQUIRE_FALSE(region.isSectorReserved(firstA.sector));
+        REQUIRE_FALSE(region.isSectorReserved(firstA.sector + 1u));
+        REQUIRE(region.leakedSectorCount() == std::size_t{0});
+
+        requireRawWrite(region, c, bodyC);
+        REQUIRE(region.flush());
+
+        requireRawReadEquals(region, a, bigA);
+        requireRawReadEquals(region, b, bodyB);
+        requireRawReadEquals(region, c, bodyC);
+    }
+
+    REQUIRE(readRawEntry(path, c).sector == firstA.sector);
 }
 
 TEST_CASE("a zero-length payload regenerates", "[persistence][corrupt]")

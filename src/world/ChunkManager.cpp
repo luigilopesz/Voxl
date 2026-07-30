@@ -64,59 +64,15 @@ constexpr float kHighPriorityDistance = static_cast<float>(2 * kChunkSize);
     return static_cast<std::int32_t>(root);
 }
 
-/// Every live manager, for isChunkNeighbourhoodBusyAnywhere(). Function-local
-/// statics rather than namespace-scope objects so there is no static
-/// initialisation order to reason about: a manager constructed by another
-/// translation unit's static initialiser still finds a built registry.
-///
-/// The mutex costs nothing - the list is touched three times per manager
-/// lifetime and once per chunk encode - but it is not decoration: a manager may
-/// be constructed on a thread that is not the one saving.
-std::mutex& managerRegistryMutex()
-{
-    static std::mutex mutex;
-    return mutex;
-}
-
-std::vector<const ChunkManager*>& managerRegistry()
-{
-    static std::vector<const ChunkManager*> registry;
-    return registry;
-}
-
 }  // namespace
-
-bool isChunkNeighbourhoodBusyAnywhere(const ChunkPos& position)
-{
-    std::lock_guard<std::mutex> lock(managerRegistryMutex());
-    for (const ChunkManager* manager : managerRegistry()) {
-        if (manager->isNeighbourhoodBusy(position)) {
-            return true;
-        }
-    }
-    return false;
-}
 
 ChunkManager::ChunkManager(JobSystem& jobs, const StreamingConfig& config) : m_jobs(jobs)
 {
     setConfig(config);
-    {
-        std::lock_guard<std::mutex> lock(managerRegistryMutex());
-        managerRegistry().push_back(this);
-    }
 }
 
 ChunkManager::~ChunkManager()
 {
-    // Unpublished FIRST, before anything else in this destructor can make the
-    // object unfit to answer: from here on nobody outside can reach us, and the
-    // members isNeighbourhoodBusy() reads are still whole.
-    {
-        std::lock_guard<std::mutex>       lock(managerRegistryMutex());
-        std::vector<const ChunkManager*>& registry = managerRegistry();
-        registry.erase(std::remove(registry.begin(), registry.end(), this), registry.end());
-    }
-
     // Order matters. First let the in-flight jobs finish, because they hold a
     // raw `this` and are mid-generate or mid-mesh; only then clear the liveness
     // flag, which is what stops the upload closures still sitting in the
@@ -151,6 +107,15 @@ void ChunkManager::setMeshReleaser(ChunkReleaseFn release)
 void ChunkManager::setRetireHook(ChunkRetireFn retire)
 {
     m_retire = std::move(retire);
+}
+
+void ChunkManager::setDivergedPredicate(ChunkDivergedFn diverged)
+{
+    // Read by lodTargetFor() from the main thread only, but a LOD rebuild in
+    // flight is already holding the old answer, so swapping the predicate under
+    // one is the same hazard as swapping the generator under a generate job.
+    VOXL_CHECK(jobsInFlight() == 0, "setDivergedPredicate() while jobs are in flight");
+    m_diverged = std::move(diverged);
 }
 
 void ChunkManager::setLighter(ChunkLighter lighter)
@@ -276,6 +241,12 @@ bool ChunkManager::isStillResident(const ChunkPtr& chunk) const
 
 bool ChunkManager::isRegionBusy(const ChunkPos& minChunk, const ChunkPos& maxChunk) const
 {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return isRegionBusyLocked(minChunk, maxChunk);
+}
+
+bool ChunkManager::isRegionBusyLocked(const ChunkPos& minChunk, const ChunkPos& maxChunk) const
+{
     // Both readers reach one chunk beyond what they are working on, so growing
     // the box by one and testing membership is the same answer as asking
     // "is any chunk in the box inside somebody's 3x3x3" - in one pass.
@@ -285,8 +256,6 @@ bool ChunkManager::isRegionBusy(const ChunkPos& minChunk, const ChunkPos& maxChu
     const std::int32_t maxZ = maxChunk.z + 1;
     const std::int32_t minY = std::max(0, minChunk.y - 1);
     const std::int32_t maxY = std::min(kWorldSectionCount - 1, maxChunk.y + 1);
-
-    std::shared_lock<std::shared_mutex> lock(m_mutex);
 
     if (!m_lightColumns.empty()) {
         for (std::int32_t z = minZ; z <= maxZ; ++z) {
@@ -387,14 +356,63 @@ LodLevel ChunkManager::lodTargetFor(const ChunkPtr& chunk, ChunkState state,
     if (state != ChunkState::Ready || !m_generate || !m_mesh) {
         return current;
     }
-    if (m_config.preserveEditedChunks && chunk->needsSave()) {
-        // Regenerating would erase the edit; see StreamingConfig.
-        return current;
-    }
+
     // The two-argument overload is the one with the hysteresis band. Passing the
     // chunk's present level is what stops a player pacing across a band edge
     // from rebuilding the same ring every few steps.
-    return m_config.lod.levelFor(distanceInChunks, current);
+    //
+    // Asked BEFORE the divergence questions below, and answered early when the
+    // level would not move anyway: m_diverged reaches into the save layer and
+    // takes a lock, and consulting it for every Ready chunk in the load volume
+    // on every update - thousands of them, almost none at a band edge - was
+    // thousands of locked lookups a frame for an answer that changed nothing.
+    const LodLevel target = m_config.lod.levelFor(distanceInChunks, current);
+    if (target == current || !m_config.preserveEditedChunks) {
+        return target;
+    }
+
+    // WHAT IS PROTECTED IS THE DATA, NOT THE LEVEL.
+    //
+    // A rebuild reruns the ChunkGenerateFn. For terrain the seed reproduces that
+    // costs nothing; for a chunk the player authored it is destruction - unless
+    // the generator can read the content back, and it can only do that at
+    // kLodFull, because kLodFull is the only level a save ever holds
+    // (WorldSave::saveChunk refuses to write a coarse chunk and
+    // WorldSave::loadChunk refuses to answer for one). So the question here is
+    // never "has this chunk been edited" but "would this particular rebuild
+    // regenerate it". See StreamingConfig::preserveEditedChunks.
+    //
+    // needsSave() says the authored content exists ONLY in this object: there is
+    // nothing on disk to reload, so every rebuild in every direction destroys it
+    // and the chunk has to stay exactly as it is. That is also the whole of the
+    // behaviour when no divergence predicate is wired, which is what keeps a
+    // standalone ChunkManager safe.
+    if (chunk->needsSave()) {
+        return current;
+    }
+
+    // m_diverged is the sticky signal, answered from the set of positions that
+    // have bytes on disk - which also covers a build that was RELOADED, whose
+    // needsSave() is false by construction and which the dirty flag therefore
+    // cannot protect at all. Tested for emptiness because calling an empty
+    // std::function throws and this function is noexcept.
+    if (!m_diverged || !m_diverged(chunk->position())) {
+        return target;  // ordinary terrain; the seed reproduces it exactly
+    }
+
+    // On disk. A rebuild at kLodFull RELOADS instead of regenerating, so it is
+    // the one transition that hands the build back intact - and refusing it was
+    // the bug: a chunk that streamed in coarse over a saved build could never be
+    // refined, and since the reload only fires at kLodFull the state fed itself.
+    //
+    // Every other target still regenerates and is still refused. That includes
+    // an INTERMEDIATE promotion - a level-3 chunk whose policy target is 1 - even
+    // though it moves in the "safe" direction: level 1 is not a level any save
+    // can hold, so restoring is not on offer there and the rebuild would be a
+    // plain regeneration over the player's work. The cost is that such a chunk
+    // resolves in one step at the level-0 band instead of two, which is a little
+    // detail arriving a little late; the alternative is deleting a house.
+    return target == kLodFull ? kLodFull : current;
 }
 
 float ChunkManager::priorityScore(const StreamingView& view, const ChunkPos& pos) const noexcept
@@ -692,6 +710,32 @@ bool ChunkManager::claimColumnLight(const ColumnPos& column, ColumnLightJob& job
         return false;  // already being lit
     }
 
+    // A NEIGHBOUR IN FLIGHT MUST NOT BE LIT ALONGSIDE US. The region fill below
+    // takes only visible() chunks, so a column being lit right now arrives as
+    // null and the engine walls it off. That is sound only because whichever
+    // column is lit SECOND reads the first and spills back - and when two
+    // neighbours run together, neither is second: nothing crosses in either
+    // direction and, since published light is never recomputed, the seam between
+    // them stays dark for good. Refusing restores the ordering; the column stays
+    // in m_lightPending (deliberately NOT erased, exactly like the self-check
+    // above) and the next sweep picks it up.
+    //
+    // Four faces, not the 3x3: LightEngine::loadSection and collectSpill only
+    // ever index work->at() with the six kDirectionOffsets, so the four diagonal
+    // region columns are filled but never read. Excluding them would cost
+    // parallelism for nothing.
+    //
+    // No livelock - runColumnLight releases the claim before it posts its spill,
+    // and sweepPendingLight retries every update.
+    constexpr std::int32_t kFaceDx[4] = {-1, 1, 0, 0};
+    constexpr std::int32_t kFaceDz[4] = {0, 0, -1, 1};
+    for (std::size_t face = 0; face < 4; ++face) {
+        if (m_lightColumns.find(ColumnPos{column.x + kFaceDx[face], column.z + kFaceDz[face]}) !=
+            m_lightColumns.end()) {
+            return false;
+        }
+    }
+
     LightColumnWork& work = job.work;
     work.column           = column;
     work.targets.fill(nullptr);
@@ -956,6 +1000,32 @@ bool ChunkManager::dispatchLodRebuild(const Candidate& candidate, JobPriority pr
     const ChunkPtr& live   = candidate.chunk;
     const LodLevel  target = candidate.targetLod;
 
+    // A REBUILD DESTROYS THE OUTGOING OBJECT, SO IT MAY NOT START ON CONTENT
+    // THAT EXISTS NOWHERE ELSE.
+    //
+    // finishLodRebuild() swaps the shadow into the map and then offers `live` to
+    // the retire hook. That offer can be REFUSED - WorldSave::saveChunk returns
+    // false while the neighbourhood is busy - and unlike every other refusal in
+    // the engine there is no next time: the object is dropped on the next line
+    // and the edit is gone. Same shape of hole as the one retireDistant() holds
+    // chunks back for, reached through the rebuild path instead.
+    //
+    // Closed here rather than at the retire call because at THIS point the
+    // chunk is still Ready, still resident and still whole; refusing costs one
+    // deferred rebuild, and the autosave clears needsSave() within an interval,
+    // after which the rebuild proceeds normally. Deferring at the far end is not
+    // available - by then the swap has already happened.
+    //
+    // Gated on m_retire because with no save layer wired there is no save to
+    // refuse: the content was never persistable, and demoting it is precisely
+    // what preserveEditedChunks == false asks for. With a saver wired this rule
+    // holds regardless of that flag, which is the point - the flag governs
+    // whether an edit may be REGENERATED over, not whether it may be silently
+    // discarded while a save was still owed.
+    if (m_retire && live->needsSave()) {
+        return false;
+    }
+
     // Same rule as a first mesh: the geometry job reads a one-voxel skirt out of
     // all 26 neighbours, and an incomplete neighbourhood bakes a wrong seam in.
     ChunkNeighbourhood snapshot = captureNeighbourhood(candidate.position);
@@ -1097,9 +1167,16 @@ void ChunkManager::finishLodRebuild(const ChunkPtr& live, const ChunkPtr& shadow
 
     // Retire the old object by hand. Deliberately NOT through the release hook:
     // that deletes the renderer's mesh for this position, which is now the mesh
-    // we just uploaded. The retire (save) hook fires only if the chunk actually
-    // diverged from generated terrain - with preserveEditedChunks on it never
-    // can, but a caller who turned that off should still get told.
+    // we just uploaded.
+    //
+    // THIS SAVE IS A BACKSTOP AND MUST STAY UNREACHABLE. A refusal here is
+    // unrecoverable - `live` is dropped on return, so there is no chunk left to
+    // retry with - which is why dispatchLodRebuild() refuses to START a rebuild
+    // on a chunk that still owes a save. needsSave() cannot turn true in the
+    // window between: `live` sits in ChunkState::Meshing for the whole rebuild,
+    // and that is exactly what makes World::isEditBlocked() defer every
+    // main-thread write to it. The call is kept anyway because the cost of being
+    // wrong about that is a deleted build, and the cost of the call is nothing.
     //
     // Two steps because Meshing -> Unloading is not an edge of the diagram: a
     // busy chunk may never be retired, and the way out of Meshing is Meshed. We
@@ -1176,6 +1253,13 @@ void ChunkManager::retireDistant(const ChunkPos& centre, std::uint64_t frameInde
                 continue;
             }
 
+            const std::uint64_t touched = chunk->lastTouchedFrame();
+            const std::uint64_t age     = frameIndex > touched ? frameIndex - touched : 0;
+            if (age < m_config.unloadGraceFrames) {
+                ++it;
+                continue;
+            }
+
             // A light job for this column is writing the chunk's light right now
             // and the retire hook is about to read the whole chunk. Not covered
             // by isChunkBusy: lighting deliberately does not make a chunk busy.
@@ -1185,9 +1269,35 @@ void ChunkManager::retireDistant(const ChunkPos& centre, std::uint64_t frameInde
                 continue;
             }
 
-            const std::uint64_t touched = chunk->lastTouchedFrame();
-            const std::uint64_t age     = frameIndex > touched ? frameIndex - touched : 0;
-            if (age < m_config.unloadGraceFrames) {
+            // AND FOR A CHUNK WITH SOMETHING TO LOSE, THE HOLD HAS TO MATCH THE
+            // SAVE PROBE'S SCOPE RATHER THAN JUST ITS OWN COLUMN.
+            //
+            // The retire hook is a dirty chunk's LAST chance to reach disk, and
+            // the save it performs reads the whole thing - voxels and light - on
+            // this thread. WorldSave::saveChunk therefore refuses on
+            // isNeighbourhoodBusy(): a MESH job anywhere in the 3x3x3, or a LIGHT
+            // job on any of the NINE surrounding columns. The own-column test
+            // above is narrower than that, so a dirty chunk beside a lit column
+            // passed it, was erased from the map, and had its save refused on the
+            // way out. Everywhere else a refusal is a deferral - the chunk keeps
+            // needsSave() and the next autosave writes it - but here there is no
+            // next time and no chunk left to retry with. The edit is simply gone.
+            //
+            // CONDITIONAL ON needsSave(), AND THAT IS NOT AN OPTIMISATION. The
+            // hold is only sound because it is temporary, and out at the keep
+            // boundary "temporary" depends on the padding: with unloadPadding 1
+            // the retiring ring sits one chunk from the load rim, where
+            // generation and lighting run continuously, so a walking player keeps
+            // the wide neighbourhood busy for as long as the walk lasts and
+            // NOTHING retires. Restricting it to chunks that actually have data
+            // to lose bounds the held set by what the player has edited since the
+            // last autosave - a handful, every one of which the autosave is
+            // independently trying to write and will release - rather than by the
+            // whole trailing edge of the load volume.
+            //
+            // m_retire for the same reason: with no hook installed there is no
+            // save to protect and the delay would buy nothing.
+            if (m_retire && chunk->needsSave() && isRegionBusyLocked(it->first, it->first)) {
                 ++it;
                 continue;
             }

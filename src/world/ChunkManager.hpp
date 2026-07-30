@@ -233,15 +233,34 @@ struct StreamingConfig {
     /// lighting one; the game always runs with it on.
     bool lighting = true;
 
-    /// Refuse to change the level of a chunk the player has edited.
+    /// Refuse to REGENERATE a chunk that diverges from generated terrain.
     ///
-    /// A rebuild regenerates terrain from the seed, which would silently erase
-    /// the edit. Chunk::needsSave() is the marker and it is exact: the terrain
-    /// generator writes through ChunkStorage and never sets it, only
-    /// Chunk::setBlock does. Until a persistence layer exists to re-apply edits
-    /// on top of a regenerated chunk, an edited chunk simply keeps the level it
-    /// was edited at - a handful of full-resolution chunks in the distance is a
-    /// far cheaper bug than a player's build dissolving when they walk away.
+    /// A rebuild reruns the ChunkGenerateFn, which for ordinary terrain is free
+    /// and for an authored chunk is destruction. Chunk::needsSave() is one half
+    /// of the marker and it is NOT exact - it means "dirty since the last
+    /// write", not "edited". The first autosave calls Chunk::markSaved() and
+    /// clears it while the build is still on disk, and a chunk decoded back off
+    /// disk has it false from birth, so on its own it protected an edit for
+    /// exactly one autosave interval. The other half is setDivergedPredicate(),
+    /// a sticky per-position answer supplied by the save layer. With no
+    /// predicate set the behaviour is the old, leaky one, which is what keeps
+    /// ChunkManager usable standalone.
+    ///
+    /// WHAT IS REFUSED IS THE REGENERATION, NOT EVERY LEVEL CHANGE. Freezing a
+    /// divergent chunk at whatever level it happens to be holding is a bug of
+    /// its own, and a self-perpetuating one: kLodFull is the only level a save
+    /// ever holds, so a build streams back in at the coarse level its distance
+    /// implies - the load misses and the seed fills it - and a frozen chunk can
+    /// never be refined afterwards. The player walks up to their own house and
+    /// it stays blocky for the rest of the session.
+    ///
+    /// So lodTargetFor() permits exactly one transition for a divergent chunk:
+    /// a rebuild AT kLodFull, for a position the diverged predicate says is on
+    /// disk, which the generator satisfies by RELOADING rather than
+    /// regenerating. Everything else is still refused - every demotion, and also
+    /// the intermediate promotion (3 -> 1, say) that would land the chunk on a
+    /// level no save can hold and therefore regenerate it just as surely as a
+    /// demotion would.
     bool preserveEditedChunks = true;
 
     [[nodiscard]] std::int32_t unloadRadius() const noexcept
@@ -283,6 +302,27 @@ using ChunkReleaseFn = std::function<void(const ChunkPos&)>;
 /// Last look at a chunk before it is dropped - the hook the save system will
 /// use. The chunk is already in state Unloading. MAIN THREAD.
 using ChunkRetireFn = std::function<void(const ChunkPtr&)>;
+
+/// Answers "does the chunk at this position diverge from generated terrain".
+///
+/// Injected because the manager has no save layer to ask; WorldSave supplies it
+/// through WorldSave::storedChunkPredicate(). See the divergence note in
+/// world/WorldSave.hpp, and preserveEditedChunks above for why the per-chunk
+/// dirty flag cannot answer this question. MAIN THREAD.
+///
+/// A TRUE ANSWER IS ALSO A PROMISE: that the injected ChunkGenerateFn will
+/// restore this position's authored content when asked to generate it at
+/// kLodFull. That promise is what makes a promotion to full resolution safe for
+/// a chunk the seed cannot reproduce, and it is exactly how Application wires
+/// the pair - WorldSave::hasStoredChunk against a generator that tries
+/// WorldSave::loadChunk before it touches the terrain sampler. A predicate
+/// answering for something the generator cannot read back would turn that
+/// promotion into a silent regeneration, which is the very thing it exists to
+/// prevent.
+///
+/// Invoked from lodTargetFor(), which is noexcept - so the target must not
+/// throw. WorldSave::hasStoredChunk() is noexcept for exactly this reason.
+using ChunkDivergedFn = std::function<bool(const ChunkPos&)>;
 
 /// The three callables the streamer needs to light what it streams.
 ///
@@ -405,6 +445,11 @@ public:
     void setMesher(ChunkMeshFn mesher);
     void setMeshReleaser(ChunkReleaseFn release);
     void setRetireHook(ChunkRetireFn retire);
+
+    /// Teaches the LOD decision which positions must never be regenerated from
+    /// the seed; see ChunkDivergedFn and StreamingConfig::preserveEditedChunks.
+    /// Leaving it unset keeps the old dirty-flag-only behaviour.
+    void setDivergedPredicate(ChunkDivergedFn diverged);
 
     /// Enables the lighting stage. Leaving it unset keeps the pre-lighting
     /// pipeline exactly as it was; see ChunkLighter.
@@ -599,6 +644,15 @@ private:
         LodLevel targetLod = kLodFull;
     };
 
+    /// isRegionBusy with the caller already holding m_mutex.
+    ///
+    /// Exists because retireDistant() runs its whole sweep inside one exclusive
+    /// lock and std::shared_mutex is not recursive, and because the retire hold
+    /// and WorldSave's busy probe MUST be the same predicate rather than two
+    /// hand-written approximations of it - see retireDistant().
+    [[nodiscard]] bool isRegionBusyLocked(const ChunkPos& minChunk,
+                                          const ChunkPos& maxChunk) const;
+
     // update() steps
     void collect(const StreamingView& view, const ChunkPos& centre, std::uint64_t frameIndex);
     void dispatch();
@@ -712,6 +766,7 @@ private:
     ChunkMeshFn     m_mesh;
     ChunkReleaseFn  m_release;
     ChunkRetireFn   m_retire;
+    ChunkDivergedFn m_diverged;
     ChunkLighter    m_lighter;
 
     mutable std::shared_mutex                    m_mutex;
@@ -768,32 +823,5 @@ private:
     mutable std::mutex      m_jobMutex;
     std::condition_variable m_jobIdle;
 };
-
-// ------------------------------------------------- asking without a manager --
-
-/// ChunkManager::isNeighbourhoodBusy(), asked by a caller that has no manager to
-/// ask, and answered by every manager that is alive.
-///
-/// WHY THIS EXISTS. WorldSave::saveChunk() encodes a whole chunk - voxels AND
-/// light - on the main thread. That is exactly the read invariant 1 forbids
-/// while a worker owns the chunk, and a column light job owns and REWRITES the
-/// light array of every unlit section in its column without the chunk ever
-/// entering a busy state (see the LIGHTING note above, which explains why it
-/// must not). Refusing the save while the neighbourhood is busy is the same
-/// answer saveChunk already gives for ChunkState::Generating: the chunk stays
-/// dirty and the next autosave tick picks it up.
-///
-/// WHY NOT A REFERENCE. A WorldSave is constructed before the world it saves and
-/// deliberately knows nothing about residency; giving it a ChunkManager would
-/// invert that and tangle two lifetimes that are currently independent. A
-/// manager instead publishes itself here for exactly as long as it exists, so
-/// there is no wiring step to forget. With no manager alive - every WorldSave
-/// unit test, and every offline tool - the answer is false and behaviour is
-/// exactly what it was.
-///
-/// Answers for EVERY live manager rather than looking one up by position,
-/// because a spurious "busy" only defers a save by one tick while a spurious
-/// "idle" is the use-after-free. MAIN THREAD, like everything that consumes it.
-[[nodiscard]] bool isChunkNeighbourhoodBusyAnywhere(const ChunkPos& position);
 
 }  // namespace voxl

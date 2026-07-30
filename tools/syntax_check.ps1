@@ -72,10 +72,24 @@ foreach ($source in $resolved) {
     Write-Host "Checking $source" -ForegroundColor Cyan
 
     # /Zs is syntax-only; it is faster than /c and emits no object file.
+    #
+    # VOXL_VERSION and VOXL_SHADER_DIR are injected by CMake (src/CMakeLists.txt
+    # and tests/CMakeLists.txt respectively), so a file that uses either one - and
+    # src/app/Application.cpp uses VOXL_VERSION - fails here with C2065 before it
+    # is even parsed unless they are supplied. The values are placeholders; this
+    # script checks syntax, not what the strings say.
+    #
+    # The inner quotes are backslash-escaped because PowerShell strips a bare
+    # pair on its way to a native executable, which would leave cl.exe with
+    # /DVOXL_VERSION=0.0.0 - a preprocessing number, not a string literal (C2288).
+    $shaderDir = ($repoRoot -replace '\\', '/') + '/assets/shaders'
     $arguments = @(
         '/nologo', '/std:c++20', '/permissive-', '/Zc:preprocessor', '/Zc:__cplusplus',
         '/EHsc', '/W4', '/utf-8', '/external:W0', '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN',
-        '/D_CRT_SECURE_NO_WARNINGS', '/DVOXL_DEBUG=0', '/Zs'
+        '/D_CRT_SECURE_NO_WARNINGS', '/DVOXL_DEBUG=0',
+        '/DVOXL_VERSION=\"0.0.0-syntax-check\"',
+        "/DVOXL_SHADER_DIR=\`"$shaderDir\`"",
+        '/Zs'
     ) + $includes + @("`"$source`"")
 
     & cl.exe @arguments

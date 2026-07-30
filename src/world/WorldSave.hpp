@@ -323,6 +323,30 @@ public:
     /// The returned callable holds `this`, so it must not outlive the WorldSave.
     [[nodiscard]] std::function<void(const ChunkPtr&)> retireHook();
 
+    /// Teaches saveChunk() which chunks a worker may be reading right now.
+    ///
+    /// WHY IT IS NEEDED. saveChunk() encodes a whole chunk - voxels AND light -
+    /// on the main thread. That is exactly the read invariant 1 forbids while a
+    /// worker owns the chunk, and a column light job owns and REWRITES the light
+    /// array of every unlit section in its column without the chunk ever
+    /// entering a busy ChunkState (see the LIGHTING note in ChunkManager.hpp,
+    /// which explains why it must not). ChunkState alone therefore cannot see
+    /// it. Refusing while the neighbourhood is busy is the same answer saveChunk
+    /// already gives for ChunkState::Generating: the chunk keeps needsSave() and
+    /// the next autosave tick writes it.
+    ///
+    /// WHY IT IS INJECTED. A WorldSave is constructed before the world it saves
+    /// and deliberately knows nothing about residency; holding a ChunkManager
+    /// would invert that and tangle two lifetimes that are independent today.
+    /// Application wires this to ChunkManager::isNeighbourhoodBusy. Unset - every
+    /// WorldSave unit test, and every offline tool - the answer is "not busy",
+    /// which is correct because nothing is streaming.
+    ///
+    /// MAIN THREAD, set before streaming starts. The callable must not outlive
+    /// the thing it probes.
+    using ChunkBusyProbeFn = std::function<bool(const ChunkPos&)>;
+    void setBusyProbe(ChunkBusyProbeFn probe);
+
     // -------------------------------------------------------------- load --
 
     /// Populates `chunk` from disk if there is anything there.
@@ -483,6 +507,10 @@ private:
     /// hot loop.
     mutable std::mutex           m_storedMutex;
     std::unordered_set<ChunkPos> m_storedChunks;
+
+    /// See setBusyProbe(). Main thread only, both to set and to call, so it needs
+    /// no lock: saveChunk() is already VOXL_CHECKed to be off the workers.
+    ChunkBusyProbeFn m_busyProbe;
 
     double m_autosaveInterval = 30.0;
     double m_lastAutosave     = 0.0;

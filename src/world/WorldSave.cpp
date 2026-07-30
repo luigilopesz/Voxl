@@ -24,7 +24,6 @@
 #include "world/WorldSave.hpp"
 
 #include "core/Log.hpp"
-#include "world/ChunkManager.hpp"
 #include "world/ChunkStorage.hpp"
 #include "world/SubVoxel.hpp"
 
@@ -596,12 +595,33 @@ bool WorldSave::saveChunk(const ChunkPtr& chunk)
     // that happens is the same use-after-free the Generating test above refuses,
     // arriving through a door the state machine does not watch.
     //
-    // isNeighbourhoodBusy() is the predicate the mesh path already uses and it
-    // covers both worker readers, so this is the same rule stated once more
-    // rather than a new one. Refusing is free: the chunk keeps needsSave() and
-    // the next autosave tick - or the retire hook, which ChunkManager already
-    // holds back for a claimed column - writes it then.
-    if (isChunkNeighbourhoodBusyAnywhere(chunk->position())) {
+    // The probe is wired to isNeighbourhoodBusy(), the predicate the mesh path
+    // already uses; it covers both worker readers, so this is the same rule
+    // stated once more rather than a new one. Refusing is free: the chunk keeps
+    // needsSave() and the next autosave tick - or the retire hook, which
+    // ChunkManager already holds back for a claimed column - writes it then.
+    //
+    // AND IT IS DELIBERATELY WIDER THAN A READ STRICTLY NEEDS. KEEP IT THAT WAY.
+    //
+    // Narrowing this to the chunk's OWN column has been proposed and rejected
+    // once already, so here is the reasoning in full. The argument for narrowing
+    // is sound as far as it goes: a save is a READ, the only worker that WRITES
+    // a chunk is a light job on its own column (or its own generate job, caught
+    // above), a mesh job and a neighbouring column's light job merely read it,
+    // and two readers do not race. isNeighbourhoodBusy() is the predicate that
+    // blocks WRITES, borrowed wholesale.
+    //
+    // It is rejected because the cost of the two answers is not symmetric. The
+    // wide predicate costs some refused saves, and a refused save is always
+    // retried - the whole point of the paragraph above. The narrow one is only
+    // correct for as long as "a light job writes nothing outside its claimed
+    // column" stays true, and that fact is an emergent property of LightEngine
+    // spread over a couple of thousand lines, not something the type system or
+    // any assertion holds down. The day it stops being true, this returns a torn
+    // chunk to disk and nothing anywhere reports it. Trading a bounded, retried
+    // latency cost for an unbounded, silent correctness risk is the wrong side
+    // of that trade, and the profiler has never once pointed here.
+    if (m_busyProbe && m_busyProbe(chunk->position())) {
         return false;
     }
 
@@ -695,6 +715,12 @@ void WorldSave::onChunkRetired(const ChunkPtr& chunk)
 std::function<void(const ChunkPtr&)> WorldSave::retireHook()
 {
     return [this](const ChunkPtr& chunk) { onChunkRetired(chunk); };
+}
+
+void WorldSave::setBusyProbe(ChunkBusyProbeFn probe)
+{
+    VOXL_CHECK(!m_jobs.onWorkerThread(), "WorldSave::setBusyProbe() called from a worker thread");
+    m_busyProbe = std::move(probe);
 }
 
 // ------------------------------------------------------------------- load --

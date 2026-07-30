@@ -346,6 +346,15 @@ void Application::wireWorld()
         }
     });
 
+    // What stops a player's build being regenerated from the seed when it
+    // demotes a LOD level. Routed through the optional rather than binding
+    // &*m_save, so closing a world cannot leave ChunkManager holding a predicate
+    // into a destroyed WorldSave - which is also why no closeWorld() teardown is
+    // needed. See ChunkDivergedFn and the divergence note in world/WorldSave.hpp.
+    m_world.chunks().setDivergedPredicate([this](const ChunkPos& position) {
+        return m_save.has_value() && m_save->hasStoredChunk(position);
+    });
+
     m_interaction.setRaycaster([this](const glm::vec3& origin, const glm::vec3& direction,
                                       float maxDistance, InteractionHit& out) {
         const physics::RayHit hit =
@@ -465,6 +474,14 @@ void Application::openWorld(std::string name, std::uint64_t seed)
         } else {
             m_save.emplace(m_jobs, directory, effectiveSeed);
             m_save->setAutosaveIntervalSeconds(m_config.autosaveSeconds);
+
+            // Wired before anything can stream, because the very first autosave
+            // may land while a column light job is rewriting a chunk's light
+            // array. See WorldSave::setBusyProbe; the manager outlives every
+            // WorldSave, so the captured reference is safe for the whole session.
+            m_save->setBusyProbe([this](const ChunkPos& position) {
+                return m_world.chunks().isNeighbourhoodBusy(position);
+            });
 
             // Before anything streams: every chunk already on disk is player
             // work and must keep the level it was built at. Doing this at open

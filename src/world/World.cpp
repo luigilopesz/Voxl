@@ -181,6 +181,15 @@ bool World::isEditBlocked(const ChunkPtr& chunk, const ChunkPos& position) const
 
 bool World::isRelightBlocked(const BlockPos& pos) const
 {
+    // The memo below only answers inside a Pass - outside one, LightWorld caches
+    // nothing at all, which is what stops a stale chunk pointer surviving into a
+    // later frame. This walk is the one reader that is not already inside an
+    // engine call, so it opens its own: without it the loop costs a map lookup
+    // and a shared_ptr copy for every one of up to 256 blocks instead of roughly
+    // eight. Safe because Pass invalidates at both ends, and correctness does not
+    // depend on it either way.
+    const LightWorld::Pass pass{m_lightWorld};
+
     // How far down a sunlight change can reach: the shaft under `pos` runs to the
     // first block that stops light, and cells beside the shaft can carry it 15
     // further. Walked through the light engine's memoising reader so a 200-block
@@ -204,6 +213,46 @@ bool World::isRelightBlocked(const BlockPos& pos) const
     const ChunkPos maxChunk{blockToChunkAxis(pos.x + kFullLight), blockToChunkAxis(maxY),
                             blockToChunkAxis(pos.z + kFullLight)};
     return m_chunks.isRegionBusy(minChunk, maxChunk);
+}
+
+bool World::subVoxelEditMayRelight(const ChunkPtr& chunk, std::size_t blockIndex,
+                                   std::size_t subIndex, BlockId material, bool restore)
+{
+    // Mirrors, case for case, what Chunk::breakSubVoxel / Chunk::restoreSubVoxel
+    // will do and therefore what writeSubVoxel's `wasWhole != isWhole ||
+    // beforeId != afterId` test will see. Everything here is a store lookup plus
+    // at most eight popcounts, so it is cheaper than the isRelightBlocked walk it
+    // guards and far cheaper than the flood it would otherwise let through.
+    const BlockId       current = chunk->getBlock(blockIndex);
+    const SubVoxelGrid* grid    = chunk->subVoxels().find(blockIndex);
+
+    if (!restore) {
+        if (current == blocks::Air) {
+            // Carving air is a no-op: Chunk::breakSubVoxel bails and the
+            // invariant guarantees there is no entry to disagree with it.
+            return false;
+        }
+        if (grid == nullptr) {
+            return true;  // whole -> partial: opaque becomes transparent
+        }
+        // Partial. Only emptying the grid changes opacity, and that happens
+        // exactly when the one sub-voxel still present is the one being cleared -
+        // the last swing of mining any block.
+        return grid->test(subIndex) && grid->count() == 1;
+    }
+
+    if (current == blocks::Air) {
+        // Air -> partial, the mirror case. The block stops being air, which is
+        // the same opacity change run backwards, so it needs the same test.
+        return material != blocks::Air;
+    }
+    if (grid == nullptr) {
+        return false;  // solid with no entry is whole already: Unchanged
+    }
+    if (grid->test(subIndex)) {
+        return false;  // already present: Unchanged
+    }
+    return grid->count() == kSubVoxelCount - 1;  // partial -> whole
 }
 
 // -------------------------------------------------------------- lighting --
@@ -314,6 +363,242 @@ void World::applyPendingLight()
     // mesh or light job that owned the chunk has finished.
 }
 
+// ------------------------------------------------------- blind column seams --
+//
+// See the BlindSeam block in World.hpp for what this is repairing. In short: two
+// neighbouring columns lit at the same time each see the other as an unloaded
+// wall, so no light crosses between them, ever.
+//
+// THE ROOT FIX IS ELSEWHERE, AND IT HAS LANDED. ChunkManager::claimColumnLight
+// now refuses a claim whose face-adjacent column is already in m_lightColumns,
+// which restores the "whichever is second reads the first" ordering the design
+// assumes, at the cost of some lighting parallelism. Two neighbours can no
+// longer be in flight together at all.
+//
+// THIS PASS IS KEPT AS A NET, not as the cure, because the ordering fix covers
+// simultaneity and nothing else. A neighbour that is resident but simply not lit
+// yet still arrives as a null slot, and while that case IS self-correcting in
+// principle - the neighbour's own job reads us and spills back - the
+// self-correction depends on that job ever running. A tolerant claim leaves
+// sections unlit for good (see ChunkManager::claimColumnLight), and a column
+// that has left the load volume gets no further jobs at all. This pass settles
+// those from the main thread after the fact. It is idempotent and
+// self-cancelling: every seed it raises is dropped as non-raising once the two
+// sides already agree, and the uniform fast path in seedAcrossSeam makes
+// rock-against-rock and sky-against-sky cost two loads.
+
+namespace {
+
+/// The four column neighbours a light job can be blind to. Faces only: the
+/// engine's shell is loaded from the six face slabs, so a diagonal column
+/// contributes nothing the faces do not already carry.
+constexpr std::int32_t kSeamDx[4] = {-1, 1, 0, 0};
+constexpr std::int32_t kSeamDz[4] = {0, 0, -1, 1};
+
+}  // namespace
+
+void World::noteBlindSeams(const LightColumnWork& work)
+{
+    for (std::size_t face = 0; face < 4; ++face) {
+        const std::int32_t dx = kSeamDx[face];
+        const std::int32_t dz = kSeamDz[face];
+
+        bool blind = false;
+        for (std::int32_t y = 0; y < kWorldSectionCount && !blind; ++y) {
+            if (work.targets[static_cast<std::size_t>(y)] == nullptr) {
+                continue;  // not a section this job lit, so it owes nothing here
+            }
+            if (work.at(dx, dz, y) != nullptr) {
+                continue;  // the neighbour was readable; the engine handled it
+            }
+            // A null slot is either "not resident" or "resident but not final".
+            // Only the second matters. A section that does not exist yet will be
+            // generated and lit later, and THAT job sees ours and spills back;
+            // one that is already resident may never look at us again.
+            blind =
+                m_chunks.find(ChunkPos{work.column.x + dx, y, work.column.z + dz}) != nullptr;
+        }
+        if (!blind) {
+            continue;
+        }
+
+        // Canonical form - always the lower column looking toward the higher one
+        // - so the jobs on either side of one boundary record the same entry.
+        BlindSeam seam{work.column, dx, dz, 0};
+        if (dx < 0) {
+            seam.column.x -= 1;
+            seam.dx = 1;
+        }
+        if (dz < 0) {
+            seam.column.z -= 1;
+            seam.dz = 1;
+        }
+
+        const std::lock_guard<std::mutex> lock(m_blindSeamMutex);
+        bool                              known = false;
+        for (const BlindSeam& queued : m_blindSeams) {
+            if (queued.column == seam.column && queued.dx == seam.dx && queued.dz == seam.dz) {
+                known = true;
+                break;
+            }
+        }
+        if (known || m_blindSeams.size() >= kMaxBlindSeams) {
+            continue;
+        }
+        m_blindSeams.push_back(seam);
+    }
+}
+
+void World::reconcileBlindSeams()
+{
+    std::vector<BlindSeam> pending;
+    {
+        const std::lock_guard<std::mutex> lock(m_blindSeamMutex);
+        if (m_blindSeams.empty()) {
+            return;
+        }
+        pending.swap(m_blindSeams);
+    }
+
+    std::size_t scanned = 0;
+    std::size_t index   = 0;
+    std::vector<BlindSeam> unfinished;
+    for (; index < pending.size() && scanned < kSeamCellsPerUpdate; ++index) {
+        BlindSeam seam = pending[index];
+        if (reconcileSeam(seam, scanned)) {
+            continue;
+        }
+        // A section on one side is resident but not lit yet. Worth waiting for -
+        // but not forever: a tolerant claim can leave a section unlit for good,
+        // and a seam that waits on one would be retried every update for the
+        // life of the process.
+        if (++seam.attempts < kMaxSeamAttempts) {
+            unfinished.push_back(seam);
+        }
+    }
+
+    const std::lock_guard<std::mutex> lock(m_blindSeamMutex);
+    // Whatever the budget did not reach goes back first, so a long queue drains
+    // in order instead of starving its tail.
+    m_blindSeams.insert(m_blindSeams.begin(), pending.begin() + static_cast<std::ptrdiff_t>(index),
+                        pending.end());
+    m_blindSeams.insert(m_blindSeams.end(), unfinished.begin(), unfinished.end());
+}
+
+bool World::reconcileSeam(const BlindSeam& seam, std::size_t& scanned)
+{
+    bool settled = true;
+    for (std::int32_t y = 0; y < kWorldSectionCount; ++y) {
+        const ChunkPos nearPos{seam.column.x, y, seam.column.z};
+        const ChunkPos farPos{seam.column.x + seam.dx, y, seam.column.z + seam.dz};
+
+        // findReadableMutable is the light engine's own gate: it hands back only
+        // chunks that are final in BOTH voxels and light. A section that is not
+        // lit yet has nothing to exchange, and reading one would read an array a
+        // worker is still filling in.
+        const ChunkPtr nearChunk = m_chunks.findReadableMutable(nearPos);
+        const ChunkPtr farChunk  = m_chunks.findReadableMutable(farPos);
+        if (nearChunk == nullptr || farChunk == nullptr) {
+            // Not lit yet, or gone. Only the first is worth coming back for: an
+            // unloaded section has no seam left to settle.
+            if (m_chunks.isResident(nearPos) && m_chunks.isResident(farPos)) {
+                settled = false;
+            }
+            continue;
+        }
+
+        scanned += seedAcrossSeam(*nearChunk, *farChunk, seam.dx, seam.dz);
+        scanned += seedAcrossSeam(*farChunk, *nearChunk, -seam.dx, -seam.dz);
+    }
+    return settled;
+}
+
+std::size_t World::seedAcrossSeam(const Chunk& from, const Chunk& to, std::int32_t dx,
+                                  std::int32_t dz)
+{
+    // A dark section gives nothing to anybody, and a section that has never been
+    // written cell by cell says so in one load.
+    if (!from.storage().hasLightData() && from.storage().uniformLight() == 0) {
+        return 0;
+    }
+    if (!from.storage().hasLightData() && !to.storage().hasLightData()) {
+        // Both flat. Nothing can cross when the source, less the CHEAPEST
+        // possible step of one, still fails to beat what the destination already
+        // holds everywhere - and a real step is never cheaper than one, so this
+        // is exact rather than an approximation. Open sky against open sky and
+        // rock against rock, which is most of a column, end here.
+        const int sourceLight      = from.storage().uniformLight();
+        const int destinationLight = to.storage().uniformLight();
+        const int sourceSun        = ChunkStorage::unpackSunlight(
+            static_cast<std::uint8_t>(sourceLight));
+        const int sourceBlock = ChunkStorage::unpackBlockLight(
+            static_cast<std::uint8_t>(sourceLight));
+        const int destinationSun = ChunkStorage::unpackSunlight(
+            static_cast<std::uint8_t>(destinationLight));
+        const int destinationBlock = ChunkStorage::unpackBlockLight(
+            static_cast<std::uint8_t>(destinationLight));
+        if (sourceSun <= destinationSun + 1 && sourceBlock <= destinationBlock + 1) {
+            return 0;
+        }
+    }
+
+    // Exactly one of dx, dz is non-zero, so one of these pins the face and the
+    // other is swept by `t`.
+    const bool         toHigher = dx > 0 || dz > 0;
+    const std::int32_t fromFace = toHigher ? kChunkSize - 1 : 0;
+    const std::int32_t toFace   = toHigher ? 0 : kChunkSize - 1;
+    const BlockPos     toOrigin = to.originBlock();
+
+    for (std::int32_t y = 0; y < kChunkSize; ++y) {
+        for (std::int32_t t = 0; t < kChunkSize; ++t) {
+            const std::int32_t fromX = dx != 0 ? fromFace : t;
+            const std::int32_t fromZ = dz != 0 ? fromFace : t;
+            const std::int32_t toX   = dx != 0 ? toFace : t;
+            const std::int32_t toZ   = dz != 0 ? toFace : t;
+
+            const std::size_t toIndex = localIndex(toX, y, toZ);
+            const BlockId     toId    = to.getBlock(toIndex);
+
+            // Same material rule as LightEngine::cellMaterial: a partially
+            // destroyed block transmits freely whatever it is made of.
+            const bool whole = to.isBlockWhole(toIndex);
+            if (whole && m_light.opaque(toId)) {
+                continue;  // light may not enter this cell at all
+            }
+            // Same arithmetic as LightEngine::collectSpill for a side face. The
+            // sunlight free-fall rule is downward-only, so a horizontal step
+            // always costs at least one.
+            const std::uint8_t cost = static_cast<std::uint8_t>(
+                1 + (whole ? m_light.attenuation(toId) : std::uint8_t{0}));
+
+            const std::uint8_t fromPacked = from.getLight(localIndex(fromX, y, fromZ));
+            const std::uint8_t toPacked   = to.getLight(toIndex);
+
+            const std::uint8_t sourceSun   = ChunkStorage::unpackSunlight(fromPacked);
+            const std::uint8_t sourceBlock = ChunkStorage::unpackBlockLight(fromPacked);
+            const std::uint8_t sunOut =
+                sourceSun > cost ? static_cast<std::uint8_t>(sourceSun - cost) : std::uint8_t{0};
+            const std::uint8_t blockOut = sourceBlock > cost
+                                              ? static_cast<std::uint8_t>(sourceBlock - cost)
+                                              : std::uint8_t{0};
+
+            const bool raisesSun   = sunOut > ChunkStorage::unpackSunlight(toPacked);
+            const bool raisesBlock = blockOut > ChunkStorage::unpackBlockLight(toPacked);
+            if (!raisesSun && !raisesBlock) {
+                continue;
+            }
+            if (m_pendingLight.size() >= kMaxPendingLightSeeds) {
+                return static_cast<std::size_t>(kChunkSize) * kChunkSize;
+            }
+            m_pendingLight.push_back(
+                LightSeed{BlockPos{toOrigin.x + toX, toOrigin.y + y, toOrigin.z + toZ},
+                          raisesSun ? sunOut : std::uint8_t{0},
+                          raisesBlock ? blockOut : std::uint8_t{0}});
+        }
+    }
+    return static_cast<std::size_t>(kChunkSize) * kChunkSize;
+}
+
 EditResult World::placeBlock(const BlockPos& pos, BlockId id)
 {
     if (!isInsideWorld(pos)) {
@@ -414,15 +699,17 @@ EditResult World::editSubVoxel(const BlockPos& pos, std::size_t subIndex, BlockI
     // neighbour's mesh job walks the store is a use-after-free, not a torn read.
     bool blocked = isEditBlocked(chunk, chunkPos);
     if (!blocked && m_lighting) {
-        // A partially destroyed block already transmits light, so the only
-        // sub-voxel edits that move a light level are the ones that cross the
-        // whole/partial boundary. Testing the relight footprint only for those
-        // keeps a player grinding through 512 sub-voxels from paying for it 511
-        // times, and from being deferred by a busy chunk it cannot affect.
+        // A partially destroyed block already transmits light, so most carves
+        // move no light at all and must not pay for the footprint walk, nor be
+        // deferred by a busy chunk they cannot affect. But "already partial" is
+        // NOT the same as "cannot change opacity": the carve that clears the last
+        // sub-voxel turns the block to air. subVoxelEditMayRelight answers the
+        // question writeSubVoxel will actually ask, so the two cannot disagree.
         const std::size_t blockIndex = localIndex(blockToLocalAxis(pos.x),
                                                   blockToLocalAxis(pos.y),
                                                   blockToLocalAxis(pos.z));
-        if ((chunk->isBlockWhole(blockIndex) || restore) && isRelightBlocked(pos)) {
+        if (subVoxelEditMayRelight(chunk, blockIndex, subIndex, material, restore) &&
+            isRelightBlocked(pos)) {
             blocked = true;
         }
     }
@@ -630,12 +917,18 @@ std::size_t World::applyDeferredEdits()
         // Carving the last whole block out of a sunlit column moves light exactly
         // as a setBlock does, and only editSubVoxel was checking that the column
         // the flood would run down was free.
+        //
+        // MIRRORS editSubVoxel and has to go on mirroring it, hence the shared
+        // predicate: a replay that admitted a carve editSubVoxel would have
+        // deferred is the same race, one frame later.
         const bool restore = edit.kind == EditKind::SubVoxelRestore;
         if (m_lighting) {
             const std::size_t blockIndex = localIndex(blockToLocalAxis(edit.position.x),
                                                       blockToLocalAxis(edit.position.y),
                                                       blockToLocalAxis(edit.position.z));
-            if ((chunk->isBlockWhole(blockIndex) || restore) && isRelightBlocked(edit.position)) {
+            const BlockId material = restore ? edit.id : blocks::Air;
+            if (subVoxelEditMayRelight(chunk, blockIndex, edit.subIndex, material, restore) &&
+                isRelightBlocked(edit.position)) {
                 retry.push_back(edit);
                 continue;
             }
@@ -658,6 +951,10 @@ void World::update(const StreamingView& view, std::uint64_t frameIndex)
     // Before scheduling, so an edit that was waiting on a mesh job is part of the
     // content this frame's mesh decisions see.
     applyDeferredEdits();
+    // Boundaries between two columns that were lit at the same time never
+    // exchanged any light at all. Settling them BEFORE the flood means the seeds
+    // it produces are applied in this same update rather than the next one.
+    reconcileBlindSeams();
     // Likewise for light that crossed a chunk border on a worker: applying it
     // here means the remesh it dirties is picked up by this frame's collect()
     // instead of the next one, with a visibly wrong seam in between.
@@ -669,6 +966,12 @@ void World::unloadAll()
 {
     m_deferredEdits.clear();
     m_pendingLight.clear();
+    {
+        // Cleared under the lock: a light job that is still in flight can be
+        // recording seams against columns that are being retired right now.
+        const std::lock_guard<std::mutex> lock(m_blindSeamMutex);
+        m_blindSeams.clear();
+    }
     m_chunks.unloadAll();
 }
 
