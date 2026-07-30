@@ -8,14 +8,18 @@ Last verified against commit following the LOD / sub-voxel milestone, on a
 
 ## Not implemented
 
-These were scoped for a milestone that was cancelled mid-run and never landed.
+Light propagation, persistence, audio, menus/settings, the sub-voxel mining verb
+and the day/night cycle all landed in the milestone that follows. What is listed
+below is what those systems do **not** do.
 
-| Missing | Consequence |
+| Area | Bounds it works within |
 |---|---|
-| **Light propagation** | Light *storage* exists (4 bits sunlight + 4 bits block light per voxel) and is read by the mesher and the shaders, but nothing propagates it. Caves and interiors are not darkened by distance from the sky, and emissive blocks (glowstone) do not actually cast light. Recesses still read as dark because of per-face shading and ambient occlusion, so the world does not look broken — but it is not lit. |
-| **Persistence (save/load)** | Nothing is written to disk. A world is regenerated from its seed every launch, and player edits are lost on exit. This also forces two LOD compromises listed below. |
-| **Audio** | No sound at all. miniaudio is linked and building but unused. |
-| **Menus and settings** | No main menu, pause menu, or settings UI. Configuration is via command-line arguments only (`voxl.exe --help`). |
+| **Light propagation** | Levels 0 and 1 get a full flood; levels 2 and 3 get a top-down sky sweep only, so a cave in the far ring is lit as though it had a roof and no walls. It is never visible at that distance. With `StreamingConfig::verticalRadius < kWorldSectionCount` the sections above a column are absent, an absent chunk counts as an opaque wall, and the world comes out **completely dark** — the shipped default loads the whole column, but `test_lod_stream.cpp` runs at `verticalRadius = 1` and its worlds are simply unlit. |
+| **Persistence** | Only level-0 chunks are written; coarser levels come from the seed. No hardware write barrier (`std::fstream::flush()` reaches the OS, not the platter), so a power cut can lose the one chunk being written — bounded by a per-payload CRC, and that chunk regenerates. No region compaction: a single long session that repeatedly rewrites growing payloads leaves holes. Light is **not** restored from disk; a loaded chunk is re-lit by the normal pipeline. |
+| **Audio** | Amplitude panning plus a distance low-pass, not HRTF: front/back is disambiguated only by a mild gain and brightness cue. Voices are capped, not stolen — past 48 simultaneous voices new plays are dropped and counted in `AudioStats::voicesDropped`. PCM is uncompressed float32, 6.2 MiB resident. |
+| **Menus and settings** | No key rebinding; the Controls tab says so on screen. `readSettings` preserves unknown keys verbatim but discards hand-written comments and section headers on the next save. |
+| **Day/night** | The moon is always full — `FrameUniforms` carries no phase input. Water depth for absorption is estimated from the view slant and the mesher's AO rather than a depth prepass. |
+| **Main menu world switching** | Creating or loading a world from the title screen rebuilds the terrain generator and the save, and unloads every chunk — but the `World` object itself is reused rather than reconstructed. That is deliberate (see the comment on `Application::closeWorld`); the practical limit is that streaming config changes still go through `applySettings` rather than through world construction. |
 
 ## Level of detail
 

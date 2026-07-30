@@ -36,7 +36,7 @@ void Hotbar::select(std::size_t index) noexcept
 
 void Hotbar::cycle(int delta) noexcept
 {
-    if (delta == 0) {
+    if (delta == 0 || m_cycleLocked) {
         return;
     }
 

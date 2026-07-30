@@ -1,0 +1,431 @@
+﻿voxl_bench - headless performance harness
+  build            : optimised (NDEBUG defined)
+  hardware threads : 20
+  world seed       : 0x764f0117a2c5d3b9
+  chunk            : 32^3 = 32768 voxels, 8 sections tall
+  lod levels       : 0..3
+
+Building fixtures and registering cases...
+Running...
+
+=========================================================================================================
+ BENCHMARK RESULTS
+=========================================================================================================
+GROUP         CASE                              RUN    MIN ms    MED ms   MEAN ms    P95 ms    MAX ms  PER-OP      THROUGHPUT 
+---------------------------------------------------------------------------------------------------------
+terrain       gen_chunk_ocean                    15    2.5270    2.8325    2.8641    3.3985    3.3985  2.833 ms    353.0 /s chunk
+                                                 surface_y = 86.000 block
+                                                 chunk_y_section = 2.000
+                                                 non_air_blocks = 32302.000 blocks
+                                                 palette_entries = 8.000
+                                                 bits_per_index = 4.000
+                                                 storage_heap = 49184.000 bytes
+terrain       gen_chunk_beach                    15    0.7970    0.8134    0.8239    0.9015    0.9015  813.40 us   1.2 k/s chunk
+                                                 surface_y = 97.000 block
+                                                 chunk_y_section = 3.000
+                                                 non_air_blocks = 3727.000 blocks
+                                                 palette_entries = 8.000
+                                                 bits_per_index = 4.000
+                                                 storage_heap = 49184.000 bytes
+terrain       gen_chunk_plains                   15    1.6780    1.7149    1.7330    1.8755    1.8755  1.715 ms    583.1 /s chunk
+                                                 surface_y = 120.000 block
+                                                 chunk_y_section = 3.000
+                                                 non_air_blocks = 19687.000 blocks
+                                                 palette_entries = 6.000
+                                                 bits_per_index = 4.000
+                                                 storage_heap = 49184.000 bytes
+terrain       gen_chunk_forest                   15    0.8961    0.9806    0.9889    1.1090    1.1090  980.60 us   1.0 k/s chunk
+                                                 surface_y = 131.000 block
+                                                 chunk_y_section = 4.000
+                                                 non_air_blocks = 4316.000 blocks
+                                                 palette_entries = 7.000
+                                                 bits_per_index = 4.000
+                                                 storage_heap = 49184.000 bytes
+terrain       gen_chunk_desert                   15    0.8515    0.8751    0.9115    1.0810    1.0810  875.10 us   1.1 k/s chunk
+                                                 surface_y = 99.000 block
+                                                 chunk_y_section = 3.000
+                                                 non_air_blocks = 5336.000 blocks
+                                                 palette_entries = 8.000
+                                                 bits_per_index = 4.000
+                                                 storage_heap = 49184.000 bytes
+terrain       gen_chunk_mountains                15    1.3808    1.3935    1.4444    1.7010    1.7010  1.393 ms    717.6 /s chunk
+                                                 surface_y = 158.000 block
+                                                 chunk_y_section = 4.000
+                                                 non_air_blocks = 14463.000 blocks
+                                                 palette_entries = 5.000
+                                                 bits_per_index = 4.000
+                                                 storage_heap = 49184.000 bytes
+terrain       gen_chunk_snowy                    15    1.2778    1.3720    1.4100    1.7980    1.7980  1.372 ms    728.9 /s chunk
+                                                 surface_y = 109.000 block
+                                                 chunk_y_section = 3.000
+                                                 non_air_blocks = 14991.000 blocks
+                                                 palette_entries = 7.000
+                                                 bits_per_index = 4.000
+                                                 storage_heap = 49184.000 bytes
+terrain       gen_lod0                           15    1.6663    1.8078    1.8334    2.1242    2.1242  1.808 ms    553.2 /s chunk
+                                                 cells_per_chunk = 32768.000
+                                                 cell_size = 1.000 blocks
+                                                 non_air_blocks = 19687.000 blocks
+terrain       gen_lod1                           15    0.5491    0.5668    0.5846    0.8410    0.8410  566.80 us   1.8 k/s chunk
+                                                 cells_per_chunk = 4096.000
+                                                 cell_size = 2.000 blocks
+                                                 non_air_blocks = 19272.000 blocks
+terrain       gen_lod2                           15    0.2138    0.2199    0.2305    0.3035    0.3035  219.90 us   4.5 k/s chunk
+                                                 cells_per_chunk = 512.000
+                                                 cell_size = 4.000 blocks
+                                                 non_air_blocks = 19136.000 blocks
+terrain       gen_lod3                           15    0.2027    0.2098    0.2097    0.2130    0.2130  209.80 us   4.8 k/s chunk
+                                                 cells_per_chunk = 64.000
+                                                 cell_size = 8.000 blocks
+                                                 non_air_blocks = 19456.000 blocks
+terrain       gen_batch_single_thread             7  197.0086  201.3458  200.2118  203.8039  203.8039  786.51 us   1.3 k/s chunk
+                                                 chunks_per_run = 256.000 chunks
+terrain       gen_batch_job_system                7   22.1452   22.4446   22.4793   22.8298   22.8298  87.67 us    11.4 k/s chunk
+                                                 worker_threads = 19.000
+                                                 chunks_per_run = 256.000 chunks
+                                                 note: one job per chunk, JobPriority::Normal, timed to waitIdle()
+
+meshing       greedy_plains_surface              21    0.7239    0.7485    0.7982    0.9962    1.0785  748.50 us   1.3 k/s chunk
+                                                 solid_blocks = 19687.000 blocks
+                                                 naive_faces = 118122 faces
+                                                 faces_after_culling = 3564.000 faces
+                                                 quads_emitted = 2968.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1.201 faces/quad
+                                                 total_reduction = 39.799 naive/quad
+                                                 triangles = 5936.000 tris
+                                                 vertices = 11872.000 verts
+                                                 mesh_bytes = 166208 bytes
+meshing       greedy_dense_caves                 21    0.7246    0.7494    0.7580    0.8058    0.8916  749.40 us   1.3 k/s chunk
+                                                 solid_blocks = 30715.000 blocks
+                                                 naive_faces = 184290 faces
+                                                 faces_after_culling = 2916.000 faces
+                                                 quads_emitted = 2566.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1.136 faces/quad
+                                                 total_reduction = 71.820 naive/quad
+                                                 triangles = 5132.000 tris
+                                                 vertices = 10264.000 verts
+                                                 mesh_bytes = 143696 bytes
+meshing       greedy_solid_chunk                 21    0.4093    0.4185    0.4203    0.4392    0.4499  418.50 us   2.4 k/s chunk
+                                                 solid_blocks = 32768.000 blocks
+                                                 naive_faces = 196608 faces
+                                                 faces_after_culling = 6144.000 faces
+                                                 quads_emitted = 6.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1024.000 faces/quad
+                                                 total_reduction = 32768.000 naive/quad
+                                                 triangles = 12.000 tris
+                                                 vertices = 24.000 verts
+                                                 mesh_bytes = 336.000 bytes
+meshing       greedy_checkerboard                21    5.7261    6.3463    6.2867    6.9575    7.3640  6.346 ms    157.6 /s chunk
+                                                 solid_blocks = 16384.000 blocks
+                                                 naive_faces = 98304.000 faces
+                                                 faces_after_culling = 98304.000 faces
+                                                 quads_emitted = 98304.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1.000 faces/quad
+                                                 total_reduction = 1.000 naive/quad
+                                                 triangles = 196608 tris
+                                                 vertices = 393216 verts
+                                                 mesh_bytes = 5505024 bytes
+meshing       greedy_lod0                        21    0.7434    0.7726    0.7702    0.7901    0.7946  772.60 us   1.3 k/s chunk
+                                                 solid_blocks = 19687.000 blocks
+                                                 naive_faces = 118122 faces
+                                                 faces_after_culling = 3564.000 faces
+                                                 quads_emitted = 2968.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1.201 faces/quad
+                                                 total_reduction = 39.799 naive/quad
+                                                 triangles = 5936.000 tris
+                                                 vertices = 11872.000 verts
+                                                 mesh_bytes = 166208 bytes
+meshing       greedy_lod1                        21    0.4310    0.4406    0.4465    0.4836    0.5379  440.60 us   2.3 k/s chunk
+                                                 solid_blocks = 19272.000 blocks
+                                                 naive_faces = 115632 faces
+                                                 faces_after_culling = 866.000 faces
+                                                 quads_emitted = 759.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1.141 faces/quad
+                                                 total_reduction = 152.348 naive/quad
+                                                 triangles = 1518.000 tris
+                                                 vertices = 3036.000 verts
+                                                 mesh_bytes = 42504.000 bytes
+meshing       greedy_lod2                        21    0.4043    0.4124    0.4347    0.4589    0.7430  412.40 us   2.4 k/s chunk
+                                                 solid_blocks = 19136.000 blocks
+                                                 naive_faces = 114816 faces
+                                                 faces_after_culling = 152.000 faces
+                                                 quads_emitted = 133.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1.143 faces/quad
+                                                 total_reduction = 863.278 naive/quad
+                                                 triangles = 266.000 tris
+                                                 vertices = 532.000 verts
+                                                 mesh_bytes = 7448.000 bytes
+meshing       greedy_lod3                        21    0.6573    0.7002    0.6974    0.7345    0.7870  700.20 us   1.4 k/s chunk
+                                                 solid_blocks = 19456.000 blocks
+                                                 naive_faces = 116736 faces
+                                                 faces_after_culling = 37.000 faces
+                                                 quads_emitted = 34.000 quads
+                                                 skirt_quads = 0.000 quads
+                                                 merge_ratio = 1.088 faces/quad
+                                                 total_reduction = 3433.412 naive/quad
+                                                 triangles = 68.000 tris
+                                                 vertices = 136.000 verts
+                                                 mesh_bytes = 1904.000 bytes
+meshing       greedy_lod1_beside_lod0            21    0.3260    0.3355    0.3488    0.3828    0.5647  335.50 us   3.0 k/s chunk
+                                                 solid_blocks = 19272.000 blocks
+                                                 naive_faces = 115632 faces
+                                                 faces_after_culling = 1672.000 faces
+                                                 quads_emitted = 838.000 quads
+                                                 skirt_quads = 24.000 quads
+                                                 merge_ratio = 1.995 faces/quad
+                                                 total_reduction = 137.986 naive/quad
+                                                 triangles = 1676.000 tris
+                                                 vertices = 3352.000 verts
+                                                 mesh_bytes = 46928.000 bytes
+meshing       greedy_lod2_beside_lod1            21    0.2051    0.2072    0.2103    0.2197    0.2348  207.20 us   4.8 k/s chunk
+                                                 solid_blocks = 19136.000 blocks
+                                                 naive_faces = 114816 faces
+                                                 faces_after_culling = 350.000 faces
+                                                 quads_emitted = 177.000 quads
+                                                 skirt_quads = 15.000 quads
+                                                 merge_ratio = 1.977 faces/quad
+                                                 total_reduction = 648.678 naive/quad
+                                                 triangles = 354.000 tris
+                                                 vertices = 708.000 verts
+                                                 mesh_bytes = 9912.000 bytes
+
+subvoxel      mesh_damage_0                      21    0.0020    0.0021    0.0021    0.0021    0.0021  2.1 ns      487.62 M/s chunk
+                                                 store_entries = 0.000 blocks
+                                                 store_heap = 0.000 bytes
+                                                 sub_voxels_removed = 0.000 sub-voxels
+                                                 blocks_meshed = 0.000 blocks
+                                                 faces_emitted = 0.000 faces
+                                                 quads_emitted = 0.000 quads
+                                                 merge_ratio = 0.000 faces/quad
+                                                 triangles = 0.000 tris
+                                                 mesh_bytes = 0.000 bytes
+                                                 note: median is below the harness's reliability floor - read it as an upper bound on a cost that clock granularity and loop hoisting cannot separate from zero
+subvoxel      mesh_damage_1                      21    0.0054    0.0055    0.0055    0.0056    0.0063  5.50 us     181.8 k/s damaged block
+                                                 store_entries = 1.000 blocks
+                                                 store_heap = 80.000 bytes
+                                                 sub_voxels_removed = 64.000 sub-voxels
+                                                 blocks_meshed = 1.000 blocks
+                                                 faces_emitted = 48.000 faces
+                                                 quads_emitted = 3.000 quads
+                                                 merge_ratio = 16.000 faces/quad
+                                                 triangles = 6.000 tris
+                                                 mesh_bytes = 168.000 bytes
+subvoxel      mesh_damage_4                      21    0.0217    0.0218    0.0219    0.0219    0.0226  5.45 us     183.5 k/s damaged block
+                                                 store_entries = 4.000 blocks
+                                                 store_heap = 320.000 bytes
+                                                 sub_voxels_removed = 256.000 sub-voxels
+                                                 blocks_meshed = 4.000 blocks
+                                                 faces_emitted = 192.000 faces
+                                                 quads_emitted = 12.000 quads
+                                                 merge_ratio = 16.000 faces/quad
+                                                 triangles = 24.000 tris
+                                                 mesh_bytes = 672.000 bytes
+subvoxel      mesh_damage_16                     21    0.0873    0.0878    0.0964    0.1153    0.1828  5.49 us     182.2 k/s damaged block
+                                                 store_entries = 16.000 blocks
+                                                 store_heap = 1280.000 bytes
+                                                 sub_voxels_removed = 1024.000 sub-voxels
+                                                 blocks_meshed = 16.000 blocks
+                                                 faces_emitted = 768.000 faces
+                                                 quads_emitted = 48.000 quads
+                                                 merge_ratio = 16.000 faces/quad
+                                                 triangles = 96.000 tris
+                                                 mesh_bytes = 2688.000 bytes
+subvoxel      mesh_damage_64                     21    0.3591    0.3955    0.4234    0.5229    0.5264  6.18 us     161.8 k/s damaged block
+                                                 store_entries = 64.000 blocks
+                                                 store_heap = 5120.000 bytes
+                                                 sub_voxels_removed = 4096.000 sub-voxels
+                                                 blocks_meshed = 64.000 blocks
+                                                 faces_emitted = 4064.000 faces
+                                                 quads_emitted = 254.000 quads
+                                                 merge_ratio = 16.000 faces/quad
+                                                 triangles = 508.000 tris
+                                                 mesh_bytes = 14224.000 bytes
+subvoxel      mesh_damage_256                    21    1.4582    1.5661    1.5922    1.7532    1.8902  6.12 us     163.5 k/s damaged block
+                                                 store_entries = 256.000 blocks
+                                                 store_heap = 20480.000 bytes
+                                                 sub_voxels_removed = 16384.000 sub-voxels
+                                                 blocks_meshed = 256.000 blocks
+                                                 faces_emitted = 16256.000 faces
+                                                 quads_emitted = 1016.000 quads
+                                                 merge_ratio = 16.000 faces/quad
+                                                 triangles = 2032.000 tris
+                                                 mesh_bytes = 56896.000 bytes
+subvoxel      carve_sub_voxels                   21    0.0742    0.0747    0.0753    0.0804    0.0835  18.2 ns     54.83 M/s sub-voxel break
+                                                 blocks_damaged = 64.000 blocks
+                                                 note: Chunk::breakSubVoxel, including the store insert that materialises each block's grid on first damage
+
+storage       set_uniform                        21    0.0821    0.0821    0.0823    0.0828    0.0858  2.5 ns      399.12 M/s voxel
+                                                 bits_per_index = 0.000
+                                                 palette_entries = 1.000
+                                                 heap_bytes = 0.000 bytes
+                                                 bytes_per_voxel = 0.000 B/voxel
+                                                 note: uniform representation: zero heap bytes, the section is one BlockId member; a compression ratio against 64 KiB is unbounded, not zero; uniform: every set() writes the id already resident, so this is the early-out that dominates terrain generation's inner loop, not a packed write
+storage       set_bits1                          21    0.0967    0.0970    0.1006    0.1067    0.1438  3.0 ns      337.81 M/s voxel
+                                                 bits_per_index = 1.000
+                                                 palette_entries = 2.000
+                                                 heap_bytes = 4100.000 bytes
+                                                 bytes_per_voxel = 0.125 B/voxel
+                                                 compression_vs_raw = 15.984 x vs 64 KiB
+storage       set_bits2                          21    0.1004    0.1053    0.1043    0.1135    0.1188  3.2 ns      311.19 M/s voxel
+                                                 bits_per_index = 2.000
+                                                 palette_entries = 4.000
+                                                 heap_bytes = 8200.000 bytes
+                                                 bytes_per_voxel = 0.250 B/voxel
+                                                 compression_vs_raw = 7.992 x vs 64 KiB
+storage       set_bits4                          21    0.1881    0.1948    0.1948    0.1980    0.2005  5.9 ns      168.21 M/s voxel
+                                                 bits_per_index = 4.000
+                                                 palette_entries = 16.000
+                                                 heap_bytes = 16416.000 bytes
+                                                 bytes_per_voxel = 0.501 B/voxel
+                                                 compression_vs_raw = 3.992 x vs 64 KiB
+storage       set_bits8                          21    1.2755    1.3681    1.3837    1.5065    1.5525  41.8 ns     23.95 M/s voxel
+                                                 bits_per_index = 8.000
+                                                 palette_entries = 256.000
+                                                 heap_bytes = 33280.000 bytes
+                                                 bytes_per_voxel = 1.016 B/voxel
+                                                 compression_vs_raw = 1.969 x vs 64 KiB
+storage       set_bits16                         21    1.4522    1.5040    1.5380    1.7189    1.8877  45.9 ns     21.79 M/s voxel
+                                                 bits_per_index = 16.000
+                                                 palette_entries = 300.000
+                                                 heap_bytes = 66304.000 bytes
+                                                 bytes_per_voxel = 2.023 B/voxel
+                                                 compression_vs_raw = 0.988 x vs 64 KiB
+storage       get_seq_uniform                    21    0.0000    0.0000    0.0000    0.0001    0.0001  -           - voxel    
+                                                 bits_per_index = 0.000
+                                                 palette_entries = 1.000
+                                                 heap_bytes = 0.000 bytes
+                                                 bytes_per_voxel = 0.000 B/voxel
+                                                 note: uniform representation: zero heap bytes, the section is one BlockId member; a compression ratio against 64 KiB is unbounded, not zero; median is below the harness's reliability floor - read it as an upper bound on a cost that clock granularity and loop hoisting cannot separate from zero
+storage       get_seq_bits1                      21    0.0292    0.0292    0.0292    0.0293    0.0293  0.9 ns      1122.19 M/s voxel
+                                                 bits_per_index = 1.000
+                                                 palette_entries = 2.000
+                                                 heap_bytes = 4100.000 bytes
+                                                 bytes_per_voxel = 0.125 B/voxel
+                                                 compression_vs_raw = 15.984 x vs 64 KiB
+storage       get_seq_bits2                      21    0.0292    0.0292    0.0295    0.0294    0.0356  0.9 ns      1122.19 M/s voxel
+                                                 bits_per_index = 2.000
+                                                 palette_entries = 4.000
+                                                 heap_bytes = 8200.000 bytes
+                                                 bytes_per_voxel = 0.250 B/voxel
+                                                 compression_vs_raw = 7.992 x vs 64 KiB
+storage       get_seq_bits4                      21    0.0292    0.0292    0.0296    0.0311    0.0342  0.9 ns      1122.19 M/s voxel
+                                                 bits_per_index = 4.000
+                                                 palette_entries = 16.000
+                                                 heap_bytes = 16416.000 bytes
+                                                 bytes_per_voxel = 0.501 B/voxel
+                                                 compression_vs_raw = 3.992 x vs 64 KiB
+storage       get_seq_bits8                      21    0.0292    0.0293    0.0296    0.0311    0.0328  0.9 ns      1118.36 M/s voxel
+                                                 bits_per_index = 8.000
+                                                 palette_entries = 256.000
+                                                 heap_bytes = 33280.000 bytes
+                                                 bytes_per_voxel = 1.016 B/voxel
+                                                 compression_vs_raw = 1.969 x vs 64 KiB
+storage       get_seq_bits16                     21    0.0275    0.0293    0.0292    0.0294    0.0294  0.9 ns      1118.36 M/s voxel
+                                                 bits_per_index = 16.000
+                                                 palette_entries = 300.000
+                                                 heap_bytes = 66304.000 bytes
+                                                 bytes_per_voxel = 2.023 B/voxel
+                                                 compression_vs_raw = 0.988 x vs 64 KiB
+storage       get_random_uniform                 21    0.0073    0.0073    0.0074    0.0078    0.0078  0.2 ns      4488.77 M/s voxel
+                                                 bits_per_index = 0.000
+                                                 palette_entries = 1.000
+                                                 heap_bytes = 0.000 bytes
+                                                 bytes_per_voxel = 0.000 B/voxel
+                                                 note: uniform representation: zero heap bytes, the section is one BlockId member; a compression ratio against 64 KiB is unbounded, not zero
+storage       get_random_bits1                   21    0.0255    0.0256    0.0258    0.0275    0.0283  0.8 ns      1280.00 M/s voxel
+                                                 bits_per_index = 1.000
+                                                 palette_entries = 2.000
+                                                 heap_bytes = 4100.000 bytes
+                                                 bytes_per_voxel = 0.125 B/voxel
+                                                 compression_vs_raw = 15.984 x vs 64 KiB
+storage       get_random_bits2                   21    0.0255    0.0256    0.0256    0.0257    0.0262  0.8 ns      1280.00 M/s voxel
+                                                 bits_per_index = 2.000
+                                                 palette_entries = 4.000
+                                                 heap_bytes = 8200.000 bytes
+                                                 bytes_per_voxel = 0.250 B/voxel
+                                                 compression_vs_raw = 7.992 x vs 64 KiB
+storage       get_random_bits4                   21    0.0255    0.0258    0.0355    0.0636    0.1604  0.8 ns      1270.08 M/s voxel
+                                                 bits_per_index = 4.000
+                                                 palette_entries = 16.000
+                                                 heap_bytes = 16416.000 bytes
+                                                 bytes_per_voxel = 0.501 B/voxel
+                                                 compression_vs_raw = 3.992 x vs 64 KiB
+storage       get_random_bits8                   21    0.0257    0.0259    0.0260    0.0261    0.0283  0.8 ns      1265.17 M/s voxel
+                                                 bits_per_index = 8.000
+                                                 palette_entries = 256.000
+                                                 heap_bytes = 33280.000 bytes
+                                                 bytes_per_voxel = 1.016 B/voxel
+                                                 compression_vs_raw = 1.969 x vs 64 KiB
+storage       get_random_bits16                  21    0.0263    0.0264    0.0270    0.0281    0.0281  0.8 ns      1241.21 M/s voxel
+                                                 bits_per_index = 16.000
+                                                 palette_entries = 300.000
+                                                 heap_bytes = 66304.000 bytes
+                                                 bytes_per_voxel = 2.023 B/voxel
+                                                 compression_vs_raw = 0.988 x vs 64 KiB
+
+lighting      light_column                        -                                                NOT MEASURED
+                                                 reason: world/LightEngine.hpp is unavailable in this build (missing header, or VOXL_BENCH_NO_LIGHT_ENGINE was defined because LightEngine.cpp is not yet linked into voxl::engine); see benchmarks/bench_lighting.cpp
+
+persistence   round_trip_terrain                 21    0.3872    0.4017    0.4109    0.4632    0.5461  401.70 us   2.5 k/s chunk
+                                                 payload_bytes = 17832.000 bytes
+                                                 bytes_per_voxel = 0.544 B/voxel
+                                                 vs_raw_voxels_and_light = 5.513 x
+                                                 palette_entries = 6.000
+                                                 bits_per_index = 4.000
+                                                 damaged_blocks = 0.000 blocks
+                                                 non_air_blocks = 19687.000 blocks
+                                                 note: encode allocates a fresh std::vector<std::byte> every call, exactly as WorldSave::saveChunk does; the allocation is part of the measurement
+persistence   round_trip_uniform                 21    0.0149    0.0149    0.0176    0.0385    0.0465  14.90 us    67.1 k/s chunk
+                                                 payload_bytes = 13.000 bytes
+                                                 bytes_per_voxel = 0.00040 B/voxel
+                                                 vs_raw_voxels_and_light = 7561.846 x
+                                                 palette_entries = 1.000
+                                                 bits_per_index = 0.000
+                                                 damaged_blocks = 0.000 blocks
+                                                 non_air_blocks = 32768.000 blocks
+                                                 note: encode allocates a fresh std::vector<std::byte> every call, exactly as WorldSave::saveChunk does; the allocation is part of the measurement
+persistence   round_trip_damaged                 21    0.4792    0.4890    0.5089    0.5215    0.8578  489.00 us   2.0 k/s chunk
+                                                 payload_bytes = 22184.000 bytes
+                                                 bytes_per_voxel = 0.677 B/voxel
+                                                 vs_raw_voxels_and_light = 4.431 x
+                                                 palette_entries = 6.000
+                                                 bits_per_index = 4.000
+                                                 damaged_blocks = 64.000 blocks
+                                                 non_air_blocks = 19687.000 blocks
+                                                 note: encode allocates a fresh std::vector<std::byte> every call, exactly as WorldSave::saveChunk does; the allocation is part of the measurement
+persistence   encode_terrain                     21    0.0419    0.0426    0.0435    0.0464    0.0517  42.60 us    23.5 k/s chunk
+                                                 payload_bytes = 17832.000 bytes
+                                                 bytes_per_voxel = 0.544 B/voxel
+                                                 vs_raw_voxels_and_light = 5.513 x
+                                                 palette_entries = 6.000
+                                                 bits_per_index = 4.000
+                                                 damaged_blocks = 0.000 blocks
+                                                 non_air_blocks = 19687.000 blocks
+persistence   decode_terrain                     21    0.3409    0.3530    0.3606    0.3945    0.4211  353.00 us   2.8 k/s chunk
+                                                 payload_bytes = 17832.000 bytes
+                                                 bytes_per_voxel = 0.544 B/voxel
+                                                 vs_raw_voxels_and_light = 5.513 x
+                                                 palette_entries = 6.000
+                                                 bits_per_index = 4.000
+                                                 damaged_blocks = 0.000 blocks
+                                                 non_air_blocks = 19687.000 blocks
+
+=========================================================================================================
+ DERIVED METRICS (computed from the rows above, not timed directly)
+=========================================================================================================
+terrain       gen_lod1                         speedup_vs_lod0                   3.189 x        ok
+terrain       gen_lod2                         speedup_vs_lod0                   8.221 x        ok
+terrain       gen_lod3                         speedup_vs_lod0                   8.617 x        ok
+terrain       gen_batch_job_system             speedup_vs_1_thread               8.971 x        
+terrain       gen_batch_job_system             parallel_efficiency              47.215 %        
+meshing       greedy_lod1                      speedup_vs_lod0                   1.754 x        ok
+meshing       greedy_lod2                      speedup_vs_lod0                   1.873 x        *** FLAG: expected >= 2.5x cheaper than level 0
+meshing       greedy_lod3                      speedup_vs_lod0                   1.103 x        *** FLAG: expected >= 4.0x cheaper than level 0
+

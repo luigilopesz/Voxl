@@ -85,6 +85,9 @@ void Hud::draw(const Hotbar& hotbar, const InteractionState& interaction, float 
 
     drawCrosshair(interaction);
     drawHotbar(hotbar);
+    // Mode first: it claims the row directly above the hotbar, and the transient
+    // block name stacks above it rather than through it.
+    drawModeLabel(interaction);
     drawSelectionLabel(hotbar);
 }
 
@@ -249,13 +252,46 @@ void Hud::drawSelectionLabel(const Hotbar& hotbar)
     }
 
     const ImVec2 size = ImGui::CalcTextSize(text.data());
+    // Row two: clear of the mode label, which owns row one.
     const ImVec2 pos{m_hotbarTopCentre.x - size.x * 0.5f,
-                     m_hotbarTopCentre.y - size.y - 12.0f};
+                     m_hotbarTopCentre.y - size.y - 34.0f};
 
     list->AddRectFilled(ImVec2{pos.x - 6.0f, pos.y - 3.0f},
                         ImVec2{pos.x + size.x + 6.0f, pos.y + size.y + 3.0f},
                         withAlpha(IM_COL32(12, 12, 16, 160), alpha * 0.63f), 3.0f);
     list->AddText(pos, withAlpha(IM_COL32(245, 245, 250, 255), alpha), text.data());
+}
+
+void Hud::drawModeLabel(const InteractionState& interaction)
+{
+    ImDrawList* list = ImGui::GetForegroundDrawList();
+    if (list == nullptr) {
+        return;
+    }
+
+    std::array<char, 96> text{};
+    if (interaction.miningMode == MiningMode::SubVoxel) {
+        std::snprintf(text.data(), text.size(), "%s  r%.1f (%zu sv)%s",
+                      miningModeLabel(interaction.miningMode),
+                      static_cast<double>(interaction.brushRadius), interaction.brushVolume,
+                      interaction.subVoxelFallback ? "  - whole block" : "");
+    } else {
+        std::snprintf(text.data(), text.size(), "%s", miningModeLabel(interaction.miningMode));
+    }
+
+    // Amber when the drill is aimed at something it cannot carve, so the player
+    // learns why the swing behaved like a plain break instead of guessing.
+    const ImU32 ink = interaction.subVoxelFallback ? IM_COL32(255, 196, 92, 255)
+                                                   : IM_COL32(206, 212, 226, 255);
+
+    const ImVec2 size = ImGui::CalcTextSize(text.data());
+    const ImVec2 pos{m_hotbarTopCentre.x - size.x * 0.5f,
+                     m_hotbarTopCentre.y - size.y - 12.0f};
+
+    list->AddRectFilled(ImVec2{pos.x - 6.0f, pos.y - 3.0f},
+                        ImVec2{pos.x + size.x + 6.0f, pos.y + size.y + 3.0f},
+                        IM_COL32(12, 12, 16, 110), 3.0f);
+    list->AddText(pos, ink, text.data());
 }
 
 }  // namespace voxl

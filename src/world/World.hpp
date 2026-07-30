@@ -16,17 +16,33 @@
 //                   captureNeighbourhood - all of which go through the
 //                   ChunkManager's shared_mutex.
 
+//
+// LIGHTING
+// --------
+// World owns the main-thread half of the light engine. The worker half - the
+// initial lighting of a freshly streamed column, and of a LOD shadow - is wired
+// into the ChunkManager here, because World is the first place that has both the
+// BlockRegistry and the streamer.
+//
+// Two things happen on this thread. An edit relights its own neighbourhood
+// immediately, inside setBlock, so the block the player just broke is lit in the
+// same frame; and light that a worker computed but was not allowed to write -
+// because it crossed into a chunk somebody else owned - is applied at the start
+// of the next update.
+
 #include "core/JobSystem.hpp"
 #include "world/Block.hpp"
 #include "world/BlockAccess.hpp"
 #include "world/Chunk.hpp"
 #include "world/ChunkManager.hpp"
+#include "world/LightEngine.hpp"
 #include "world/Lod.hpp"
 #include "world/SubVoxel.hpp"
 #include "world/VoxelTypes.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -167,6 +183,32 @@ public:
 
     [[nodiscard]] std::size_t deferredEditCount() const noexcept { return m_deferredEdits.size(); }
 
+    // ---- lighting (main thread) ----
+
+    [[nodiscard]] bool lightingEnabled() const noexcept { return m_lighting; }
+
+    /// What the last incremental relight cost. Zeroed by an edit that changed no
+    /// light property at all, which is most of them.
+    [[nodiscard]] const LightUpdateStats& lastLightUpdate() const noexcept
+    {
+        return m_lastLightUpdate;
+    }
+
+    /// Spilled light still waiting to be applied. Should hover near zero once
+    /// streaming settles; a figure that keeps growing means the flood is being
+    /// refused faster than it is being retried.
+    [[nodiscard]] std::size_t pendingLightSeeds() const noexcept { return m_pendingLight.size(); }
+
+    /// Column boundaries that were lit blind and still have to exchange light.
+    /// Rises while chunks stream in and must fall back to zero once they stop;
+    /// a figure that never settles means seams are being recorded faster than
+    /// they can be reconciled. See BlindSeam.
+    [[nodiscard]] std::size_t pendingLightSeams() const
+    {
+        const std::lock_guard<std::mutex> lock(m_blindSeamMutex);
+        return m_blindSeams.size();
+    }
+
     // ---- streaming (main thread) ----
 
     /// One streaming step. Applies whatever edits were deferred first, so a
@@ -263,7 +305,90 @@ private:
     /// worker, not merely a torn read. A chunk is therefore writable only when
     /// no chunk in its own 3x3x3 neighbourhood is meshing - that set is exactly
     /// the set of chunks whose mesh job could hold a pointer to it.
+    ///
+    /// Since lighting arrived there is a second kind of worker reader: a column
+    /// light job reads the light of every chunk in a 3x3 block of columns. The
+    /// rule is unchanged, only the set is bigger, and
+    /// ChunkManager::isNeighbourhoodBusy answers for both in one lock.
     [[nodiscard]] bool isEditBlocked(const ChunkPtr& chunk, const ChunkPos& position) const;
+
+    /// True when an incremental relight around `pos` would have to write a chunk
+    /// a worker owns.
+    ///
+    /// Light reaches 15 blocks, so HORIZONTALLY the relight never leaves the
+    /// 3x3x3 isEditBlocked already covers. Vertically it does: opening or cutting
+    /// a sunlit column changes every cell beneath it down to the first blocker,
+    /// which can be most of the world's height. Those extra sections have to be
+    /// tested too, or the removal pass stops at a chunk border and leaves a
+    /// column of light hanging in the air with nothing to take it away.
+    [[nodiscard]] bool isRelightBlocked(const BlockPos& pos) const;
+
+    /// Rebuilds the light around a voxel that just changed, then marks every
+    /// chunk whose light moved - and its seam neighbours - for a remesh.
+    void relightAround(const BlockPos& pos);
+
+    /// Applies whatever a light worker could not write itself, within a budget.
+    void applyPendingLight();
+
+    // ---- blind column seams ----
+    //
+    // A column light job may only read neighbouring chunks that are final in
+    // BOTH voxels and light. A neighbour column that is being lit at the same
+    // moment is neither, so it arrives as a null region slot, which the engine
+    // has no choice but to treat as a solid wall. That is safe, and it is also
+    // supposed to be self-correcting: whichever column is lit second sees the
+    // first, reads its light, and spills back across the boundary.
+    //
+    // TWO COLUMNS LIT AT THE SAME TIME BREAK THAT ARGUMENT. Neither is second.
+    // Each sees the other as a wall, neither reads the other, and neither spills
+    // into the other - and because published light is never recomputed, the seam
+    // between them stays dark permanently. It is not a rare interleaving either:
+    // the streaming sweep claims several columns per update, so adjacent columns
+    // being in flight together is the normal case at the loading frontier.
+    //
+    // The root fix belongs in ChunkManager::claimColumnLight, which is what
+    // decides that two neighbours may run concurrently (see the note at the top
+    // of the seam code in World.cpp). What follows is the main thread doing
+    // afterwards, once both columns are resident and lit, exactly the exchange
+    // the two workers were not allowed to do at the time: read both sides of the
+    // boundary and queue the light that should have crossed as ordinary spill
+    // seeds. It is idempotent and self-cancelling - a seam with nothing to move
+    // produces no seeds - so it stays correct, and costs almost nothing, if the
+    // scheduler is fixed underneath it.
+
+    struct BlindSeam {
+        /// The lower of the two columns; the neighbour is at +dx / +dz. Storing
+        /// it in this canonical form is what lets the two jobs either side of one
+        /// boundary record the same entry, so the duplicate can be dropped.
+        ColumnPos     column{};
+        std::int32_t  dx       = 0;  ///< exactly one of dx, dz is 1; the other 0
+        std::int32_t  dz       = 0;
+        std::uint16_t attempts = 0;  ///< gives up on a section that is never lit
+    };
+
+    /// WORKER THREAD. Records which neighbour columns `work` had to treat as a
+    /// wall, so the main thread can settle the boundary later.
+    void noteBlindSeams(const LightColumnWork& work);
+
+    /// Settles recorded seams within a per-update cell budget.
+    void reconcileBlindSeams();
+
+    /// One seam. Returns false when a section on either side is resident but not
+    /// lit yet, so the seam has to be tried again. `scanned` accumulates the
+    /// cells looked at, which is what the budget is spent in.
+    [[nodiscard]] bool reconcileSeam(const BlindSeam& seam, std::size_t& scanned);
+
+    /// Queues the light that should cross the shared face from `from` into `to`.
+    /// `dx`/`dz` point from `from` toward `to`. Returns the cells examined.
+    std::size_t seedAcrossSeam(const Chunk& from, const Chunk& to, std::int32_t dx,
+                               std::int32_t dz);
+
+    /// Dirties the chunks LightWorld recorded, plus the neighbours that sample
+    /// across the faces it touched.
+    void markLitChunksDirty();
+
+    /// Wires the worker half of the light engine into the ChunkManager.
+    void installLighter();
 
     /// Marks every chunk whose mesh depends on `pos` as needing a remesh. That is
     /// up to seven neighbours, not one: a face is culled against its direct
@@ -278,6 +403,46 @@ private:
     JobSystem&           m_jobs;
     const BlockRegistry& m_registry;
     ChunkManager         m_chunks;
+
+    /// Main-thread light engine. The workers use their own thread_local ones;
+    /// this instance only ever runs on the thread that owns the edits.
+    LightEngine m_light;
+    LightWorld  m_lightWorld;
+    bool        m_lighting = true;
+
+    /// Light a worker produced that crossed into a chunk it did not own.
+    ///
+    /// Applying it is main-thread work, so it is budgeted rather than done all at
+    /// once: a cold start can spill thousands of border cells in a single update
+    /// and blowing the frame for light nobody can see yet would be a worse bug
+    /// than the seam it fixes.
+    std::vector<LightSeed> m_pendingLight;
+    LightUpdateStats       m_lastLightUpdate;
+
+    /// Spill seeds applied per update. Each one is a compare and, when it wins,
+    /// a short flood; 4096 is a few tens of microseconds.
+    static constexpr std::size_t kLightSeedsPerUpdate = 4096;
+    /// Ceiling on the backlog. Reached only if the flood is refused faster than
+    /// it is retried, which means something is wedged; dropping the excess costs
+    /// a dim seam rather than unbounded memory.
+    static constexpr std::size_t kMaxPendingLightSeeds = 1u << 16;
+
+    /// Boundaries recorded by the light workers, waiting to be settled. Written
+    /// from workers, drained by update(), hence the lock.
+    std::vector<BlindSeam> m_blindSeams;
+    mutable std::mutex     m_blindSeamMutex;
+
+    /// Cells one update may look at while settling seams. A boundary between two
+    /// uniform sections - solid rock at zero, open sky at fifteen, which is most
+    /// of a column - is decided in two loads and spends none of this, so the
+    /// budget only ever bites on the handful of sections that hold real detail.
+    static constexpr std::size_t kSeamCellsPerUpdate = 1u << 15;
+    /// Updates a seam may wait for a section that never becomes lit before it is
+    /// dropped. A tolerant claim can leave a section unlit indefinitely, and a
+    /// seam that waits for it forever would be retried forever.
+    static constexpr std::uint16_t kMaxSeamAttempts = 600;
+    /// Ceiling on the backlog, for the same reason as the light seed one.
+    static constexpr std::size_t kMaxBlindSeams = 4096;
 
     std::vector<PendingEdit> m_deferredEdits;
     std::uint64_t            m_frameIndex = 0;

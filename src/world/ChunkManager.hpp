@@ -51,9 +51,48 @@
 //    step, and an ordinary remesh and a LOD rebuild contend for the same
 //    Ready -> Meshing transition.
 
+//
+// LIGHTING
+// --------
+// A freshly generated section is NOT handed to the mesher until its light has
+// been computed: a mesh bakes light into its vertices, and nothing would rebuild
+// it afterwards. The light pass runs on a worker and WRITES voxel light, so it
+// may only touch chunks no other thread can read (invariant 1 in Chunk.hpp).
+//
+// THE LIT FLAG, AND WHY IT IS NOT A CHUNK STATE. The obvious implementation is a
+// `Lighting` state between Generated and Meshing, or - without touching the
+// frozen state machine - leaving the section in `Generating` until it is lit.
+// Both make an unlit chunk BUSY, and busy is a promise that a worker owns it
+// right now. A section whose column is only half generated is not owned by
+// anybody; it is merely waiting. Marking it busy makes it un-meshable (correct),
+// un-editable (correct) and un-RETIRABLE (wrong) - so a column the player walks
+// away from before it finishes generating strands its sections in a busy state
+// forever, which is a leak and trips every "nothing is stranded" assertion in
+// the streaming tests.
+//
+// So the section goes to `Generated` exactly as it always did, and residency
+// carries a separate `lit` flag. Unlit chunks are simply invisible to
+// findReadable() and captureNeighbourhood(), which is all that is needed: no
+// mesh job can capture one, so none can read the light being written, and the
+// scheduler naturally waits for it the same way it already waits for a missing
+// neighbour. Nothing outside this file can observe the flag.
+//
+// Lighting is scheduled a WHOLE COLUMN at a time - see LightColumnWork for why -
+// and the job also READS the eight surrounding columns. A main-thread light or
+// voxel write into any of those would race it, so an active light job registers
+// its column and isNeighbourhoodBusy() reports it exactly as it reports a mesh
+// job.
+//
+// THAT REGISTRATION IS TAKEN ON THE MAIN THREAD AND NOWHERE ELSE. It is the same
+// kind of marker as ChunkState::Meshing, and the reason the main thread may test
+// one and then write is that no other thread can raise one behind its back. A
+// generate job that completes a column therefore only files the column as
+// pending; sweepPendingLight() takes the claim and dispatches, one update later.
+
 #include "core/JobSystem.hpp"
 #include "world/BlockAccess.hpp"
 #include "world/Chunk.hpp"
+#include "world/LightEngine.hpp"
 #include "world/Lod.hpp"
 #include "world/VoxelTypes.hpp"
 
@@ -68,6 +107,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <glm/vec3.hpp>
@@ -166,6 +206,33 @@ struct StreamingConfig {
     /// player is moving fast enough to keep the per-update cap saturated.
     std::size_t maxLodJobsInFlight = 8;
 
+    // ------------------------------------------------------------- lighting --
+
+    /// Columns the main-thread light sweep may start per update.
+    ///
+    /// EVERY column comes through the sweep. A generate job used to start its own
+    /// column's light the instant the last section landed, which saved an update
+    /// of latency and cost a data race: the claim is what makes a chunk
+    /// unwritable, and a claim taken on a worker can appear between the main
+    /// thread's writability check and its write. See dispatchGenerate.
+    ///
+    /// The budget has room to spare. A cold start admits maxScheduledPerUpdate
+    /// (48) generate jobs per update, which completes at most six eight-section
+    /// columns in that time, so 32 drains the backlog several times over and the
+    /// cap only ever bites on a teleport.
+    std::size_t maxLightColumnsPerUpdate = 32;
+
+    /// Light jobs allowed to be in flight at once, across all updates. Bounds how
+    /// much worker time lighting can steal from the generation it depends on.
+    std::size_t maxLightJobsInFlight = 64;
+
+    /// Set false to stream with no lighting at all, which is what the pipeline
+    /// did before the light engine existed: terrain goes straight from
+    /// Generating to Generated and the mesher sees whatever light the generator
+    /// left behind. For A/B comparisons and for isolating a streaming bug from a
+    /// lighting one; the game always runs with it on.
+    bool lighting = true;
+
     /// Refuse to change the level of a chunk the player has edited.
     ///
     /// A rebuild regenerates terrain from the seed, which would silently erase
@@ -217,6 +284,32 @@ using ChunkReleaseFn = std::function<void(const ChunkPos&)>;
 /// use. The chunk is already in state Unloading. MAIN THREAD.
 using ChunkRetireFn = std::function<void(const ChunkPtr&)>;
 
+/// The three callables the streamer needs to light what it streams.
+///
+/// Injected rather than compiled in for the same reason meshing is: the manager
+/// has no BlockRegistry and world/ keeps its dependencies one-directional. When
+/// the lighter is not set the pipeline behaves exactly as it did before lighting
+/// existed - terrain goes straight from Generating to Generated - which is what
+/// keeps ChunkManager usable on its own in tests and tools.
+struct ChunkLighter {
+    /// Rebuilds the light of every section in the work item. Runs on a WORKER
+    /// with exclusive ownership of `work.targets`; everything else it touches is
+    /// read-only. Returns the light that crossed into chunks it did not own.
+    std::function<LightSpill(const LightColumnWork&)> column;
+
+    /// Lights the LOD shadow chunk, which nobody else can see yet. Runs on a
+    /// WORKER, between the shadow's terrain and its geometry.
+    std::function<void(Chunk&, const ChunkNeighbourhood&, LightSpill&)> chunk;
+
+    /// Applies spilled light to the live world. MAIN THREAD.
+    std::function<void(LightSpill&&)> spill;
+
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return static_cast<bool>(column) && static_cast<bool>(chunk) && static_cast<bool>(spill);
+    }
+};
+
 // ------------------------------------------------------------------- stats --
 
 /// Everything the debug overlay needs. Sampled without a global snapshot, so
@@ -240,9 +333,13 @@ struct WorldStats {
     std::size_t generateJobsInFlight = 0;
     std::size_t meshJobsInFlight     = 0;
     std::size_t lodJobsInFlight      = 0;
+    std::size_t lightJobsInFlight    = 0;
     std::size_t pendingUploads       = 0;
     /// Edits waiting for their chunk to leave a worker-owned state. World only.
     std::size_t deferredEdits = 0;
+    /// Cross-border light a worker computed that the main thread has not applied
+    /// yet. World only.
+    std::size_t pendingLightSeeds = 0;
 
     std::size_t cpuVoxelBytes = 0;
     std::size_t gpuMeshBytes  = 0;
@@ -261,6 +358,13 @@ struct WorldStats {
     /// Meshes thrown away because the chunk was retired or edited mid-job. A
     /// number that climbs steadily means the streaming radii are thrashing.
     std::uint64_t meshesDropped = 0;
+
+    /// Column light jobs that finished, and the sections they lit. A world that
+    /// has settled should see both stop climbing; a `columnsLit` that keeps
+    /// rising with the player standing still means light is being invalidated in
+    /// a loop.
+    std::uint64_t lightColumnsLit  = 0;
+    std::uint64_t lightSectionsLit = 0;
 
     /// LOD rebuilds that completed and swapped in. Divided by elapsed time this
     /// is the transition rate; if it grows without the player moving, the
@@ -302,8 +406,13 @@ public:
     void setMeshReleaser(ChunkReleaseFn release);
     void setRetireHook(ChunkRetireFn retire);
 
+    /// Enables the lighting stage. Leaving it unset keeps the pre-lighting
+    /// pipeline exactly as it was; see ChunkLighter.
+    void setLighter(ChunkLighter lighter);
+
     [[nodiscard]] bool hasGenerator() const noexcept { return static_cast<bool>(m_generate); }
     [[nodiscard]] bool hasMesher() const noexcept { return static_cast<bool>(m_mesh); }
+    [[nodiscard]] bool hasLighter() const noexcept { return m_lighter.valid(); }
 
     [[nodiscard]] const StreamingConfig& config() const noexcept { return m_config; }
     /// Clamps the padding to at least one chunk; see StreamingConfig.
@@ -320,6 +429,21 @@ public:
     [[nodiscard]] ChunkPtr find(const ChunkPos& position) const;
     /// Null unless the chunk is resident AND its voxels are safe to read.
     [[nodiscard]] ConstChunkPtr findReadable(const ChunkPos& position) const;
+
+    /// findReadable's predicate, but hands back a MUTABLE pointer.
+    ///
+    /// For the main-thread incremental light pass, which reads a neighbourhood
+    /// and then writes part of it. `find()` is the wrong tool there and was a
+    /// real crash: it hands back a chunk in ANY state, including one a generator
+    /// is filling and one whose column a light job is writing. ChunkStorage grows
+    /// its palette and materialises its light array in place, so reading such a
+    /// chunk from the main thread is the mirror image of the use-after-free
+    /// World::isEditBlocked exists to prevent - the reader, not the writer, is
+    /// the one on the wrong thread.
+    ///
+    /// Writability is a strictly stronger test and still belongs to the caller;
+    /// see LightWorld's predicate, which additionally consults isRegionBusy().
+    [[nodiscard]] ChunkPtr findReadableMutable(const ChunkPos& position) const;
     [[nodiscard]] bool        isResident(const ChunkPos& position) const;
     [[nodiscard]] std::size_t residentCount() const;
 
@@ -327,6 +451,28 @@ public:
     /// Slots holding a chunk that is not yet readable are left null, so
     /// `ChunkNeighbourhood::complete()` answers "may this be meshed yet".
     [[nodiscard]] ChunkNeighbourhood captureNeighbourhood(const ChunkPos& centre) const;
+
+    /// True when a worker may be reading any chunk whose contents a main-thread
+    /// write to `position` would change under it.
+    ///
+    /// This is the single predicate behind World::isEditBlocked, and it covers
+    /// both kinds of worker reader:
+    ///  * a MESH job for any chunk in `position`'s own 3x3x3, which captured a
+    ///    snapshot including `position` and reads a one-voxel skirt out of it;
+    ///  * a LIGHT job for any of the nine columns around `position`, which reads
+    ///    the light of every chunk in that block while it recomputes the middle.
+    /// Both are answered in one shared lock rather than one per neighbour, which
+    /// is also strictly cheaper than the per-chunk find() loop it replaced.
+    [[nodiscard]] bool isNeighbourhoodBusy(const ChunkPos& position) const
+    {
+        return isRegionBusy(position, position);
+    }
+
+    /// isNeighbourhoodBusy for every chunk in the inclusive box, in one critical
+    /// section. An incremental relight can reach down a whole column, so its
+    /// writable set is a box rather than a single 3x3x3 and testing it a chunk
+    /// at a time would take the lock dozens of times per edit.
+    [[nodiscard]] bool isRegionBusy(const ChunkPos& minChunk, const ChunkPos& maxChunk) const;
 
     /// Visits every resident chunk as `fn(const ChunkPos&, const ChunkPtr&)`.
     /// The shared lock is held throughout: `fn` must not call back into the
@@ -408,15 +554,40 @@ public:
     }
 
 private:
+    /// Where a chunk is in the lighting pipeline. Allocated only when lighting
+    /// is enabled, and held behind a shared_ptr so a worker can update it without
+    /// taking the map lock - and so a job that outlives the map entry still has
+    /// somewhere safe to write.
+    struct ChunkLightFlags {
+        /// Terrain is final. Set by the generate worker before it publishes the
+        /// chunk, so a light job can tell a section that is merely waiting from
+        /// one that is still being written.
+        std::atomic<bool> terrainReady{false};
+        /// Light is final. Until this is set the chunk is invisible to
+        /// findReadable() and captureNeighbourhood(); see the LIGHTING note at
+        /// the top of this file.
+        std::atomic<bool> lit{false};
+    };
+
     /// Map value: the chunk plus the main-thread-only accounting for the mesh
     /// the renderer currently holds for it.
     struct Slot {
         ChunkPtr    chunk;
         std::size_t gpuBytes  = 0;
         std::size_t triangles = 0;
+
+        /// Null when lighting is disabled, which then reads as "always lit".
+        std::shared_ptr<ChunkLightFlags> light;
+
+        [[nodiscard]] bool lit() const noexcept
+        {
+            return light == nullptr || light->lit.load(std::memory_order_acquire);
+        }
+        /// Readable by a mesh job, a physics query or another light job.
+        [[nodiscard]] bool visible() const noexcept { return chunk->hasVoxels() && lit(); }
     };
 
-    enum class WorkKind : std::uint8_t { Generate, Mesh, LodRebuild };
+    enum class WorkKind : std::uint8_t { Generate, Mesh, LodRebuild, Light };
 
     struct Candidate {
         float      score = 0.0f;
@@ -442,6 +613,54 @@ private:
 
     bool dispatchGenerate(const ChunkPtr& chunk, JobPriority priority);
     bool dispatchMesh(const Candidate& candidate, JobPriority priority);
+
+    // ---- lighting ----
+
+    /// A claimed column light job: what the engine needs, plus the residency
+    /// flags to flip when it is done. Kept apart from LightColumnWork so the
+    /// engine stays ignorant of how the streamer tracks residency.
+    struct ColumnLightJob {
+        LightColumnWork work;
+        std::array<std::shared_ptr<ChunkLightFlags>, kWorldSectionCount> flags{};
+    };
+
+    /// Takes the column's light claim and fills `work` with everything the job
+    /// may touch, in ONE critical section. Fails - without taking the claim -
+    /// when the column is already claimed or when there is nothing to light.
+    ///
+    /// MAIN THREAD ONLY, and that is a threading invariant rather than a
+    /// convenience: the claim is a marker that makes chunks unwritable, and the
+    /// main thread's check-then-write pattern is only safe while the main thread
+    /// is the only one that can establish such a marker. See dispatchGenerate.
+    ///
+    /// `tolerant` decides what to do about a section that has no terrain yet.
+    /// Strict refuses the whole column, which is what gives the common case its
+    /// quality: waiting for the last section of a column means the sky is exact
+    /// on the first pass. Tolerant treats it as an unknown wall and lights the
+    /// rest, which is right once the column has left the load volume and no more
+    /// terrain is coming - see sweepPendingLight().
+    bool claimColumnLight(const ColumnPos& column, ColumnLightJob& job, bool tolerant);
+    void releaseColumnLight(const ColumnPos& column);
+
+    /// Claims and submits, or does nothing. MAIN THREAD - see claimColumnLight.
+    ///
+    /// Does NOT consult maxLightJobsInFlight itself; sweepPendingLight, its only
+    /// caller, applies that cap before it asks.
+    bool startColumnLight(const ColumnPos& column, JobPriority priority, bool tolerant);
+
+    /// Starts the light job for every column whose terrain has landed. MAIN
+    /// THREAD, once per update, and the ONLY thing that dispatches column light.
+    ///
+    /// IT IS ALSO WHAT STOPS CHUNKS BEING STRANDED. A section waiting to be lit
+    /// is invisible to findReadable(), and the only thing that makes it visible
+    /// is a light job. If the player turns away before the rest of its column is
+    /// generated, that column is never in the load volume again and no further
+    /// generate job runs in it; without this sweep its sections stay unlit - and
+    /// therefore un-meshable - for as long as they stay resident.
+    void sweepPendingLight();
+
+    /// Body of a light job. Runs on a WORKER.
+    void runColumnLight(const ColumnLightJob& job);
 
     /// Starts a shadow rebuild at `candidate.targetLod`. See the LEVEL OF DETAIL
     /// section of the file header for why it is a shadow and not an in-place
@@ -482,7 +701,8 @@ private:
     {
         return m_generateInFlight.load(std::memory_order_acquire) +
                m_meshInFlight.load(std::memory_order_acquire) +
-               m_lodInFlight.load(std::memory_order_acquire);
+               m_lodInFlight.load(std::memory_order_acquire) +
+               m_lightInFlight.load(std::memory_order_acquire);
     }
 
     JobSystem&      m_jobs;
@@ -492,9 +712,22 @@ private:
     ChunkMeshFn     m_mesh;
     ChunkReleaseFn  m_release;
     ChunkRetireFn   m_retire;
+    ChunkLighter    m_lighter;
 
     mutable std::shared_mutex                    m_mutex;
     std::unordered_map<ChunkPos, Slot>           m_chunks;
+
+    /// Columns with a light job in flight. Only busy columns are in here, so it
+    /// holds at most maxLightJobsInFlight entries and needs no pruning; a set of
+    /// "every column that was ever lit" would grow without bound as the player
+    /// walks. Guarded by m_mutex together with the chunk map, because claiming a
+    /// column and reading the chunks in it has to be one atomic step.
+    std::unordered_set<ColumnPos>                m_lightColumns;
+
+    /// Columns holding at least one section that has terrain but no light yet.
+    /// Added by the generate worker, cleared when a light job claims the column;
+    /// swept once per update so nothing can be stranded. Guarded by m_mutex.
+    std::unordered_set<ColumnPos>                m_lightPending;
 
     /// Reused across frames so the per-frame scheduling pass does not allocate.
     std::vector<Candidate> m_candidates;
@@ -514,6 +747,9 @@ private:
     /// their own in-flight budget; jobsInFlight() sums all three, which is what
     /// keeps waitForPendingJobs() and the destructor honest.
     std::atomic<std::size_t> m_lodInFlight{0};
+    /// Counted apart so lighting gets its own budget and cannot crowd out the
+    /// generation it depends on; jobsInFlight() sums all four.
+    std::atomic<std::size_t> m_lightInFlight{0};
     std::atomic<std::size_t> m_pendingUploads{0};
     std::atomic<std::size_t> m_queuedChunks{0};
     std::atomic<std::size_t> m_visibleChunks{0};
@@ -524,11 +760,40 @@ private:
     std::atomic<std::uint64_t> m_meshesDropped{0};
     std::atomic<std::uint64_t> m_lodTransitions{0};
     std::atomic<std::uint64_t> m_lodTransitionsDropped{0};
+    std::atomic<std::uint64_t> m_lightColumnsLit{0};
+    std::atomic<std::uint64_t> m_lightSectionsLit{0};
 
     /// Only the sleep/wake handshake for waitForPendingJobs; the counters above
     /// are atomics so stats() never contends with a worker.
     mutable std::mutex      m_jobMutex;
     std::condition_variable m_jobIdle;
 };
+
+// ------------------------------------------------- asking without a manager --
+
+/// ChunkManager::isNeighbourhoodBusy(), asked by a caller that has no manager to
+/// ask, and answered by every manager that is alive.
+///
+/// WHY THIS EXISTS. WorldSave::saveChunk() encodes a whole chunk - voxels AND
+/// light - on the main thread. That is exactly the read invariant 1 forbids
+/// while a worker owns the chunk, and a column light job owns and REWRITES the
+/// light array of every unlit section in its column without the chunk ever
+/// entering a busy state (see the LIGHTING note above, which explains why it
+/// must not). Refusing the save while the neighbourhood is busy is the same
+/// answer saveChunk already gives for ChunkState::Generating: the chunk stays
+/// dirty and the next autosave tick picks it up.
+///
+/// WHY NOT A REFERENCE. A WorldSave is constructed before the world it saves and
+/// deliberately knows nothing about residency; giving it a ChunkManager would
+/// invert that and tangle two lifetimes that are currently independent. A
+/// manager instead publishes itself here for exactly as long as it exists, so
+/// there is no wiring step to forget. With no manager alive - every WorldSave
+/// unit test, and every offline tool - the answer is false and behaviour is
+/// exactly what it was.
+///
+/// Answers for EVERY live manager rather than looking one up by position,
+/// because a spurious "busy" only defers a save by one tick while a spurious
+/// "idle" is the use-after-free. MAIN THREAD, like everything that consumes it.
+[[nodiscard]] bool isChunkNeighbourhoodBusyAnywhere(const ChunkPos& position);
 
 }  // namespace voxl

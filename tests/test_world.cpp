@@ -8,6 +8,7 @@
 #include "core/JobSystem.hpp"
 #include "world/Block.hpp"
 #include "world/ChunkManager.hpp"
+#include "world/ChunkStorage.hpp"
 #include "world/VoxelTypes.hpp"
 #include "world/World.hpp"
 
@@ -100,6 +101,29 @@ struct Fixture {
 [[nodiscard]] StreamingView viewAt(float x, float y, float z)
 {
     return StreamingView{glm::vec3{x, y, z}, glm::vec3{0.0f, 0.0f, -1.0f}};
+}
+
+/// Every light value in the cube of radius `radius` around `centre`, in a fixed
+/// order, so two edits made in identical surroundings can be compared cell for
+/// cell. Sunlight and block light are kept apart because a glowstone changes
+/// both and only one of them survives a missing relight.
+[[nodiscard]] std::vector<std::uint8_t> lightAround(const World& world, const BlockPos& centre,
+                                                    std::int32_t radius)
+{
+    std::vector<std::uint8_t> out;
+    out.reserve(static_cast<std::size_t>(2 * radius + 1) * static_cast<std::size_t>(2 * radius + 1) *
+                static_cast<std::size_t>(2 * radius + 1) * 2);
+    for (std::int32_t dy = -radius; dy <= radius; ++dy) {
+        for (std::int32_t dz = -radius; dz <= radius; ++dz) {
+            for (std::int32_t dx = -radius; dx <= radius; ++dx) {
+                const std::uint8_t packed =
+                    world.getLight(BlockPos{centre.x + dx, centre.y + dy, centre.z + dz});
+                out.push_back(ChunkStorage::unpackSunlight(packed));
+                out.push_back(ChunkStorage::unpackBlockLight(packed));
+            }
+        }
+    }
+    return out;
 }
 
 [[nodiscard]] StreamingConfig tightConfig()
@@ -527,4 +551,147 @@ TEST_CASE("the load and keep radii are separated by the hysteresis padding",
     CHECK(manager.inKeepRange(centre, ChunkPos{5, 3, 0}));
     CHECK_FALSE(manager.inKeepRange(centre, ChunkPos{6, 3, 0}));
     CHECK(ChunkManager::horizontalDistanceSq(ChunkPos{-3, 0, 4}, ChunkPos{1, 7, 1}) == 16 + 9);
+}
+
+// ---------------------------------------------------------------------------
+//  Regression: a deferred edit must be relit exactly as an immediate one
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a deferred edit is relit exactly as an immediate one", "[world][light][regression]")
+{
+    // REGRESSION. World::setBlock relights around the edit; World::applyDeferredEdits
+    // - the path every edit made near the streaming frontier goes down - used to
+    // call a bare writeBlock() and nothing else. The block landed, the light did
+    // not move, and nothing ever came back to fix it: light that has already been
+    // published is not recomputed, so the stale value was permanent.
+    //
+    // The same replay also has to re-test the RELIGHT footprint, not just the
+    // 3x3x3 isEditBlocked covers. A sunlight change runs the height of the world,
+    // which is exactly why setBlock defers on isRelightBlocked as well; a replay
+    // that only re-tested isEditBlocked would flood light into a chunk a worker
+    // owns and reintroduce the race the deferral exists to prevent.
+    StreamingConfig config = tightConfig();
+    config.loadRadius      = 3;
+    REQUIRE(config.lighting);
+
+    Fixture fixture(config);
+    const StreamingView view = viewAt(16.5f, 200.0f, 16.5f);
+    fixture.settle(view);
+
+    // Both sit in the interior of chunk (0, 6, 0), in identical open air well
+    // above the flat floor, and 32 blocks apart - twice the reach of a glowstone,
+    // so neither can light the other and their neighbourhoods must come out
+    // identical cell for cell.
+    const BlockPos immediate{8, 200, 8};
+    const BlockPos deferred{24, 200, 24};
+
+    REQUIRE(ChunkStorage::unpackSunlight(fixture.world.getLight(immediate)) == 15);
+    REQUIRE(ChunkStorage::unpackSunlight(fixture.world.getLight(deferred)) == 15);
+    REQUIRE(ChunkStorage::unpackBlockLight(fixture.world.getLight(deferred)) == 0);
+
+    // ---- the control: the same edit, applied at once ----
+    REQUIRE(fixture.world.setBlock(immediate, blocks::Glowstone) == EditResult::Applied);
+    REQUIRE(ChunkStorage::unpackBlockLight(fixture.world.getLight(immediate)) == 15);
+
+    // ---- force the deferral, through the relight footprint alone ----
+    //
+    // Chunk (0, 3, 0) is four sections below the edit: outside the 3x3x3 that
+    // isEditBlocked tests, inside the column the sunlight change would run down.
+    // With it busy, setBlock must defer even though the edited chunk itself is
+    // perfectly writable - which is the state the replay has to handle.
+    const ChunkPtr blocker = fixture.world.chunkAt(ChunkPos{0, 3, 0});
+    REQUIRE(blocker != nullptr);
+    const ChunkState blockerState = blocker->state();
+    blocker->forceState(ChunkState::Meshing);
+
+    REQUIRE(fixture.world.setBlock(deferred, blocks::Glowstone) == EditResult::Deferred);
+    REQUIRE(fixture.world.getBlock(deferred) == blocks::Air);
+
+    // One update with the blocker still busy. The replay must notice that the
+    // relight is still unsafe and leave the edit queued; writing the block here
+    // and skipping the relight is precisely the defect.
+    fixture.world.update(view);
+    CHECK(fixture.world.deferredEditCount() == 1);
+    CHECK(fixture.world.getBlock(deferred) == blocks::Air);
+
+    // ---- let it through ----
+    blocker->forceState(blockerState);
+    fixture.settle(view);
+
+    CHECK(fixture.world.deferredEditCount() == 0);
+    REQUIRE(fixture.world.getBlock(deferred) == blocks::Glowstone);
+
+    // The whole point: a deferred edit and an immediate one leave the same light.
+    CHECK(lightAround(fixture.world, deferred, 4) == lightAround(fixture.world, immediate, 4));
+    // Spelled out as well, so a failure says what is wrong rather than "vectors
+    // differ": the lamp lights its own cell, and the cell under it one less.
+    CHECK(ChunkStorage::unpackBlockLight(fixture.world.getLight(deferred)) == 15);
+    CHECK(ChunkStorage::unpackBlockLight(
+              fixture.world.getLight(BlockPos{deferred.x, deferred.y - 1, deferred.z})) == 14);
+    // ... and it casts a shadow: the cell below an opaque block can only be lit
+    // sideways, which costs one.
+    CHECK(ChunkStorage::unpackSunlight(
+              fixture.world.getLight(BlockPos{deferred.x, deferred.y - 1, deferred.z})) == 14);
+}
+
+// ---------------------------------------------------------------------------
+//  Regression: the light seam fan-out must survive both faces of one axis
+// ---------------------------------------------------------------------------
+
+TEST_CASE("a relight spanning a whole section dirties the right neighbours",
+          "[world][light][regression]")
+{
+    // REGRESSION. World::markLitChunksDirty turns the set of chunk faces a
+    // relight touched into the set of neighbours that must remesh, by building
+    // a per-axis offset list and taking the product. That list was sized for
+    // two entries per axis - copied from markSeamNeighboursDirty, where the
+    // source is a single voxel and so can only be against ONE face of any given
+    // axis.
+    //
+    // A flood is not a voxel. An opaque block dropped into an open column
+    // shadows every section beneath it from top to bottom, so a section fully
+    // inside that shadow has its light change at local y == 0 AND at
+    // local y == 31: both the NegY and the PosY bit. The axis then needs three
+    // offsets (0, -1, +1) and the third write ran off the row - corrupting the
+    // Z axis's zero entry on the way past, and on the last axis taking out the
+    // stack cookie and killing the process with no log at all.
+    //
+    // The observable below is the corruption, not the crash: with the row
+    // overflowing, the Z offset list lost its zero and every neighbour was
+    // dirtied one chunk further along +Z than it should have been.
+    StreamingConfig config = tightConfig();
+    config.loadRadius      = 3;
+    REQUIRE(config.lighting);
+
+    Fixture fixture(config);
+    fixture.settle(viewAt(16.5f, 200.0f, 16.5f));
+
+    ChunkManager& chunks = fixture.world.chunks();
+
+    // Sections 4 (y 128..159) and 5 (y 160..191) sit entirely between the floor
+    // and the block placed below, so both are fully shadowed by it.
+    const ChunkPos shadowed{0, 5, 0};
+    const ChunkPos above{0, 6, 0};
+    const ChunkPos below{0, 4, 0};
+    const ChunkPos acrossZ{0, 5, 1};
+    for (const ChunkPos& position : {shadowed, above, below, acrossZ}) {
+        const ChunkPtr chunk = chunks.find(position);
+        REQUIRE(chunk != nullptr);
+        chunk->clearRemeshFlag();
+    }
+
+    // Interior of its own section (local 16, 8, 16), so nothing here is a seam
+    // edit: every dirty flag observed below comes from the light pass.
+    REQUIRE(fixture.world.setBlock(BlockPos{16, 200, 16}, blocks::Stone) == EditResult::Applied);
+
+    // The shaft runs down the middle of the column, so the light that changed
+    // never reaches a Z face - and no neighbour across Z has any reason to
+    // remesh. This is the assertion the overflow used to fail.
+    CHECK_FALSE(chunks.find(acrossZ)->needsRemesh());
+
+    // The sections the shadow actually crossed, and their vertical neighbours,
+    // do have to remesh: each one samples the other's light as its skirt.
+    CHECK(chunks.find(shadowed)->needsRemesh());
+    CHECK(chunks.find(below)->needsRemesh());
+    CHECK(chunks.find(above)->needsRemesh());
 }

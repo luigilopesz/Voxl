@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
+#include <string>
 #include <string_view>
 #include <system_error>
 
@@ -62,15 +64,25 @@ void logUsage()
         "  --pos X,Y,Z          place the player's feet here instead of the spawn point\n"
         "  --look YAW,PITCH     degrees; yaw 0 faces -Z, 180 faces +Z, 270 faces +X\n"
         "  --freeze             suspend player physics so the camera cannot drift\n"
+        "                       (also freezes the day/night cycle)\n"
         "  --overlay            open the F3 panel at startup\n"
         "  --no-hud             hide the hotbar and crosshair\n"
         "  --lod-off            pin every chunk to level 0\n"
         "  --lod-bands A,B,C    LodPolicy::bandStart\n"
         "  --radius N           streaming load radius in chunks\n"
-        "  --seed N             terrain seed\n"
+        "  --seed N             terrain seed (ignored when the save records one)\n"
         "  --warmup-ms N        milliseconds of streaming before the first frame\n"
         "  --carve WHAT         none | crater | tunnel | both\n"
-        "  --carve-at X,Y,Z     anchor block for the carve rig");
+        "  --carve-at X,Y,Z     anchor block for the carve rig\n"
+        "  --time SPEC          13:30 | noon | midnight | dawn | dusk | 0.5\n"
+        "  --day-length MIN     minutes of wall clock per full day\n"
+        "  --freeze-time        hold the day/night cycle where it starts\n"
+        "  --no-light           stream with no light propagation at all\n"
+        "  --settings PATH      settings file to read and write\n"
+        "  --save-dir PATH      root directory holding world save folders\n"
+        "  --world NAME         world folder to open under the save root\n"
+        "  --no-save            run with no persistence: nothing is read or written\n"
+        "  --menu               open on the title screen instead of a world");
 }
 
 /// Exit rather than Run after `--help`, so asking for the usage text does not
@@ -115,6 +127,66 @@ enum class ParseResult : std::uint8_t { Run, Exit, Failed };
         }
         if (argument == "--lod-off") {
             debug.lodEnabled = false;
+            continue;
+        }
+        if (argument == "--freeze-time") {
+            debug.freezeTime = true;
+            continue;
+        }
+        if (argument == "--no-light") {
+            config.streaming.lighting = false;
+            continue;
+        }
+        if (argument == "--no-save") {
+            config.persistence = false;
+            continue;
+        }
+        if (argument == "--menu") {
+            config.startInMainMenu = true;
+            continue;
+        }
+        if (argument == "--settings") {
+            if (!value(text)) {
+                VOXL_LOG_ERROR("--settings wants a path");
+                return ParseResult::Failed;
+            }
+            config.settingsPath = std::filesystem::path{text};
+            continue;
+        }
+        if (argument == "--save-dir") {
+            if (!value(text)) {
+                VOXL_LOG_ERROR("--save-dir wants a path");
+                return ParseResult::Failed;
+            }
+            config.savesRoot = std::filesystem::path{text};
+            continue;
+        }
+        if (argument == "--world") {
+            if (!value(text)) {
+                VOXL_LOG_ERROR("--world wants a folder name");
+                return ParseResult::Failed;
+            }
+            config.worldName = std::string{text};
+            continue;
+        }
+        if (argument == "--time") {
+            float when = 0.0f;
+            if (!value(text) || !voxl::parseTimeOfDay(text, when)) {
+                VOXL_LOG_ERROR("--time wants HH:MM, a name (noon/midnight/dawn/dusk) or a "
+                               "fraction");
+                return ParseResult::Failed;
+            }
+            debug.hasTime   = true;
+            debug.timeOfDay = when;
+            continue;
+        }
+        if (argument == "--day-length") {
+            float minutes = 0.0f;
+            if (!value(text) || !parseList(text, &minutes, 1) || minutes <= 0.0f) {
+                VOXL_LOG_ERROR("--day-length wants a positive minute count");
+                return ParseResult::Failed;
+            }
+            config.dayLengthMinutesOverride = minutes;
             continue;
         }
         if (argument == "--pos") {
@@ -183,15 +255,20 @@ enum class ParseResult : std::uint8_t { Run, Exit, Failed };
                 return ParseResult::Failed;
             }
             config.streaming.loadRadius = radius;
+            config.radiusOverridden     = true;
             continue;
         }
         if (argument == "--seed") {
-            std::int32_t seed = 0;
-            if (!value(text) || !parseInt(text, seed)) {
-                VOXL_LOG_ERROR("--seed wants an integer");
+            // 64-bit, matching TerrainSettings::seed and the region header. A
+            // 32-bit parse here would silently make "--seed <big>" a different
+            // world from the one whose regions carry that seed.
+            std::uint64_t seed = 0;
+            if (!value(text) || !parseList(text, &seed, 1)) {
+                VOXL_LOG_ERROR("--seed wants a non-negative 64-bit integer");
                 return ParseResult::Failed;
             }
-            config.terrain.seed = static_cast<std::uint32_t>(seed);
+            config.terrain.seed   = seed;
+            config.seedOverridden = true;
             continue;
         }
         if (argument == "--warmup-ms") {

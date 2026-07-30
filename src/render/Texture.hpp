@@ -61,6 +61,15 @@ public:
     [[nodiscard]] int    mipLevels() const noexcept { return m_mipLevels; }
     /// Anisotropy actually applied, 1.0 when the extension is unavailable.
     [[nodiscard]] float  anisotropy() const noexcept { return m_anisotropy; }
+
+    /// Re-requests anisotropic filtering on an already-created array.
+    ///
+    /// Safe on immutable storage: GL_TEXTURE_MAX_ANISOTROPY is sampler state,
+    /// not storage state, so this needs no reallocation and no re-upload - which
+    /// is what lets the settings slider apply live instead of at the next
+    /// launch. The request is clamped to what the driver reports; read
+    /// `anisotropy()` afterwards for what was actually granted.
+    void setAnisotropy(float requested);
     /// Bytes of mip 0 across all layers, times 4/3 for the mip tail. Approximate;
     /// the driver's real footprint is not queryable.
     [[nodiscard]] std::size_t estimatedBytes() const noexcept;

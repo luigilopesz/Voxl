@@ -9,9 +9,11 @@
 namespace voxl {
 namespace {
 
-/// Cap on anisotropic samples. Beyond 8x the cost keeps rising and the visible
-/// difference on a 32x32 texture does not, so the cap is a straight win.
-constexpr float kMaxAnisotropy = 8.0f;
+/// Default anisotropic samples. Beyond 8x the cost keeps rising and the visible
+/// difference on a 32x32 texture does not, so this is where `create()` starts.
+/// It is a default and no longer a ceiling: `setAnisotropy` lets the settings
+/// slider ask for more, bounded only by the driver.
+constexpr float kDefaultAnisotropy = 8.0f;
 
 [[nodiscard]] bool anisotropySupported() noexcept
 {
@@ -119,11 +121,30 @@ void TextureArray::applySampling()
     if (anisotropySupported()) {
         GLfloat driverMax = 1.0f;
         glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &driverMax);
-        m_anisotropy = std::min(driverMax, kMaxAnisotropy);
+        m_anisotropy = std::min(driverMax, kDefaultAnisotropy);
         if (m_anisotropy > 1.0f) {
             glTextureParameterf(m_id, GL_TEXTURE_MAX_ANISOTROPY, m_anisotropy);
         }
     }
+}
+
+void TextureArray::setAnisotropy(float requested)
+{
+    if (m_id == 0 || !anisotropySupported()) {
+        return;
+    }
+
+    GLfloat driverMax = 1.0f;
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &driverMax);
+    // Below 1 is not "off", it is an invalid value the driver may reject
+    // outright, so the floor is 1.0 rather than 0.
+    const float granted = std::clamp(requested, 1.0f, driverMax);
+    if (granted == m_anisotropy) {
+        return;
+    }
+
+    m_anisotropy = granted;
+    glTextureParameterf(m_id, GL_TEXTURE_MAX_ANISOTROPY, m_anisotropy);
 }
 
 void TextureArray::uploadLayer(int layer, const std::uint8_t* rgba, int width, int height)

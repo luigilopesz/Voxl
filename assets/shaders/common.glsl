@@ -72,6 +72,17 @@ float voxlNoise(vec2 p)
 /// not toward a single flat fog colour. That is what makes distant terrain
 /// dissolve into the sky instead of into a grey band that is visibly the wrong
 /// shade wherever the gradient is not average.
+///
+/// INVARIANT - THIS FUNCTION IS THE FOG COLOUR, SO IT MUST STAY LOW-FREQUENCY.
+/// It is called by chunk.frag, subvoxel.frag and water.frag as the colour their
+/// geometry resolves into, and by sky.frag as the sky's own base. Anything added
+/// here is therefore painted onto SOLID GEOMETRY as well as onto the dome. Only
+/// terms that vary smoothly with direction may live here - the gradient, the
+/// ground haze, the scattering halo and the sun disc, all of which fogged
+/// geometry genuinely must converge to. A term driven by a hash, by a lattice or
+/// by VOXL_TIME must not: it has no meaning on a mountainside. Decoration of
+/// that kind belongs in sky.frag, which is the only shader that draws the dome
+/// and nothing else.
 vec3 voxlSkyColour(vec3 dir)
 {
     float up = clamp(dir.y, -1.0, 1.0);
@@ -100,15 +111,23 @@ vec3 voxlSkyColour(vec3 dir)
     float disc = smoothstep(0.99965, 0.99992, cosSun);
     sky += VOXL_SUN_COLOUR * disc * 12.0;
 
-    float night = 1.0 - VOXL_DAY;
-    if (night > 0.01) {
-        // Stars live on a fixed 3D lattice sampled by the view direction, so they
-        // stay put as the camera turns and no projection seam is visible.
-        vec3  cell = floor(dir * 220.0);
-        float star = voxlHash13(cell);
-        float twinkle = 0.65 + 0.35 * sin(VOXL_TIME * 2.3 + star * 40.0);
-        sky += vec3(0.9, 0.92, 1.0) * smoothstep(0.9975, 1.0, star) * twinkle * night;
-    }
+    // NO STARS HERE, AND NOTHING ELSE HIGH-FREQUENCY EITHER. See the invariant
+    // note above this function: sky.frag owns the star field exclusively.
+    //
+    // A star field used to live at this point. It was wrong twice over. It was
+    // drawn a second time by sky.frag's starField(), and - far worse - because
+    // chunk.frag, subvoxel.frag and water.frag all resolve their fog toward THIS
+    // function, every one of those stars was also painted onto solid geometry and
+    // onto water at whatever distance the fog had saturated. It was additionally
+    // a lattice-cell threshold with no sub-cell placement, so each "star" was a
+    // hard-edged axis-aligned rectangle the size of a whole cell's projected
+    // footprint rather than a point.
+    //
+    // Only the sun disc and its halo stay in the shared function, and they belong
+    // here: they are what fully fogged geometry must converge to for the horizon
+    // to have no seam. Stars do not have that property, because starField()
+    // already fades them out over exactly the low-altitude band where fogged
+    // terrain sits.
     return sky;
 }
 

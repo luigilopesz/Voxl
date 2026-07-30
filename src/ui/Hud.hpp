@@ -79,6 +79,10 @@ private:
     void drawCrosshair(const InteractionState& interaction);
     void drawHotbar(const Hotbar& hotbar);
     void drawSelectionLabel(const Hotbar& hotbar);
+    /// "Break" / "Drill r1.5 (33 sv)" just above the hotbar. Always visible
+    /// rather than transient: which verb the mouse button is bound to is
+    /// persistent state, and a player who cannot see it has to swing to find out.
+    void drawModeLabel(const InteractionState& interaction);
 
     /// Advances the label fade and notices a slot change.
     void updateSelectionLabel(const Hotbar& hotbar, float deltaSeconds);

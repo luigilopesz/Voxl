@@ -43,7 +43,21 @@ public:
     /// (wheel away from the user) moves towards *lower* slot indices, which is
     /// the direction every other first-person voxel game uses. Wraps, and
     /// handles the multi-notch deltas a high-resolution wheel reports.
+    ///
+    /// A no-op while the bar is cycle-locked; see `setCycleLocked`.
     void cycle(int delta) noexcept;
+
+    /// Stands the bar down from the mouse wheel.
+    ///
+    /// The sub-voxel mining mode needs a continuous dial for its brush radius
+    /// and the wheel is the only one a first-person layout has spare. Rather
+    /// than have the input layer decide per frame whether to call `cycle` at
+    /// all - which is the sort of split rule that ends up implemented twice and
+    /// differently - the bar is told to release the wheel, and the number row
+    /// keeps working throughout. Selecting a slot directly is never blocked:
+    /// locking the wheel must not lock the player out of their blocks.
+    void setCycleLocked(bool locked) noexcept { m_cycleLocked = locked; }
+    [[nodiscard]] bool cycleLocked() const noexcept { return m_cycleLocked; }
 
     /// Number-row selection. `digit` is 1-9 as printed on the key. Returns false
     /// for anything else so a caller can chain this into a key dispatcher
@@ -54,7 +68,8 @@ public:
 
 private:
     std::array<BlockId, kSlotCount> m_slots{};
-    std::size_t                     m_selected = 0;
+    std::size_t                     m_selected    = 0;
+    bool                            m_cycleLocked = false;
 };
 
 }  // namespace voxl

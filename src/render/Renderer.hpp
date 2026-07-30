@@ -147,6 +147,15 @@ public:
     /// contrast right where streaming stops.
     void setFogFromViewDistance(float blocks) noexcept;
 
+    /// Live-applies the anisotropy setting to the block texture array. Sampler
+    /// state only - no reallocation, no re-upload. Safe to call every frame,
+    /// though the settings panel only calls it when the slider moves.
+    void setTextureAnisotropy(float requested) { m_blockTextures.setAnisotropy(requested); }
+    [[nodiscard]] float textureAnisotropy() const noexcept
+    {
+        return m_blockTextures.anisotropy();
+    }
+
     /// Clears, and uploads the frame uniform block. `timeSeconds` drives the
     /// water animation and the star twinkle; it must be monotonic but its origin
     /// does not matter.

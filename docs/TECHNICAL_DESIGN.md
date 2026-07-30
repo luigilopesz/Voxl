@@ -484,15 +484,63 @@ hidden-face removal; the mesher must not reimplement it.
 
 ---
 
-## 10. Persistence outline
+## 10. Persistence
 
-Not yet implemented; the contracts above already fix its shape.
+Implemented in `world/RegionFile.{hpp,cpp}` (the on-disk container) and
+`world/WorldSave.{hpp,cpp}` (the chunk codec, the async write queue and the
+world metadata file).
 
-* Unit of storage is the `ColumnPos` - a whole vertical column, loaded and saved
-  together.
-* A section serialises as: state byte, `bitsPerIndex`, palette length, palette
-  (`uint16` each), packed index words (`uint64` each, little-endian), then the
-  light bytes. Uniform sections write the single id and no index array.
+* Unit of storage is the **section**, not the column: a chunk is addressed
+  individually inside a 16x16-column region file (`r.<x>.<z>.vxr`, 2048 entries).
+* A section serialises as a 16-byte header (magic, length, CRC) plus
+  `bitsPerIndex`, a `uint32` palette count, the palette (`uint16` each), packed
+  index words (`uint64`, little-endian), a light-encoding byte with an RLE
+  option, and a sub-voxel damage table. Uniform sections write the single id and
+  no index array.
 * Voxel order inside a section is `localIndex` order (x fastest, then z, then y).
+* Only level-0 chunks are ever written; coarser levels are a downsample the seed
+  reproduces exactly.
+* **Encoding happens on the main thread, only the write is async.** Reading a
+  chunk's voxels from a worker while the main thread edits it is precisely the
+  use-after-free of section 3.2, so `saveChunk()` produces a self-contained byte
+  buffer on the main thread and the worker job never touches a `Chunk` again.
+* **Crash safety is allocate-then-commit**, not temp-and-rename: sectors no live
+  table entry references are written and flushed, then the 8-byte table entry is
+  rewritten. A crash before the commit orphans sectors (reclaimed on the next
+  open) and leaves the old chunk readable. The metadata file, being small and
+  rewritten wholesale, does use temp-and-rename.
+* Every corruption mode - bad magic, bad CRC, truncation, an offset past EOF, a
+  foreign seed, a newer format version - yields `ChunkLoadStatus::Corrupt`,
+  leaves the chunk untouched, and regenerates it from the seed.
 * The format carries a version; block-id remapping on upgrade is by name via
-  `BlockRegistry::findByName`.
+  `BlockRegistry::findByName` and is a v2 concern (only version 1 exists).
+* Light is **not** restored from disk. It is derived data: a loaded chunk arrives
+  unlit and is re-lit by the normal pipeline, which is also why a light write
+  deliberately does not set `Chunk::needsSave()`.
+
+## 11. Lighting
+
+Implemented in `world/LightEngine.{hpp,cpp}`. The 4-bit sunlight / 4-bit block
+light per voxel described in section 5 was always stored and always rendered;
+this is what fills it.
+
+* **The unit of work is a whole column, not a section.** Sunlight is vertical:
+  the level entering the top of section `y` is whatever left the bottom of
+  section `y + 1`. Lighting sections independently would force a strict top-down
+  order of one section per streaming update. One column job makes the sky exact
+  in a single pass.
+* Levels 0 and 1 get a full flood; levels 2 and 3 get a top-down sky sweep only.
+* A damaged (sub-voxel) block is treated as fully transparent.
+* **The `lit` flag is a residency-slot flag, not a chunk state.** Making an unlit
+  chunk *busy* would also make it un-retirable, and a column the player walks
+  away from mid-generation would strand its sections forever. Unlit chunks are
+  ordinary `Generated` chunks that `findReadable()` and `captureNeighbourhood()`
+  skip.
+* The rule of section 3.2 extends to lighting rather than bending: a column job
+  registers its column, `isRegionBusy()` reports it alongside meshing chunks, and
+  the main-thread incremental pass reaches chunks through
+  `ChunkManager::findReadableMutable()` so it can never read one a worker owns.
+* Time of day does **not** re-light. The stored sunlight nibble means "sky
+  exposure"; `world/DayNightCycle` scales what the sky is *worth* through
+  `SkySettings::sunIntensity` and `ambientColour`. A world-wide relight is ~70 us
+  per chunk and there are ten thousand of them.

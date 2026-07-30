@@ -3,9 +3,11 @@
 #include <glad/gl.h>
 
 #include "core/Log.hpp"
+#include "physics/SubVoxelAccess.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <utility>
 
 #include <glm/gtc/type_ptr.hpp>
@@ -347,6 +349,44 @@ BlockInteraction::~BlockInteraction() = default;
 void BlockInteraction::setRaycaster(RaycastFn raycaster) { m_raycast = std::move(raycaster); }
 void BlockInteraction::setBlockWriter(BlockWriteFn writer) { m_write = std::move(writer); }
 void BlockInteraction::setBlockReader(BlockReadFn reader) { m_read = std::move(reader); }
+void BlockInteraction::setSubVoxelBreaker(SubVoxelBreakFn carve) { m_carve = std::move(carve); }
+void BlockInteraction::setSubVoxelDamageReader(SubVoxelDamagedFn damaged)
+{
+    m_damaged = std::move(damaged);
+}
+
+void BlockInteraction::setMiningMode(MiningMode mode) noexcept
+{
+    if (m_tool.mode() == mode) {
+        return;
+    }
+    m_tool.setMode(mode);
+    // See BreakTarget: a swing belongs to a (target, mode) pair.
+    resetBreakProgress();
+}
+
+MiningMode BlockInteraction::toggleMiningMode() noexcept
+{
+    setMiningMode(m_tool.mode() == MiningMode::WholeBlock ? MiningMode::SubVoxel
+                                                          : MiningMode::WholeBlock);
+    return m_tool.mode();
+}
+
+void BlockInteraction::setBrushRadius(float subVoxels) noexcept
+{
+    const float before = m_tool.brushRadius();
+    m_tool.setBrushRadius(subVoxels);
+    if (m_tool.brushRadius() != before) {
+        // Widening the brush mid-swing would remove sub-voxels the player had
+        // not aimed at when they pressed the button.
+        resetBreakProgress();
+    }
+}
+
+void BlockInteraction::adjustBrushRadius(int steps) noexcept
+{
+    setBrushRadius(m_tool.brushRadius() + static_cast<float>(steps) * MiningTool::kBrushRadiusStep);
+}
 
 void BlockInteraction::setReach(float blocks) noexcept
 {
@@ -371,6 +411,89 @@ void BlockInteraction::resetBreakProgress() noexcept
     m_state.breakStage    = -1;
 }
 
+void BlockInteraction::updateSubTarget() noexcept
+{
+    m_state.hasSubTarget = false;
+    m_state.subTarget    = glm::ivec3{0};
+    if (!m_state.hasTarget) {
+        return;
+    }
+
+    // The hit point lies exactly ON the block face, where the scaled sub-voxel
+    // coordinate is 0 or 8 and a rounding error can land it on either side.
+    // Stepping half a sub-voxel along the inward normal puts it unambiguously
+    // inside the block the ray actually hit; `subVoxelOfPoint` then clamps, so
+    // even a pathological hit point cannot address a neighbour's grid.
+    const glm::vec3 inward =
+        -kDirectionNormals[static_cast<std::size_t>(m_state.hit.face)] * (0.5f * kSubVoxelSize);
+    m_state.subTarget = physics::subVoxelOfPoint(m_state.hit.point + inward, m_state.hit.block);
+    m_state.hasSubTarget = true;
+}
+
+bool BlockInteraction::canCarveTarget() const noexcept
+{
+    if (m_tool.mode() != MiningMode::SubVoxel || !m_carve || !m_state.hasSubTarget) {
+        return false;
+    }
+    // World::editSubVoxel refuses anything that is not RenderLayer::Opaque - the
+    // sub-voxel pass has no alpha cutoff, so a chipped pane of glass would come
+    // back as a solid one. Asking the registry the same question here rather
+    // than discovering it from a refusal is what lets the fallback happen on the
+    // frame the player aims at the glass, instead of after a whole brush of
+    // rejected edits that changed nothing and left the button feeling dead.
+    return m_registry->renderLayer(m_state.hit.blockId) == RenderLayer::Opaque;
+}
+
+void BlockInteraction::noteFallback(const BlockPos& block, BlockId id)
+{
+    // Keyed on the block, because this runs every frame the button is held.
+    if (m_loggedFallback && m_loggedFallbackBlock == block) {
+        return;
+    }
+    m_loggedFallbackBlock = block;
+    m_loggedFallback      = true;
+    VOXL_LOG_DEBUG("drill: {} cannot be carved (not opaque); breaking the whole block instead",
+                   m_registry->get(id).name);
+}
+
+std::size_t BlockInteraction::applyBrush()
+{
+    if (!m_carve || !m_state.hasSubTarget) {
+        return 0;
+    }
+
+    const physics::SubVoxelCoord centre =
+        physics::toGlobalSubVoxel(m_state.hit.block, m_state.subTarget);
+
+    std::size_t carved = 0;
+    for (const glm::ivec3& offset : m_tool.stencil()) {
+        const physics::SubVoxelCoord cell = centre.offset(offset.x, offset.y, offset.z);
+
+        // A brush is a ball, so it spills across block boundaries whenever the
+        // player drills near a face - which is most of the time, and is the
+        // point: a bore has to be able to cross into the next block. Skipping
+        // the cells that cannot be carved here rather than letting the world
+        // refuse them keeps the refusal off the world's deferral queue and makes
+        // the returned count mean what it says.
+        if (m_read) {
+            const BlockId id = m_read(cell.block());
+            if (id == blocks::Air || m_registry->renderLayer(id) != RenderLayer::Opaque) {
+                continue;
+            }
+        }
+
+        // The centre of the cell: the one point inside it that cannot floor into
+        // a neighbour whichever way the arithmetic rounds.
+        const glm::vec3 point{(static_cast<float>(cell.x) + 0.5f) * kSubVoxelSize,
+                              (static_cast<float>(cell.y) + 0.5f) * kSubVoxelSize,
+                              (static_cast<float>(cell.z) + 0.5f) * kSubVoxelSize};
+        if (m_carve(point) == CarveOutcome::Carved) {
+            ++carved;
+        }
+    }
+    return carved;
+}
+
 PlaceResult BlockInteraction::evaluatePlacement(const BlockPos& target) const noexcept
 {
     // `Placed` here means "nothing objects"; the write has not happened yet.
@@ -382,6 +505,17 @@ PlaceResult BlockInteraction::evaluatePlacement(const BlockPos& target) const no
     }
     if (!m_write) {
         return PlaceResult::NoWorldSink;
+    }
+
+    // Checked before the block id, because a partially destroyed cell still
+    // reads as its original block and would otherwise report the vaguer
+    // `Occupied`. The rule itself matters more than the message: writing a whole
+    // block over a damaged one DISCARDS its sub-voxel grid - World::writeBlock
+    // does that deliberately, because a grid whose material no longer matches
+    // ChunkStorage violates the SubVoxel.hpp invariant - so a stray right click
+    // would silently erase a bore the player just spent ten seconds drilling.
+    if (m_damaged && m_damaged(target)) {
+        return PlaceResult::Damaged;
     }
 
     // Without a reader we cannot know what is in the cell. Being permissive is
@@ -407,8 +541,16 @@ PlaceResult BlockInteraction::evaluatePlacement(const BlockPos& target) const no
 void BlockInteraction::update(const Camera& camera, const InteractionInput& input,
                               float deltaSeconds)
 {
-    m_state.lastPlace = PlaceResult::None;
-    m_state.lastBreak = BreakResult::None;
+    m_state.lastPlace        = PlaceResult::None;
+    m_state.lastBreak        = BreakResult::None;
+    m_state.lastCarveCount   = 0;
+    m_state.subVoxelFallback = false;
+
+    // Mirrored every frame so the HUD reads one snapshot rather than reaching
+    // into the tool.
+    m_state.miningMode  = m_tool.mode();
+    m_state.brushRadius = m_tool.brushRadius();
+    m_state.brushVolume = m_tool.brushVolume();
 
     const float dt = std::max(deltaSeconds, 0.0f);
 
@@ -424,6 +566,8 @@ void BlockInteraction::update(const Camera& camera, const InteractionInput& inpu
 
     const BlockType& targetType = m_registry->get(m_state.hit.blockId);
     m_state.targetUnbreakable   = hasTarget && targetType.hardness < 0.0f;
+
+    updateSubTarget();
 
     if (hasTarget) {
         m_state.placeTarget  = neighbour(hit.block, hit.face);
@@ -446,24 +590,50 @@ void BlockInteraction::update(const Camera& camera, const InteractionInput& inpu
         m_state.lastBreak = BreakResult::NoWorldSink;
         resetBreakProgress();
     } else {
-        // Looking away restarts the timer: progress is per-block, never a global
-        // "time spent holding the button".
-        if (!m_breakingValid || !(m_breakingBlock == hit.block)) {
-            m_breakingBlock = hit.block;
+        // Whether THIS swing drills or breaks. The tool's mode is only a
+        // request: a material the sub-voxel pass cannot draw falls back to a
+        // whole-block break rather than refusing to do anything, so the button
+        // never feels dead.
+        const bool carving = canCarveTarget();
+        m_state.subVoxelFallback = m_tool.mode() == MiningMode::SubVoxel && !carving;
+        if (m_state.subVoxelFallback && m_carve) {
+            noteFallback(hit.block, hit.blockId);
+        }
+
+        // Looking away restarts the timer: progress belongs to the target, never
+        // to a global "time spent holding the button".
+        const BreakTarget target{hit.block, m_state.subTarget, carving};
+        if (!m_breakingValid || !(m_breakTarget == target)) {
+            m_breakTarget   = target;
             m_breakingValid = true;
             m_breakElapsed  = 0.0f;
         }
         m_breakElapsed += dt;
 
-        const float total = targetType.hardness * kBreakSecondsPerHardness;
+        // Hardness drives both modes; a carve is a fixed fraction of a full
+        // break of the same material. The fallback is timed as the whole-block
+        // break it actually is, which is why the effective mode is passed rather
+        // than the tool's.
+        const float total = miningActionSeconds(
+            carving ? MiningMode::SubVoxel : MiningMode::WholeBlock, targetType.hardness,
+            kBreakSecondsPerHardness);
+
         if (total <= 0.0f || m_breakElapsed >= total) {
-            const bool written = m_write(hit.block, blocks::Air);
+            if (carving) {
+                const std::size_t carved = applyBrush();
+                m_state.lastCarveCount   = carved;
+                m_state.lastBreak = carved > 0 ? BreakResult::Carved : BreakResult::CarveRefused;
+            } else {
+                const bool written = m_write(hit.block, blocks::Air);
+                m_state.lastBreak  = written ? BreakResult::Broken : BreakResult::WriteFailed;
+            }
+            // Clearing the timer is what makes a held button drill continuously:
+            // the next frame starts a fresh swing against whatever is left.
             resetBreakProgress();
-            // Show the effect fully formed on the frame the block gives way,
+            // Show the effect fully formed on the frame the target gives way,
             // otherwise an instant-break block never renders a break state.
             m_state.breakProgress = 1.0f;
             m_state.breakStage    = kBreakStageCount - 1;
-            m_state.lastBreak     = written ? BreakResult::Broken : BreakResult::WriteFailed;
         } else {
             const float progress  = std::clamp(m_breakElapsed / total, 0.0f, 1.0f);
             m_state.breakProgress = progress;
@@ -515,26 +685,68 @@ void BlockInteraction::render(const glm::mat4& viewProjection)
     const glm::vec3 blockOrigin{static_cast<float>(m_state.hit.block.x),
                                 static_cast<float>(m_state.hit.block.y),
                                 static_cast<float>(m_state.hit.block.z)};
-    const float     progress = m_state.breakProgress;
+    const float progress = m_state.breakProgress;
+
+    // A drill that has fallen back to a whole-block break must not draw a brush:
+    // showing a footprint the swing is not going to use is worse than showing
+    // nothing, because it tells the player the material can be carved.
+    const bool drilling = m_state.miningMode == MiningMode::SubVoxel &&
+                          !m_state.subVoxelFallback && m_state.hasSubTarget;
+
+    // Bounds of the brush footprint, in world units. The stencil is a ball, so
+    // this box is its bounding cube - close enough to communicate reach, and one
+    // draw instead of up to 257.
+    glm::vec3 brushOrigin{0.0f};
+    glm::vec3 brushSize{0.0f};
+    if (drilling) {
+        const auto      extent = static_cast<float>(m_tool.brushExtent());
+        const glm::vec3 sub{static_cast<float>(m_state.subTarget.x),
+                            static_cast<float>(m_state.subTarget.y),
+                            static_cast<float>(m_state.subTarget.z)};
+        brushOrigin = blockOrigin + (sub - glm::vec3{extent}) * kSubVoxelSize;
+        brushSize   = glm::vec3{(2.0f * extent + 1.0f) * kSubVoxelSize};
+    }
+
+    // What the shrinking progress box collapses into: the brush when drilling,
+    // the whole block otherwise. The box has to describe the thing that is about
+    // to disappear, or progress reads as a whole-block break in drill mode.
+    const glm::vec3 targetOrigin = drilling ? brushOrigin : blockOrigin;
+    const glm::vec3 targetSize   = drilling ? brushSize : glm::vec3{1.0f};
+
+    const bool unbreakable = m_state.targetUnbreakable;
 
     m_selection->draw(viewProjection, [&](const SelectionRenderer& renderer) {
+        // Dull red for a block that will never give way. Without it a player
+        // holding the button on bedrock gets no feedback whatsoever, because the
+        // break timer legitimately never starts and the outline looks the same
+        // as it does on stone.
+        const glm::vec4 outline = unbreakable ? glm::vec4{0.60f, 0.10f, 0.10f, 0.85f}
+                                              : glm::vec4{0.04f, 0.04f, 0.04f, 0.75f};
         renderer.drawBox(blockOrigin - glm::vec3{kOutlineInflate},
-                         glm::vec3{1.0f + 2.0f * kOutlineInflate},
-                         glm::vec4{0.04f, 0.04f, 0.04f, 0.75f});
+                         glm::vec3{1.0f + 2.0f * kOutlineInflate}, outline);
+
+        // Depth testing is off for every box below. They live *inside* a solid
+        // voxel, so a depth-tested draw would be entirely occluded by the very
+        // block it is describing. Nothing can be between the eye and the
+        // targeted block along the view ray - that is what made it the target -
+        // so drawing them unconditionally is safe.
+        if (drilling) {
+            // The exact footprint of the next swing, which is what turns the
+            // brush radius from a number in the HUD into a dial the player aims.
+            renderer.setDepthTest(false);
+            renderer.drawBox(brushOrigin - glm::vec3{kOutlineInflate},
+                             brushSize + glm::vec3{2.0f * kOutlineInflate},
+                             glm::vec4{0.30f, 0.85f, 1.0f, 0.75f});
+            renderer.setDepthTest(true);
+        }
 
         if (progress > 0.0f) {
-            // Shrinking box centred on the voxel: the visual stand-in for a
-            // crack overlay until the texture array carries the crack strip.
-            //
-            // Depth testing is off for this one box. It lives *inside* a solid
-            // voxel, so a depth-tested draw would be entirely occluded by the
-            // very block it is describing. Nothing can be between the eye and
-            // the targeted block along the view ray - that is what made it the
-            // target - so drawing it unconditionally is safe.
-            const float     scale = 1.0f - kBreakShrink * progress;
-            const glm::vec3 size{scale};
-            const glm::vec3 origin = blockOrigin + glm::vec3{0.5f} - size * 0.5f;
-            // Cools white -> orange as the block gives way, so progress reads
+            // Shrinking box: the visual stand-in for a crack overlay until the
+            // texture array carries the crack strip.
+            const float     scale  = 1.0f - kBreakShrink * progress;
+            const glm::vec3 size   = targetSize * scale;
+            const glm::vec3 origin = targetOrigin + targetSize * 0.5f - size * 0.5f;
+            // Cools white -> orange as the target gives way, so progress reads
             // even when the box is small.
             const glm::vec4 colour{1.0f, 0.85f - 0.45f * progress, 0.55f - 0.45f * progress, 0.9f};
             renderer.setDepthTest(false);

@@ -64,15 +64,59 @@ constexpr float kHighPriorityDistance = static_cast<float>(2 * kChunkSize);
     return static_cast<std::int32_t>(root);
 }
 
+/// Every live manager, for isChunkNeighbourhoodBusyAnywhere(). Function-local
+/// statics rather than namespace-scope objects so there is no static
+/// initialisation order to reason about: a manager constructed by another
+/// translation unit's static initialiser still finds a built registry.
+///
+/// The mutex costs nothing - the list is touched three times per manager
+/// lifetime and once per chunk encode - but it is not decoration: a manager may
+/// be constructed on a thread that is not the one saving.
+std::mutex& managerRegistryMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<const ChunkManager*>& managerRegistry()
+{
+    static std::vector<const ChunkManager*> registry;
+    return registry;
+}
+
 }  // namespace
+
+bool isChunkNeighbourhoodBusyAnywhere(const ChunkPos& position)
+{
+    std::lock_guard<std::mutex> lock(managerRegistryMutex());
+    for (const ChunkManager* manager : managerRegistry()) {
+        if (manager->isNeighbourhoodBusy(position)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 ChunkManager::ChunkManager(JobSystem& jobs, const StreamingConfig& config) : m_jobs(jobs)
 {
     setConfig(config);
+    {
+        std::lock_guard<std::mutex> lock(managerRegistryMutex());
+        managerRegistry().push_back(this);
+    }
 }
 
 ChunkManager::~ChunkManager()
 {
+    // Unpublished FIRST, before anything else in this destructor can make the
+    // object unfit to answer: from here on nobody outside can reach us, and the
+    // members isNeighbourhoodBusy() reads are still whole.
+    {
+        std::lock_guard<std::mutex>       lock(managerRegistryMutex());
+        std::vector<const ChunkManager*>& registry = managerRegistry();
+        registry.erase(std::remove(registry.begin(), registry.end(), this), registry.end());
+    }
+
     // Order matters. First let the in-flight jobs finish, because they hold a
     // raw `this` and are mid-generate or mid-mesh; only then clear the liveness
     // flag, which is what stops the upload closures still sitting in the
@@ -107,6 +151,14 @@ void ChunkManager::setMeshReleaser(ChunkReleaseFn release)
 void ChunkManager::setRetireHook(ChunkRetireFn retire)
 {
     m_retire = std::move(retire);
+}
+
+void ChunkManager::setLighter(ChunkLighter lighter)
+{
+    VOXL_CHECK(jobsInFlight() == 0, "setLighter() while jobs are in flight");
+    VOXL_CHECK(lighter.valid() || (!lighter.column && !lighter.chunk && !lighter.spill),
+               "ChunkLighter must have all three callables or none");
+    m_lighter = std::move(lighter);
 }
 
 void ChunkManager::setConfig(const StreamingConfig& config)
@@ -171,7 +223,19 @@ ConstChunkPtr ChunkManager::findReadable(const ChunkPos& position) const
 {
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     const auto it = m_chunks.find(position);
-    if (it == m_chunks.end() || !it->second.chunk->hasVoxels()) {
+    // An unlit chunk is deliberately not readable: a worker may be writing its
+    // light right now, and anything that meshed it would bake in the darkness.
+    if (it == m_chunks.end() || !it->second.visible()) {
+        return nullptr;
+    }
+    return it->second.chunk;
+}
+
+ChunkPtr ChunkManager::findReadableMutable(const ChunkPos& position) const
+{
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    const auto it = m_chunks.find(position);
+    if (it == m_chunks.end() || !it->second.visible()) {
         return nullptr;
     }
     return it->second.chunk;
@@ -196,7 +260,7 @@ ChunkNeighbourhood ChunkManager::captureNeighbourhood(const ChunkPos& centre) co
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     return voxl::captureNeighbourhood(centre, [this](const ChunkPos& pos) -> ConstChunkPtr {
         const auto it = m_chunks.find(pos);
-        if (it == m_chunks.end() || !it->second.chunk->hasVoxels()) {
+        if (it == m_chunks.end() || !it->second.visible()) {
             return nullptr;
         }
         return it->second.chunk;
@@ -208,6 +272,43 @@ bool ChunkManager::isStillResident(const ChunkPtr& chunk) const
     std::shared_lock<std::shared_mutex> lock(m_mutex);
     const auto it = m_chunks.find(chunk->position());
     return it != m_chunks.end() && it->second.chunk.get() == chunk.get();
+}
+
+bool ChunkManager::isRegionBusy(const ChunkPos& minChunk, const ChunkPos& maxChunk) const
+{
+    // Both readers reach one chunk beyond what they are working on, so growing
+    // the box by one and testing membership is the same answer as asking
+    // "is any chunk in the box inside somebody's 3x3x3" - in one pass.
+    const std::int32_t minX = minChunk.x - 1;
+    const std::int32_t maxX = maxChunk.x + 1;
+    const std::int32_t minZ = minChunk.z - 1;
+    const std::int32_t maxZ = maxChunk.z + 1;
+    const std::int32_t minY = std::max(0, minChunk.y - 1);
+    const std::int32_t maxY = std::min(kWorldSectionCount - 1, maxChunk.y + 1);
+
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+    if (!m_lightColumns.empty()) {
+        for (std::int32_t z = minZ; z <= maxZ; ++z) {
+            for (std::int32_t x = minX; x <= maxX; ++x) {
+                if (m_lightColumns.find(ColumnPos{x, z}) != m_lightColumns.end()) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    for (std::int32_t y = minY; y <= maxY; ++y) {
+        for (std::int32_t z = minZ; z <= maxZ; ++z) {
+            for (std::int32_t x = minX; x <= maxX; ++x) {
+                const auto it = m_chunks.find(ChunkPos{x, y, z});
+                if (it != m_chunks.end() && it->second.chunk->state() == ChunkState::Meshing) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 // ----------------------------------------------------------------- ranges --
@@ -326,6 +427,10 @@ void ChunkManager::update(const StreamingView& view, std::uint64_t frameIndex)
     m_centre                 = centre;
 
     collect(normalised, centre, frameIndex);
+    // Before dispatch, so a column lit this update is Generated in time for the
+    // next one's meshing pass, and before retireDistant, so a section that has
+    // just been lit can be retired in the same update rather than the next.
+    sweepPendingLight();
     dispatch();
     retireDistant(centre, frameIndex);
 }
@@ -362,7 +467,11 @@ void ChunkManager::collect(const StreamingView& view, const ChunkPos& centre,
 
                 auto it = m_chunks.find(position);
                 if (it == m_chunks.end()) {
-                    it = m_chunks.emplace(position, Slot{Chunk::create(position), 0, 0}).first;
+                    Slot fresh{Chunk::create(position), 0, 0, nullptr};
+                    if (m_lighter.valid()) {
+                        fresh.light = std::make_shared<ChunkLightFlags>();
+                    }
+                    it = m_chunks.emplace(position, std::move(fresh)).first;
                     m_chunksCreated.fetch_add(1, std::memory_order_relaxed);
                 }
 
@@ -387,10 +496,15 @@ void ChunkManager::collect(const StreamingView& view, const ChunkPos& centre,
                 // and therefore subsumes whatever dirtied the chunk.
                 const LodLevel targetLod = lodTargetFor(chunk, state, distanceInChunks);
 
+                // An unlit chunk cannot be meshed: captureNeighbourhood leaves it
+                // out, so the snapshot would be incomplete and dispatchMesh would
+                // refuse it anyway. Testing here saves the 27-entry capture.
+                const bool lit = it->second.lit();
+
                 WorkKind kind = WorkKind::Generate;
                 if (state == ChunkState::Empty && m_generate) {
                     kind = WorkKind::Generate;
-                } else if (m_mesh && state == ChunkState::Generated &&
+                } else if (m_mesh && lit && state == ChunkState::Generated &&
                            neighboursInLoadRange(centre, position)) {
                     kind = WorkKind::Mesh;
                 } else if (targetLod != chunk->lod() && neighboursInLoadRange(centre, position)) {
@@ -495,22 +609,262 @@ bool ChunkManager::dispatchGenerate(const ChunkPtr& chunk, JobPriority priority)
         return false;
     }
 
+    // Captured now rather than looked up in the job: the map entry can be erased
+    // while we run, and the flags have to outlive it so the light scheduler sees
+    // a consistent answer either way.
+    std::shared_ptr<ChunkLightFlags> light;
+    if (m_lighter.valid()) {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        const auto it = m_chunks.find(chunk->position());
+        if (it != m_chunks.end()) {
+            light = it->second.light;
+        }
+    }
+
     noteJobStarted(WorkKind::Generate);
-    m_jobs.submitDetached(priority, [this, alive = m_alive, chunk] {
+    m_jobs.submitDetached(priority, [this, alive = m_alive, chunk, light] {
         if (!alive->load(std::memory_order_acquire)) {
             return;  // the manager is gone; the chunk dies with our shared_ptr
         }
 
         m_generate(*chunk);
 
+        // Published before the light job is offered the column: the flag is what
+        // tells that job the terrain underneath it is final.
+        if (light != nullptr) {
+            light->terrainReady.store(true, std::memory_order_release);
+        }
+
         // Only unloadAll() can steal a busy chunk's state. Losing the CAS means
         // the chunk was retired, so the terrain we just wrote is discarded.
-        if (chunk->tryTransition(ChunkState::Generating, ChunkState::Generated)) {
+        const bool published =
+            chunk->tryTransition(ChunkState::Generating, ChunkState::Generated);
+        if (published) {
             chunk->markDirty();
+        }
+
+        if (light != nullptr && published) {
+            const ChunkPos& position = chunk->position();
+            const ColumnPos column{position.x, position.z};
+
+            // RECORDED, NOT DISPATCHED. This runs on a WORKER, and taking the
+            // light claim here was a race against the main thread's own
+            // check-then-write.
+            //
+            // Every other marker that makes a chunk unwritable - Generating,
+            // Meshing, Unloading - is established on the MAIN THREAD, and that
+            // is precisely what lets World::setBlock ask isEditBlocked() and
+            // then write: nothing can turn the answer from "writable" into
+            // "busy" in between, because the only thread that can do so is the
+            // one asking. A claim taken on a worker breaks that. It could appear
+            // in m_lightColumns after isEditBlocked() said yes and before the
+            // write landed, and the light job would then read - and write - a
+            // chunk the main thread was mutating, which is invariant 1 defeated
+            // in both directions at once.
+            //
+            // sweepPendingLight() already runs on the main thread every update
+            // and already knows how to start these, so the fix is to let it. The
+            // cost is one update of latency on a freshly completed column, which
+            // is a frame of a chunk staying unlit and therefore unmeshed; the
+            // benefit is that a claim can only ever appear while the main thread
+            // is between an isEditBlocked() and nothing at all.
+            std::unique_lock<std::shared_mutex> lock(m_mutex);
+            m_lightPending.insert(column);
         }
         noteJobFinished(WorkKind::Generate);
     });
     return true;
+}
+
+// ---------------------------------------------------------------- lighting --
+
+bool ChunkManager::claimColumnLight(const ColumnPos& column, ColumnLightJob& job, bool tolerant)
+{
+    // THE CLAIM IS A MAIN-THREAD-ONLY ACT. Entering m_lightColumns is what makes
+    // isNeighbourhoodBusy() - and through it World::isEditBlocked() - say no, and
+    // the main thread's check-then-write pattern is only sound while it is the
+    // sole thread that can make that answer change. See dispatchGenerate.
+    VOXL_CHECK(!m_jobs.onWorkerThread(), "claimColumnLight() called from a worker thread");
+
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+
+    if (m_lightColumns.find(column) != m_lightColumns.end()) {
+        return false;  // already being lit
+    }
+
+    LightColumnWork& work = job.work;
+    work.column           = column;
+    work.targets.fill(nullptr);
+    work.region.fill(nullptr);
+    job.flags.fill(nullptr);
+
+    bool anyTarget  = false;
+    bool anyPending = false;
+    for (std::int32_t y = 0; y < kWorldSectionCount; ++y) {
+        const auto it = m_chunks.find(ChunkPos{column.x, y, column.z});
+        if (it == m_chunks.end()) {
+            continue;  // outside the vertical radius; treated as an unknown wall
+        }
+
+        const ChunkPtr& chunk = it->second.chunk;
+        if (it->second.visible()) {
+            work.region[LightColumnWork::regionIndex(0, 0, y)] = chunk;
+            continue;
+        }
+        const bool ready = it->second.light != nullptr &&
+                           it->second.light->terrainReady.load(std::memory_order_acquire) &&
+                           chunk->hasVoxels();
+        if (!ready) {
+            // No terrain here yet. Waiting for it is what makes the sky exact in
+            // one pass, so the strict caller backs off and tries again; the
+            // tolerant one treats the section as a wall and lights the rest.
+            if (!tolerant) {
+                return false;
+            }
+            anyPending = true;
+            continue;
+        }
+        work.targets[static_cast<std::size_t>(y)]          = chunk;
+        work.region[LightColumnWork::regionIndex(0, 0, y)] = chunk;
+        job.flags[static_cast<std::size_t>(y)]             = it->second.light;
+        anyTarget                                          = true;
+    }
+
+    if (!anyTarget) {
+        // Nothing left to light: either the sections were retired, or another
+        // job got here first. Either way this column is no longer outstanding.
+        m_lightPending.erase(column);
+        return false;
+    }
+    if (!anyPending) {
+        m_lightPending.erase(column);
+    }
+    // Otherwise the entry stays: a tolerant claim leaves the sections that had no
+    // terrain unlit, and their own generate jobs may never come - the column is
+    // out of the load volume, which is why we were tolerant in the first place.
+    // Keeping it costs one more sweep attempt, which drops the entry itself once
+    // there is nothing left to light.
+
+    for (std::int32_t dz = -1; dz <= 1; ++dz) {
+        for (std::int32_t dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dz == 0) {
+                continue;
+            }
+            for (std::int32_t y = 0; y < kWorldSectionCount; ++y) {
+                const auto it = m_chunks.find(ChunkPos{column.x + dx, y, column.z + dz});
+                // Only chunks that are final in BOTH voxels and light are
+                // readable. An unlit neighbour is left null, which the engine
+                // treats as an unknown wall; when its own column is lit it reads
+                // ours and spills back whatever should have crossed. Light only
+                // ever grows, so the two passes converge from either side.
+                if (it != m_chunks.end() && it->second.visible()) {
+                    work.region[LightColumnWork::regionIndex(dx, dz, y)] = it->second.chunk;
+                }
+            }
+        }
+    }
+
+    m_lightColumns.insert(column);
+    return true;
+}
+
+void ChunkManager::releaseColumnLight(const ColumnPos& column)
+{
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    m_lightColumns.erase(column);
+}
+
+bool ChunkManager::startColumnLight(const ColumnPos& column, JobPriority priority, bool tolerant)
+{
+    if (!m_lighter.valid()) {
+        return false;
+    }
+
+    ColumnLightJob job;
+    if (!claimColumnLight(column, job, tolerant)) {
+        return false;
+    }
+
+    noteJobStarted(WorkKind::Light);
+    m_jobs.submitDetached(priority, [this, alive = m_alive, job = std::move(job)] {
+        if (!alive->load(std::memory_order_acquire)) {
+            return;
+        }
+        runColumnLight(job);
+        noteJobFinished(WorkKind::Light);
+    });
+    return true;
+}
+
+void ChunkManager::sweepPendingLight()
+{
+    if (!m_lighter.valid()) {
+        return;
+    }
+    VOXL_CHECK(!m_jobs.onWorkerThread(), "sweepPendingLight() called from a worker thread");
+
+    std::vector<ColumnPos> outstanding;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        if (m_lightPending.empty()) {
+            return;
+        }
+        outstanding.assign(m_lightPending.begin(), m_lightPending.end());
+    }
+
+    std::size_t started = 0;
+    for (const ColumnPos& column : outstanding) {
+        if (started >= m_config.maxLightColumnsPerUpdate ||
+            m_lightInFlight.load(std::memory_order_acquire) >= m_config.maxLightJobsInFlight) {
+            break;
+        }
+        // A column still inside the load volume will get the rest of its terrain,
+        // so it is worth waiting for the exact one-pass answer. One that has left
+        // never will: no generate job runs out there, and holding out for terrain
+        // that is not coming is precisely what strands its sections.
+        const bool inRange =
+            inLoadRange(m_centre, ChunkPos{column.x, m_centre.y, column.z});
+        if (startColumnLight(column, inRange ? JobPriority::Normal : JobPriority::Low, !inRange)) {
+            ++started;
+        }
+    }
+}
+
+void ChunkManager::runColumnLight(const ColumnLightJob& job)
+{
+    LightSpill spill = m_lighter.column(job.work);
+
+    std::size_t lit = 0;
+    for (std::size_t y = 0; y < kWorldSectionCount; ++y) {
+        if (job.work.targets[y] == nullptr || job.flags[y] == nullptr) {
+            continue;
+        }
+        // Release, paired with the acquire in Slot::lit(). Publishing the flag is
+        // what makes the chunk readable, so every light byte written above has to
+        // be visible to whoever observes it.
+        job.flags[y]->lit.store(true, std::memory_order_release);
+        job.work.targets[y]->markDirty();
+        ++lit;
+    }
+
+    // Released BEFORE the spill is posted, and while we are still on the worker:
+    // from here on this job neither reads nor writes any chunk, so holding the
+    // claim would only keep the main thread from editing a 3x3 block of columns
+    // for no reason.
+    releaseColumnLight(job.work.column);
+
+    m_lightColumnsLit.fetch_add(1, std::memory_order_relaxed);
+    m_lightSectionsLit.fetch_add(lit, std::memory_order_relaxed);
+
+    if (!spill.empty()) {
+        m_jobs.mainThreadQueue().push(
+            [this, alive = m_alive, spill = std::move(spill)]() mutable {
+                if (!alive->load(std::memory_order_acquire)) {
+                    return;
+                }
+                m_lighter.spill(std::move(spill));
+            });
+    }
 }
 
 bool ChunkManager::dispatchMesh(const Candidate& candidate, JobPriority priority)
@@ -646,6 +1000,21 @@ bool ChunkManager::dispatchLodRebuild(const Candidate& candidate, JobPriority pr
         // The generator is free to reset the level along with everything else,
         // so re-assert it before anyone can read it back.
         shadow->setLod(target);
+
+        // The replacement's voxels are brand new, so its light is too. Done here
+        // rather than after the swap because the shadow is still invisible: this
+        // is the one moment a worker may write light into it, and a mesh built
+        // before it would bake the generator's placeholder light into the
+        // geometry the player is about to be shown.
+        //
+        // Reading the 26 live neighbours' light is safe for the same reason the
+        // mesh below is: `live` is in ChunkState::Meshing, which makes
+        // isNeighbourhoodBusy() refuse every main-thread write in that set.
+        LightSpill spill;
+        if (m_lighter.valid()) {
+            m_lighter.chunk(*shadow, snapshot, spill);
+        }
+
         // Every one of these is a legal edge of the diagram in Chunk.hpp, and
         // every one is uncontended: the shadow is reachable only from this
         // closure until the swap. They are done anyway so that the object that
@@ -658,12 +1027,18 @@ bool ChunkManager::dispatchLodRebuild(const Candidate& candidate, JobPriority pr
         shadow->tryTransition(ChunkState::Meshing, ChunkState::Meshed);
 
         m_pendingUploads.fetch_add(1, std::memory_order_release);
-        m_jobs.mainThreadQueue().push([this, alive, live, shadow, result = std::move(result)] {
+        m_jobs.mainThreadQueue().push([this, alive, live, shadow, result = std::move(result),
+                                       spill = std::move(spill)]() mutable {
             if (!alive->load(std::memory_order_acquire)) {
                 return;
             }
             m_pendingUploads.fetch_sub(1, std::memory_order_release);
             finishLodRebuild(live, shadow, result);
+            // After the swap, so the seeds land on the chunk that is actually
+            // resident rather than on the object we just retired.
+            if (!spill.empty() && m_lighter.valid()) {
+                m_lighter.spill(std::move(spill));
+            }
         });
 
         noteJobFinished(WorkKind::LodRebuild);
@@ -801,6 +1176,15 @@ void ChunkManager::retireDistant(const ChunkPos& centre, std::uint64_t frameInde
                 continue;
             }
 
+            // A light job for this column is writing the chunk's light right now
+            // and the retire hook is about to read the whole chunk. Not covered
+            // by isChunkBusy: lighting deliberately does not make a chunk busy.
+            if (!m_lightColumns.empty() &&
+                m_lightColumns.find(ColumnPos{it->first.x, it->first.z}) != m_lightColumns.end()) {
+                ++it;
+                continue;
+            }
+
             const std::uint64_t touched = chunk->lastTouchedFrame();
             const std::uint64_t age     = frameIndex > touched ? frameIndex - touched : 0;
             if (age < m_config.unloadGraceFrames) {
@@ -812,6 +1196,9 @@ void ChunkManager::retireDistant(const ChunkPos& centre, std::uint64_t frameInde
                 ++it;  // raced with a worker's own transition; try again later
                 continue;
             }
+            // The column stays in m_lightPending: its other sections may still
+            // need lighting, and claimColumnLight drops the entry itself once
+            // there is nothing left in the column to light.
 
             retired.push_back(chunk);
             it = m_chunks.erase(it);
@@ -837,6 +1224,10 @@ void ChunkManager::unloadAll()
     {
         std::unique_lock<std::shared_mutex> lock(m_mutex);
         retired.swap(m_chunks);
+        // Nothing is resident, so nothing is waiting to be lit. In-flight light
+        // jobs keep their claim and release it themselves; they write through
+        // shared_ptrs that outlive the map, exactly as generate jobs do.
+        m_lightPending.clear();
     }
 
     for (auto& [position, slot] : retired) {
@@ -862,6 +1253,8 @@ void ChunkManager::noteJobStarted(WorkKind kind) noexcept
         m_generateInFlight.fetch_add(1, std::memory_order_release);
     } else if (kind == WorkKind::LodRebuild) {
         m_lodInFlight.fetch_add(1, std::memory_order_release);
+    } else if (kind == WorkKind::Light) {
+        m_lightInFlight.fetch_add(1, std::memory_order_release);
     } else {
         m_meshInFlight.fetch_add(1, std::memory_order_release);
     }
@@ -873,6 +1266,8 @@ void ChunkManager::noteJobFinished(WorkKind kind) noexcept
         m_generateInFlight.fetch_sub(1, std::memory_order_release);
     } else if (kind == WorkKind::LodRebuild) {
         m_lodInFlight.fetch_sub(1, std::memory_order_release);
+    } else if (kind == WorkKind::Light) {
+        m_lightInFlight.fetch_sub(1, std::memory_order_release);
     } else {
         m_meshInFlight.fetch_sub(1, std::memory_order_release);
     }
@@ -930,6 +1325,7 @@ WorldStats ChunkManager::stats() const
     out.generateJobsInFlight = m_generateInFlight.load(std::memory_order_acquire);
     out.meshJobsInFlight     = m_meshInFlight.load(std::memory_order_acquire);
     out.lodJobsInFlight      = m_lodInFlight.load(std::memory_order_acquire);
+    out.lightJobsInFlight    = m_lightInFlight.load(std::memory_order_acquire);
     out.pendingUploads       = m_pendingUploads.load(std::memory_order_acquire);
 
     out.chunksCreated  = m_chunksCreated.load(std::memory_order_relaxed);
@@ -939,6 +1335,8 @@ WorldStats ChunkManager::stats() const
 
     out.lodTransitions        = m_lodTransitions.load(std::memory_order_relaxed);
     out.lodTransitionsDropped = m_lodTransitionsDropped.load(std::memory_order_relaxed);
+    out.lightColumnsLit       = m_lightColumnsLit.load(std::memory_order_relaxed);
+    out.lightSectionsLit      = m_lightSectionsLit.load(std::memory_order_relaxed);
 
     out.centre       = m_centre;
     out.loadRadius   = m_config.loadRadius;

@@ -1,7 +1,17 @@
 #pragma once
 
 // Break/place interaction: target selection, the progressive break timer, the
-// placement legality rules, and the wireframe selection box.
+// sub-voxel mining mode, the placement legality rules, and the wireframe
+// selection box.
+//
+// THE MINING VERB
+// ---------------
+// Left click is unchanged by default: hold to break the whole targeted block,
+// timed by BlockType::hardness. `MiningMode::SubVoxel` is a mode the player
+// opts into (see gameplay/MiningTool.hpp), in which the same button carves a
+// brush-shaped hole out of the block instead of removing it. Nothing about the
+// default path is conditional on the mode existing - with no sub-voxel hook
+// installed the mode degrades to ordinary breaking.
 //
 // DEPENDENCY NOTE FOR THE INTEGRATOR
 // ----------------------------------
@@ -18,17 +28,21 @@
 //         return true;
 //     });
 //
-// The world writer and reader are injected the same way, so interaction has no
-// compile-time dependency on the World type either. Every hook is optional: with
-// none set, `update()` reports "no target" and `render()` draws nothing.
+// The world writer, reader, sub-voxel carver and damage probe are injected the
+// same way, so interaction has no compile-time dependency on the World type
+// either. Every hook is optional: with none set, `update()` reports "no target"
+// and `render()` draws nothing.
 //
 // Thread safety: none. Main-thread only - it reads the camera, mutates the world
 // and issues GL calls.
 
+#include "gameplay/MiningTool.hpp"
 #include "render/Camera.hpp"
 #include "world/Block.hpp"
+#include "world/SubVoxel.hpp"
 #include "world/VoxelTypes.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -64,6 +78,37 @@ using BlockWriteFn = std::function<bool(const BlockPos& position, BlockId id)>;
 /// Reads one voxel. Used only to check whether the placement cell is free.
 using BlockReadFn = std::function<BlockId(const BlockPos& position)>;
 
+/// What the world did with one requested carve.
+///
+/// Two values, not five, because the only decision this module makes on the
+/// answer is "did that sub-voxel come out". Mapping World::EditResult onto it is
+/// the integrator's one-liner and keeps World.hpp out of this header:
+///
+///     result == EditResult::Applied || result == EditResult::Deferred
+///         ? CarveOutcome::Carved : CarveOutcome::Refused
+///
+/// Deferred counts as carved on purpose: a deferred edit is accepted and will be
+/// replayed, and re-issuing it next frame would double-apply it.
+enum class CarveOutcome : std::uint8_t {
+    Carved  = 0,
+    Refused = 1,
+};
+
+/// Carves the sub-voxel containing `worldPoint`. Maps onto
+/// World::breakSubVoxelAt.
+///
+/// The point form rather than a block-plus-index pair because a brush spills
+/// across block boundaries by design, and letting the world do the one floor
+/// division keeps a single implementation of that split. This module always
+/// passes the exact CENTRE of a sub-voxel cell, so the division can never land
+/// on a boundary.
+using SubVoxelBreakFn = std::function<CarveOutcome(const glm::vec3& worldPoint)>;
+
+/// True when the block at `position` is partially destroyed. Maps onto
+/// `!World::isBlockWhole(position)`. Optional; without it, damaged cells are
+/// indistinguishable from whole ones, which placement already refuses.
+using SubVoxelDamagedFn = std::function<bool(const BlockPos& position)>;
+
 /// Per-frame button state, already debounced by the input layer.
 struct InteractionInput {
     /// Left mouse held: drives the break timer.
@@ -81,6 +126,7 @@ enum class PlaceResult : std::uint8_t {
     NoTarget,          ///< the ray hit nothing
     OutOfWorld,        ///< candidate cell is above or below the world
     Occupied,          ///< candidate cell holds a non-replaceable block
+    Damaged,           ///< candidate cell holds a partially destroyed block
     IntersectsPlayer,  ///< would trap the player inside the new block
     NothingHeld,       ///< held block is air
     NoWorldSink,       ///< no BlockWriteFn installed
@@ -89,12 +135,14 @@ enum class PlaceResult : std::uint8_t {
 
 /// Why the break timer is in the state it is.
 enum class BreakResult : std::uint8_t {
-    None = 0,     ///< not breaking
-    InProgress,   ///< timer running
-    Broken,       ///< voxel removed this frame
-    NoTarget,     ///< the ray hit nothing
-    Unbreakable,  ///< hardness < 0
-    NoWorldSink,  ///< no BlockWriteFn installed
+    None = 0,      ///< not breaking
+    InProgress,    ///< timer running
+    Broken,        ///< the whole voxel was removed this frame
+    Carved,        ///< sub-voxel mode removed at least one sub-voxel this frame
+    CarveRefused,  ///< the world refused every sub-voxel of the brush
+    NoTarget,      ///< the ray hit nothing
+    Unbreakable,   ///< hardness < 0
+    NoWorldSink,   ///< no BlockWriteFn installed
     WriteFailed,
 };
 
@@ -106,6 +154,7 @@ enum class BreakResult : std::uint8_t {
         case PlaceResult::NoTarget:         return "NoTarget";
         case PlaceResult::OutOfWorld:       return "OutOfWorld";
         case PlaceResult::Occupied:         return "Occupied";
+        case PlaceResult::Damaged:          return "Damaged";
         case PlaceResult::IntersectsPlayer: return "IntersectsPlayer";
         case PlaceResult::NothingHeld:      return "NothingHeld";
         case PlaceResult::NoWorldSink:      return "NoWorldSink";
@@ -117,13 +166,15 @@ enum class BreakResult : std::uint8_t {
 [[nodiscard]] constexpr const char* toString(BreakResult result) noexcept
 {
     switch (result) {
-        case BreakResult::None:        return "None";
-        case BreakResult::InProgress:  return "InProgress";
-        case BreakResult::Broken:      return "Broken";
-        case BreakResult::NoTarget:    return "NoTarget";
-        case BreakResult::Unbreakable: return "Unbreakable";
-        case BreakResult::NoWorldSink: return "NoWorldSink";
-        case BreakResult::WriteFailed: return "WriteFailed";
+        case BreakResult::None:         return "None";
+        case BreakResult::InProgress:   return "InProgress";
+        case BreakResult::Broken:       return "Broken";
+        case BreakResult::Carved:       return "Carved";
+        case BreakResult::CarveRefused: return "CarveRefused";
+        case BreakResult::NoTarget:     return "NoTarget";
+        case BreakResult::Unbreakable:  return "Unbreakable";
+        case BreakResult::NoWorldSink:  return "NoWorldSink";
+        case BreakResult::WriteFailed:  return "WriteFailed";
     }
     return "Unknown";
 }
@@ -147,6 +198,30 @@ struct InteractionState {
 
     /// True when the target's hardness is the "never breaks" sentinel.
     bool targetUnbreakable = false;
+
+    // ---- mining mode ----
+
+    /// Mode the verb is in, mirrored here so the HUD needs only this snapshot.
+    MiningMode miningMode = MiningMode::WholeBlock;
+    float      brushRadius = MiningTool::kDefaultBrushRadius;
+    /// Sub-voxels one completed carve touches.
+    std::size_t brushVolume = 1;
+
+    /// Sub-voxel under the crosshair, valid only while `hasSubTarget`. Local
+    /// coordinates within `hit.block`, each component in [0, 8).
+    bool         hasSubTarget = false;
+    glm::ivec3   subTarget{0};
+
+    /// True while the mode is SubVoxel but this target cannot be carved, so the
+    /// swing fell back to a whole-block break. The two reasons are a non-opaque
+    /// material (World::editSubVoxel refuses those - the sub-voxel pass has no
+    /// alpha cutoff) and no carve hook being installed at all.
+    bool subVoxelFallback = false;
+
+    /// Sub-voxels of the last completed carve the world accepted. Lower than
+    /// `brushVolume` whenever the brush spilled into air or into a block that
+    /// cannot be carved, which is the common case near a block face.
+    std::size_t lastCarveCount = 0;
 
     PlaceResult lastPlace = PlaceResult::None;
     BreakResult lastBreak = BreakResult::None;
@@ -185,9 +260,29 @@ public:
     void setRaycaster(RaycastFn raycaster);
     void setBlockWriter(BlockWriteFn writer);
     void setBlockReader(BlockReadFn reader);
+    void setSubVoxelBreaker(SubVoxelBreakFn carve);
+    void setSubVoxelDamageReader(SubVoxelDamagedFn damaged);
 
     [[nodiscard]] bool hasRaycaster() const noexcept { return static_cast<bool>(m_raycast); }
     [[nodiscard]] bool hasWorldSink() const noexcept { return static_cast<bool>(m_write); }
+    [[nodiscard]] bool hasSubVoxelSink() const noexcept { return static_cast<bool>(m_carve); }
+
+    // ---- mining mode ----
+
+    [[nodiscard]] const MiningTool& tool() const noexcept { return m_tool; }
+
+    [[nodiscard]] MiningMode miningMode() const noexcept { return m_tool.mode(); }
+
+    /// Changing mode abandons any swing in progress. Progress belongs to a
+    /// (target, mode) pair: carrying a half-finished whole-block break over into
+    /// a carve would remove a sub-voxel the player never aimed at.
+    void setMiningMode(MiningMode mode) noexcept;
+    MiningMode toggleMiningMode() noexcept;
+
+    [[nodiscard]] float brushRadius() const noexcept { return m_tool.brushRadius(); }
+    void setBrushRadius(float subVoxels) noexcept;
+    /// Wheel-style relative control; positive widens the brush.
+    void adjustBrushRadius(int steps) noexcept;
 
     void  setReach(float blocks) noexcept;
     [[nodiscard]] float reach() const noexcept { return m_reach; }
@@ -226,19 +321,60 @@ public:
     void releaseGpuResources() noexcept;
 
 private:
-    /// Applies the three placement rules: inside the world, cell is replaceable,
-    /// and the resulting cube does not overlap the player.
+    /// What a swing in progress is aimed at.
+    ///
+    /// The sub-voxel is part of the identity, not just the block: in drill mode
+    /// the thing being removed is the sub-voxel, so sliding the crosshair onto
+    /// the one next door starts a new (short) swing. Keeping the rule uniform -
+    /// progress belongs to whatever you are pointing at - is what makes "release
+    /// or look away and you start over" true in both modes.
+    struct BreakTarget {
+        BlockPos   block{};
+        glm::ivec3 sub{0};
+        /// A whole-block swing and a carve at the same place are not the same
+        /// swing, so the mode has to take part in the comparison.
+        bool carving = false;
+
+        [[nodiscard]] bool operator==(const BreakTarget& other) const noexcept
+        {
+            return block == other.block && carving == other.carving &&
+                   (!carving || sub == other.sub);
+        }
+    };
+
+    /// Applies the placement rules: something is held, inside the world, the
+    /// cell is replaceable and undamaged, and the resulting cube does not
+    /// overlap the player.
     [[nodiscard]] PlaceResult evaluatePlacement(const BlockPos& target) const noexcept;
 
     void resetBreakProgress() noexcept;
+
+    /// Fills `m_state.hasSubTarget` / `m_state.subTarget` from the ray hit.
+    void updateSubTarget() noexcept;
+
+    /// True when a carve against the current target would be accepted by the
+    /// world's material rule, so the swing should drill rather than break.
+    [[nodiscard]] bool canCarveTarget() const noexcept;
+
+    /// Issues the whole brush and returns how many sub-voxels came out.
+    [[nodiscard]] std::size_t applyBrush();
+
+    /// Says once, and only when the block changes, that this material cannot be
+    /// drilled. Called every frame the player holds the button against glass, so
+    /// it cannot log unconditionally.
+    void noteFallback(const BlockPos& block, BlockId id);
 
     class SelectionRenderer;  // GL-owning, defined in the .cpp
 
     const BlockRegistry* m_registry = nullptr;
 
-    RaycastFn    m_raycast;
-    BlockWriteFn m_write;
-    BlockReadFn  m_read;
+    RaycastFn         m_raycast;
+    BlockWriteFn      m_write;
+    BlockReadFn       m_read;
+    SubVoxelBreakFn   m_carve;
+    SubVoxelDamagedFn m_damaged;
+
+    MiningTool m_tool;
 
     float   m_reach     = kDefaultReachBlocks;
     BlockId m_heldBlock = blocks::Stone;
@@ -248,13 +384,18 @@ private:
 
     InteractionState m_state{};
 
-    /// Voxel the break timer belongs to. Moving the crosshair off it resets the
-    /// timer, so a player cannot chip away at several blocks in parallel.
-    BlockPos m_breakingBlock{};
-    bool     m_breakingValid   = false;
-    float    m_breakElapsed    = 0.0f;
-    float    m_placeCooldown   = 0.0f;
-    bool     m_selectionVisible = true;
+    /// What the break timer belongs to. Moving the crosshair off it resets the
+    /// timer, so a player cannot chip away at several targets in parallel.
+    BreakTarget m_breakTarget{};
+    bool        m_breakingValid    = false;
+    float       m_breakElapsed     = 0.0f;
+    float       m_placeCooldown    = 0.0f;
+    bool        m_selectionVisible = true;
+
+    /// Last block reported as undrillable, so the message is printed once per
+    /// block rather than once per frame.
+    BlockPos m_loggedFallbackBlock{};
+    bool     m_loggedFallback = false;
 
     std::unique_ptr<SelectionRenderer> m_selection;
 };

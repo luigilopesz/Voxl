@@ -5,6 +5,11 @@ add_library(voxl::engine ALIAS voxl_engine)
 
 target_include_directories(voxl_engine PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# The version string the title screen shows. Defined here rather than hard-coded
+# in a header so bumping project(VERSION) in the top-level CMakeLists is the only
+# place it ever has to change.
+target_compile_definitions(voxl_engine PUBLIC VOXL_VERSION="${PROJECT_VERSION}")
+
 target_link_libraries(voxl_engine
     PUBLIC
         voxl::compile_options
@@ -21,7 +26,13 @@ target_link_libraries(voxl_engine
 # reviewable change and CMake reliably reconfigures.
 target_sources(voxl_engine PRIVATE
     app/Application.cpp
+    app/Settings.cpp
 
+    audio/AudioEngine.cpp
+    audio/SoundBank.cpp
+    audio/SynthSounds.cpp
+
+    core/FrameLimiter.cpp
     core/JobSystem.cpp
     core/Log.cpp
     core/Profiler.cpp
@@ -29,6 +40,7 @@ target_sources(voxl_engine PRIVATE
 
     gameplay/BlockInteraction.cpp
     gameplay/Hotbar.cpp
+    gameplay/MiningTool.cpp
     gameplay/Player.cpp
 
     mesh/GreedyMesher.cpp
@@ -50,14 +62,21 @@ target_sources(voxl_engine PRIVATE
 
     ui/DebugOverlay.cpp
     ui/Hud.cpp
+    ui/MainMenu.cpp
+    ui/PauseMenu.cpp
+    ui/SettingsPanel.cpp
 
     world/Block.cpp
     world/Chunk.cpp
     world/ChunkManager.cpp
     world/ChunkStorage.cpp
+    world/DayNightCycle.cpp
+    world/LightEngine.cpp
+    world/RegionFile.cpp
     world/SubVoxel.cpp
     world/TerrainGenerator.cpp
     world/World.cpp
+    world/WorldSave.cpp
 )
 
 # ------------------------------------------------------------ executable --

@@ -176,7 +176,14 @@ struct TerrainSettings {
     /// through water, zero underground) so that a freshly generated chunk is
     /// visible before the real lighting pass has run. The lighting system
     /// overwrites this; it is not an attempt at correct light.
-    bool seedSunlight = true;
+    ///
+    /// OFF BY DEFAULT NOW THAT world/LightEngine.hpp EXISTS. The real pass
+    /// overwrites every nibble this writes, so the work is pure waste - and
+    /// worse than waste: the per-voxel `storage.setLight` calls materialise the
+    /// 32 KB light array on every surface chunk, which defeats the uniform-
+    /// section `fillLight` fast path the light engine relies on. Turn it back on
+    /// only to see what the world looks like with lighting disabled entirely.
+    bool seedSunlight = false;
 };
 
 /// Everything the generator derives about one world column, in one place so the
