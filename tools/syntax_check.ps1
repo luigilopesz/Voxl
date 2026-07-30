@@ -51,7 +51,10 @@ $includes = @(
     (Join-Path $deps 'imgui-src/backends'),
     (Join-Path $deps 'stb-src'),
     (Join-Path $deps 'fastnoiselite-src/Cpp'),
-    (Join-Path $deps 'miniaudio-src')
+    (Join-Path $deps 'miniaudio-src'),
+    # Catch2, so that files under tests/ can be checked too.
+    (Join-Path $deps 'catch2-src/src'),
+    (Join-Path $deps 'catch2-build/generated-includes')
 ) | Where-Object { Test-Path $_ } | ForEach-Object { "/I`"$_`"" }
 
 $scratch = Join-Path $env:TEMP 'voxl_syntax_check'

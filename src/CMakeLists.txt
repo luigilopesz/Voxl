@@ -20,8 +20,42 @@ target_link_libraries(voxl_engine
 # Sources are listed explicitly (never globbed) so that adding a file is a
 # reviewable change and CMake reliably reconfigures.
 target_sources(voxl_engine PRIVATE
+    app/Application.cpp
+
+    core/JobSystem.cpp
     core/Log.cpp
+    core/Profiler.cpp
+    core/Time.cpp
+
+    gameplay/BlockInteraction.cpp
+    gameplay/Hotbar.cpp
+    gameplay/Player.cpp
+
+    mesh/GreedyMesher.cpp
+
+    physics/Collision.cpp
+    physics/Raycast.cpp
+
+    platform/Input.cpp
     platform/Window.cpp
+
+    render/Camera.cpp
+    render/ChunkRenderer.cpp
+    render/GpuBuffer.cpp
+    render/Renderer.cpp
+    render/Shader.cpp
+    render/Texture.cpp
+    render/TextureGen.cpp
+
+    ui/DebugOverlay.cpp
+    ui/Hud.cpp
+
+    world/Block.cpp
+    world/Chunk.cpp
+    world/ChunkManager.cpp
+    world/ChunkStorage.cpp
+    world/TerrainGenerator.cpp
+    world/World.cpp
 )
 
 # ------------------------------------------------------------ executable --

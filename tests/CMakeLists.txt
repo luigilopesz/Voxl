@@ -3,7 +3,13 @@
 include(Catch)
 
 add_executable(voxl_tests
+    test_chunkstorage.cpp
+    test_jobsystem.cpp
     test_log.cpp
+    test_mesher.cpp
+    test_physics.cpp
+    test_terrain.cpp
+    test_world.cpp
 )
 
 target_link_libraries(voxl_tests PRIVATE

@@ -151,9 +151,16 @@ Window::Window(const WindowConfig& config)
     glfwGetFramebufferSize(m_window, &m_framebufferWidth, &m_framebufferHeight);
     glfwSetFramebufferSizeCallback(m_window, &framebufferSizeCallback);
     glfwSetWindowIconifyCallback(m_window, &iconifyCallback);
+    // Installed before the UI backend so that ImGui's own callback chains to it
+    // rather than replacing it; ImGui saves whatever is registered at its init.
+    glfwSetScrollCallback(m_window, &scrollCallback);
 
-    setVSync(config.vsync);
     glfwShowWindow(m_window);
+    // After the window is visible, because the swap interval is a property of
+    // the device context. NOTE: on hybrid-graphics laptops the WGL swap control
+    // is advisory - measured ~1300 fps on an Optimus RTX 3050 with interval 1 -
+    // so nothing may assume swapBuffers() throttles the loop.
+    setVSync(config.vsync);
 }
 
 Window::~Window()
@@ -170,6 +177,11 @@ Window::~Window()
 void Window::pollEvents()
 {
     glfwPollEvents();
+}
+
+void Window::waitEvents(double timeoutSeconds)
+{
+    glfwWaitEventsTimeout(timeoutSeconds);
 }
 
 void Window::swapBuffers()
@@ -216,6 +228,13 @@ void Window::setCursorCaptured(bool captured)
     }
 }
 
+float Window::consumeScrollDelta() noexcept
+{
+    const float delta   = m_scrollAccumulator;
+    m_scrollAccumulator = 0.0f;
+    return delta;
+}
+
 void Window::framebufferSizeCallback(GLFWwindow* window, int width, int height)
 {
     auto* self = static_cast<Window*>(glfwGetWindowUserPointer(window));
@@ -233,6 +252,15 @@ void Window::iconifyCallback(GLFWwindow* window, int iconified)
         return;
     }
     self->m_iconified = iconified == GLFW_TRUE;
+}
+
+void Window::scrollCallback(GLFWwindow* window, double /*xOffset*/, double yOffset)
+{
+    auto* self = static_cast<Window*>(glfwGetWindowUserPointer(window));
+    if (self == nullptr) {
+        return;
+    }
+    self->m_scrollAccumulator += static_cast<float>(yOffset);
 }
 
 }  // namespace voxl

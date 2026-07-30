@@ -44,6 +44,10 @@ public:
 
     /// Pumps the OS event queue. Call once per frame before simulation.
     void pollEvents();
+    /// Pumps the queue, blocking for up to `timeoutSeconds` if it is empty. Only
+    /// for the minimised case: there is no framebuffer to draw into, and polling
+    /// in a tight loop would burn a core producing nothing.
+    void waitEvents(double timeoutSeconds);
     void swapBuffers();
 
     [[nodiscard]] bool shouldClose() const noexcept;
@@ -64,6 +68,14 @@ public:
     void setCursorCaptured(bool captured);
     [[nodiscard]] bool cursorCaptured() const noexcept { return m_cursorCaptured; }
 
+    /// Vertical wheel movement accumulated since the last call, in notches, and
+    /// resets the accumulator.
+    ///
+    /// The wheel is the one input that cannot be polled - a notch is an event -
+    /// so it is accumulated here, where the GLFW callback already has a `this`
+    /// via the window user pointer. platform/Input.cpp drains it once per frame.
+    [[nodiscard]] float consumeScrollDelta() noexcept;
+
     [[nodiscard]] GLFWwindow* handle() const noexcept { return m_window; }
 
     /// Raw GL version actually granted by the driver, for the debug overlay.
@@ -73,6 +85,7 @@ public:
 private:
     static void framebufferSizeCallback(GLFWwindow* window, int width, int height);
     static void iconifyCallback(GLFWwindow* window, int iconified);
+    static void scrollCallback(GLFWwindow* window, double xOffset, double yOffset);
 
     GLFWwindow* m_window = nullptr;
     int  m_framebufferWidth  = 0;
@@ -80,6 +93,7 @@ private:
     bool m_iconified      = false;
     bool m_vsync          = true;
     bool m_cursorCaptured = false;
+    float m_scrollAccumulator = 0.0f;
     std::string m_glVersion;
     std::string m_glRenderer;
 };
