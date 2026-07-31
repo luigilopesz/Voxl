@@ -9,6 +9,7 @@
 #include <unordered_map>
 
 #include <application/cli.hpp>
+#include <utilities/gpu_profiler.hpp>
 
 // #include <voxels/gvox_model.inl>
 
@@ -99,6 +100,8 @@ VoxelApp::VoxelApp() : AppWindow(APPNAME, {AppCli::get().width, AppCli::get().he
 }
 VoxelApp::~VoxelApp() {
     gpu_context.device.wait_idle();
+    // After wait_idle so every outstanding query is resolved, and before the device goes away.
+    gpu_profiler::shutdown();
     gpu_context.device.collect_garbage();
 
     if (!screenshot_buffer.is_empty()) {
@@ -194,6 +197,10 @@ void VoxelApp::on_update() {
 
     gpu_input.flags &= ~GAME_FLAG_BITS_NEEDS_PHYS_UPDATE;
 
+    // Before renderer.begin_frame, because that executes and submits the sky task graph and the
+    // profiler's ring slot has to be claimed before the first submit of the frame.
+    gpu_profiler::begin_frame(gpu_context.device, gpu_input.frame_index, gpu_input.time, gpu_input.delta_time * 1000.0f);
+
     renderer.begin_frame(gpu_input);
 
     if (now - prev_phys_update_time > std::chrono::duration<float>(GAME_PHYS_UPDATE_DT)) {
@@ -225,6 +232,9 @@ void VoxelApp::on_update() {
     }
 
     gpu_context.frame_task_graph.execute({});
+
+    // Reads back the pool written three frames ago; never the one just submitted.
+    gpu_profiler::end_frame();
 
     if (screenshot_capture_this_frame) {
         write_screenshot();
@@ -468,6 +478,7 @@ void VoxelApp::record_tasks() {
             daxa::inl_attachment(daxa::TaskBufferAccess::TRANSFER_WRITE, gpu_context.task_input_buffer),
         },
         .task = [this](daxa::TaskInterface const &ti) {
+            auto prof = gpu_profiler::Scope{ti.recorder, "GpuInputUpload"};
             auto staging_input_buffer = ti.device.create_buffer({
                 .size = sizeof(GpuInput),
                 .allocate_info = daxa::MemoryFlagBits::HOST_ACCESS_RANDOM,
@@ -496,6 +507,7 @@ void VoxelApp::record_tasks() {
             daxa::inl_attachment(daxa::TaskBufferAccess::HOST_TRANSFER_WRITE, gpu_context.task_staging_output_buffer),
         },
         .task = [this](daxa::TaskInterface const &ti) {
+            auto prof = gpu_profiler::Scope{ti.recorder, "GpuOutputDownload"};
             auto output_buffer = gpu_context.task_output_buffer.get_state().buffers[0];
             auto staging_output_buffer = gpu_context.staging_output_buffer;
             auto frame_index = gpu_input.frame_index + 1;
@@ -516,6 +528,7 @@ void VoxelApp::record_tasks() {
             daxa::inl_attachment(daxa::TaskImageAccess::COLOR_ATTACHMENT, daxa::ImageViewType::REGULAR_2D, gpu_context.task_swapchain_image),
         },
         .task = [this](daxa::TaskInterface const &ti) {
+            auto prof = gpu_profiler::Scope{ti.recorder, "ImGuiDraw"};
             imgui_renderer.record_commands(ImGui::GetDrawData(), ti.recorder, gpu_context.swapchain_image, window_size.x, window_size.y);
         },
         .name = "ImGui draw",

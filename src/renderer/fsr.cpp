@@ -64,6 +64,7 @@ auto Fsr2Renderer::upscale(GpuContext &gpu_context, GbufferDepth const &gbuffer_
             daxa::inl_attachment(daxa::TaskImageAccess::COMPUTE_SHADER_STORAGE_WRITE_ONLY, daxa::ImageViewType::REGULAR_2D, output_image),
         },
         .task = [=, this](daxa::TaskInterface const &ti) {
+            auto prof = gpu_profiler::Scope{ti.recorder, "FSR2"};
             auto const &color_use = ti.get(daxa::TaskImageAttachmentIndex{0});
             auto const &depth_use = ti.get(daxa::TaskImageAttachmentIndex{1});
             auto const &velocity_use = ti.get(daxa::TaskImageAttachmentIndex{2});

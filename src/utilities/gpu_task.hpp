@@ -3,6 +3,7 @@
 #include <daxa/daxa.hpp>
 #include <daxa/utils/task_graph.hpp>
 #include "async_pipeline_manager.hpp"
+#include "gpu_profiler.hpp"
 
 template <typename TaskHeadT, typename PushT, typename InfoT, typename PipelineT>
 using TaskCallback = void(daxa::TaskInterface const &ti, typename PipelineT::PipelineT &pipeline, PushT &push, InfoT const &info);
@@ -23,6 +24,9 @@ struct Task : TaskHeadT {
     daxa::TaskGraph *task_graph_ptr = nullptr;
     void callback(daxa::TaskInterface const &ti) {
         auto push = PushT{};
+        // Opened before the validity check on purpose: a pipeline that is still compiling would
+        // otherwise silently drop a column and shift every pass after it. See gpu_profiler.hpp.
+        auto prof = gpu_profiler::Scope{ti.recorder, TaskHeadT::name()};
         if (!pipeline->is_valid()) {
             return;
         }
@@ -47,6 +51,7 @@ struct Task<TaskHeadT, PushT, InfoT, AsyncManagedRasterPipeline> : TaskHeadT {
     void callback(daxa::TaskInterface const &ti) {
         auto push = PushT{};
         // ti.copy_task_head_to(&push.uses);
+        auto prof = gpu_profiler::Scope{ti.recorder, TaskHeadT::name()};
         if (!pipeline->is_valid()) {
             return;
         }

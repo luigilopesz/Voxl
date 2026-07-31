@@ -155,6 +155,7 @@ auto Renderer::render(GpuContext &gpu_context, VoxelWorldBuffers &voxel_buffers,
                     daxa::inl_attachment(daxa::TaskImageAccess::TRANSFER_WRITE, daxa::ImageViewType::REGULAR_2D, output_image),
                 },
                 .task = [=](daxa::TaskInterface const &ti) {
+                    auto prof = gpu_profiler::Scope{ti.recorder, "UpscaleBlit"};
                     auto image_a = ti.get(daxa::TaskImageAttachmentIndex{0}).ids[0];
                     auto image_b = ti.get(daxa::TaskImageAttachmentIndex{1}).ids[0];
                     auto image_a_info = ti.device.info_image(image_a).value();
