@@ -30,14 +30,43 @@ param(
     # persist tree-node open state in imgui.ini, so this has to be done by clicking, every run.
     [switch]$ExpandGraphs,
 
+    # Client-Y of the two tree arrows. Defaults are measured from a 1280x720 capture; pass
+    # explicit values if the font size or the debug-string list changes the row layout.
+    # Y2 is where "CPU-only frame-time" lands *after* Y1's 120 px plot has expanded above it.
+    [int]$ExpandY1 = 15,
+    [int]$ExpandY2 = 175,
+
+    # Seconds to wait after the window appears before sending any input. The window is
+    # created early but ~127 GLSL shaders are still compiling behind it, and keystrokes sent
+    # during that window are silently dropped -- F3 in particular.
+    [int]$SettleSec = 8,
+
     # Hold W and sweep the view, so new chunks are generated and the heap actually grows.
     [switch]$Soak,
+
+    # Raw-mouse deltas for the soak. Pitch is applied once at the start and undone before the
+    # screenshot; yaw is applied every second. Large values fly clean out of the 128 m
+    # wrapping volume and the capture ends up looking at open water.
+    [int]$SoakPitch = 120,
+    [int]$SoakYaw = 12,
+
+    # Seconds of MOVE_BACKWARD before capturing, to back out of whatever the soak walked into.
+    [int]$RetreatSec = 7,
+
+    # Seconds to hold still before capturing, so the temporally-accumulated GI converges and
+    # the 200-frame frame-time ring buffer fully refills with settled frames.
+    [int]$ConvergeSec = 15,
 
     # How long to keep the app up and sampling. 0 means launch and return immediately.
     [int]$Seconds = 0,
 
-    # Capture the window to this PNG at the end of the sampling window.
+    # Capture the window to this PNG at the end of the sampling window, after framing.
     [string]$Screenshot,
+
+    # Capture the window the instant the soak ends, before any framing. The overlay's
+    # frame-time ring buffer is only 200 frames (src/application/ui.hpp:28), i.e. about 5 s,
+    # so this is the only moment at which it holds nothing but moving-over-terrain frames.
+    [string]$SoakShot,
 
     # Close the window when sampling finishes and verify VRAM returns to baseline.
     [switch]$Quit
@@ -63,7 +92,9 @@ public static class Win {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
-    [DllImport("user32.dll")] public static extern void mouse_event(uint f, uint dx, uint dy, uint d, UIntPtr e);
+    // dx/dy are declared signed: MOUSEEVENTF_MOVE deltas are LONG, and a negative pitch is
+    // how the view is levelled back up after a soak.
+    [DllImport("user32.dll")] public static extern void mouse_event(uint f, int dx, int dy, uint d, UIntPtr e);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
@@ -71,7 +102,7 @@ public static class Win {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
 
-    public const byte VK_ESCAPE = 0x1B, VK_F3 = 0x72, VK_W = 0x57;
+    public const byte VK_ESCAPE = 0x1B, VK_F3 = 0x72, VK_W = 0x57, VK_S = 0x53;
     public const uint KEYUP = 0x0002, MOVE = 0x0001, LDOWN = 0x0002, LUP = 0x0004;
 
     public static void Tap(byte vk) {
@@ -113,6 +144,9 @@ public static class Win {
 # same environment the build saw, which removes one variable when something misbehaves.
 $env:VULKAN_SDK = Join-Path $repo 'vksdk'
 
+# AppSettings persists to the platform config dir via sago::platform_folders.
+$settingsPath = Join-Path $env:APPDATA 'GabeVoxelGame\user_settings.json'
+
 $vramBefore = Get-VramMiB
 Write-Host ("==> VRAM before launch: {0} MiB" -f $vramBefore) -ForegroundColor Cyan
 
@@ -121,6 +155,10 @@ $stderr = Join-Path $env:TEMP 'voxl2_run_stderr.txt'
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $p = Start-Process -FilePath $exe -WorkingDirectory $repo -PassThru `
     -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+# Touching .Handle caches the native handle in the Process object. Without this, .NET closes
+# the handle when the process exits and .ExitCode comes back empty later -- which is why the
+# run report used to print a blank exit code even on a perfectly clean shutdown.
+$null = $p.Handle
 Write-Host ("==> started pid={0}" -f $p.Id) -ForegroundColor Cyan
 
 # Cold start compiles ~127 GLSL shaders; .out/spirv_cache makes subsequent starts fast.
@@ -138,34 +176,65 @@ Write-Host ("==> window up after {0:N2} s" -f $sw.Elapsed.TotalSeconds) -Foregro
 
 [void][Win]::ShowWindow($hwnd, 9)
 [void][Win]::SetForegroundWindow($hwnd)
-Start-Sleep -Milliseconds 800
+Write-Host ("==> settling {0} s (shaders still compiling behind the window)" -f $SettleSec) -ForegroundColor Cyan
+Start-Sleep -Seconds $SettleSec
+[void][Win]::SetForegroundWindow($hwnd)
+Start-Sleep -Milliseconds 500
 
-if ($Overlay) { [Win]::Tap([Win]::VK_F3); Start-Sleep -Milliseconds 500; Write-Host '==> F3 sent (debug overlay)' -ForegroundColor Cyan }
+if ($Overlay) {
+    # F3 TOGGLES, and "UI"/"show_debug_info" is PERSISTED to user_settings.json
+    # (src/application/settings.cpp:130, autosave on exit). A blind F3 therefore turns the
+    # overlay OFF whenever the previous run left it on -- which silently produced one
+    # baseline screenshot with no overlay in it. Read the persisted value and only tap when
+    # it is actually off.
+    $already = $false
+    if (Test-Path $settingsPath) {
+        try {
+            $cfg = Get-Content $settingsPath -Raw | ConvertFrom-Json
+            $already = [bool]$cfg.categories.UI.show_debug_info.data.setting.value
+        }
+        catch { Write-Warning "could not parse $settingsPath; assuming overlay is off" }
+    }
+    if ($already) {
+        Write-Host '==> debug overlay already enabled by the previous run; F3 not sent' -ForegroundColor Cyan
+    }
+    else {
+        [Win]::Tap([Win]::VK_F3); Start-Sleep -Milliseconds 800
+        Write-Host '==> F3 sent (debug overlay on)' -ForegroundColor Cyan
+    }
+}
 
 if ($ExpandGraphs) {
-    # ESC releases the mouse capture so ImGui can receive clicks.
-    [Win]::Tap([Win]::VK_ESCAPE); Start-Sleep -Milliseconds 700
+    # NOTE: the app boots with ui.paused = true (src/application/ui.hpp:44), so the cursor
+    # is already free and ImGui is already taking clicks. Do NOT press ESC first -- that
+    # would unpause and capture the mouse, and the clicks would go to the game instead.
     $r = New-Object Win+RECT
     [void][Win]::GetClientRect($hwnd, [ref]$r)
     $cw = $r.Right - $r.Left
-    # The Debug Menu is pinned to the right edge, 290 px wide (see src/application/ui.cpp:657-661).
-    # The two tree arrows are the first two rows inside it.
+    # The Debug Menu is pinned to the right edge and is 290 px wide (src/application/ui.cpp:657-661,
+    # geometry pinned by imgui.ini). The two tree arrows are the first two rows inside it;
+    # the second sits below the first one's 120 px PlotLines graph once it expands.
     $x = $cw - 290 + 14
-    [Win]::ClickClient($hwnd, $x, 27)   # "Full frame-time"
-    [Win]::ClickClient($hwnd, $x, 176)  # "CPU-only frame-time" (below the 120 px plot)
-    Write-Host '==> expanded frame-time graphs' -ForegroundColor Cyan
+    [Win]::ClickClient($hwnd, $x, $ExpandY1)
+    [Win]::ClickClient($hwnd, $x, $ExpandY2)
+    Write-Host "==> expanded frame-time graphs (clicked x=$x, y=$ExpandY1 and y=$ExpandY2)" -ForegroundColor Cyan
 }
 
 $peak = 0; $samples = @()
 if ($Seconds -gt 0) {
+    # ESC unpauses and captures the mouse (src/voxel_app.cpp:228-232). Measure in-game:
+    # while paused the main-menu overlay covers the view and the player does not move.
+    [Win]::Tap([Win]::VK_ESCAPE); Start-Sleep -Milliseconds 700
+    $pitched = 0
     if ($Soak) {
         [void][Win]::SetForegroundWindow($hwnd)
-        [Win]::mouse_event([Win]::MOVE, 0, [uint32]260, 0, [UIntPtr]::Zero)  # pitch down at terrain
+        [Win]::mouse_event([Win]::MOVE, 0, $SoakPitch, 0, [UIntPtr]::Zero)
+        $pitched = $SoakPitch
         Start-Sleep -Milliseconds 400
         [Win]::keybd_event([Win]::VK_W, 0, 0, [UIntPtr]::Zero)
     }
     for ($i = 1; $i -le $Seconds; $i++) {
-        if ($Soak) { [Win]::mouse_event([Win]::MOVE, [uint32]25, 0, 0, [UIntPtr]::Zero) }
+        if ($Soak) { [Win]::mouse_event([Win]::MOVE, $SoakYaw, 0, 0, [UIntPtr]::Zero) }
         Start-Sleep -Seconds 1
         if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { Write-Warning "process died at t=${i}s"; break }
         $u = Get-VramMiB
@@ -176,13 +245,40 @@ if ($Seconds -gt 0) {
     if ($Soak) { [Win]::keybd_event([Win]::VK_W, 0, [Win]::KEYUP, [UIntPtr]::Zero) }
 }
 
-if ($Screenshot) {
-    $full = if ([IO.Path]::IsPathRooted($Screenshot)) { $Screenshot } else { Join-Path $repo $Screenshot }
+function Save-Shot([string]$path) {
+    $full = if ([IO.Path]::IsPathRooted($path)) { $path } else { Join-Path $repo $path }
     New-Item -ItemType Directory -Force -Path (Split-Path $full -Parent) | Out-Null
     [void][Win]::SetForegroundWindow($hwnd)
-    Start-Sleep -Milliseconds 600
+    Start-Sleep -Milliseconds 400
     [Win]::Capture($hwnd, $full)
     Write-Host ("==> screenshot -> {0}" -f $full) -ForegroundColor Cyan
+}
+
+if ($SoakShot) { Save-Shot $SoakShot }
+
+if ($Screenshot) {
+    [void][Win]::SetForegroundWindow($hwnd)
+    if ($pitched -ne 0) {
+        # Frame the shot. The soak walks forward for 30 s and reliably ends up embedded in a
+        # hillside, where the capture shows nothing but the inside faces of half a dozen
+        # voxels. Backing out along the path just walked returns the camera to open terrain,
+        # and the heap does not shrink when it does -- the allocator has no shrink path
+        # (src/utilities/allocator.inl), so the heap figures on screen stay at their peak.
+        if ($RetreatSec -gt 0) {
+            [Win]::keybd_event([Win]::VK_S, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Seconds $RetreatSec
+            [Win]::keybd_event([Win]::VK_S, 0, [Win]::KEYUP, [UIntPtr]::Zero)
+        }
+        # Undo the soak pitch so the capture frames terrain rather than sky or sea floor.
+        [Win]::mouse_event([Win]::MOVE, 0, -$pitched, 0, [UIntPtr]::Zero)
+    }
+    # Two reasons to wait, and the longer one wins. The GI is temporally accumulated (the
+    # irradiance cache and both ReSTIR passes reuse reservoirs across frames), so a frame
+    # grabbed the instant motion stops is visibly noisier. And the frame-time ring buffer is
+    # 200 frames deep, so it needs to fully refill before the on-screen average describes the
+    # settled state rather than the retreat that preceded it.
+    Start-Sleep -Seconds $ConvergeSec
+    Save-Shot $Screenshot
 }
 
 Write-Host ''
@@ -197,11 +293,17 @@ if ($samples.Count) {
 if ($Quit) {
     [void]$p.CloseMainWindow()
     if (-not $p.WaitForExit(15000)) { Write-Warning 'did not exit within 15 s; killing'; $p.Kill() }
-    $p.Refresh()
+    # Read ExitCode before anything else touches the object; Refresh() on an exited process
+    # can invalidate it and leave the field blank.
+    $code = try { $p.ExitCode } catch { 'unavailable' }
     Start-Sleep -Seconds 3   # let the driver release the allocations
-    Write-Host ("    {0,-22} {1}" -f 'exit code', $p.ExitCode)
+    Write-Host ("    {0,-22} {1}" -f 'exit code', $code)
     Write-Host ("    {0,-22} {1} MiB" -f 'VRAM after exit', (Get-VramMiB))
 }
 else {
     Write-Host ("    {0,-22} pid {1} still running" -f 'state', $p.Id)
 }
+
+# Native tools called above (nvidia-smi) leave $LASTEXITCODE set; without this the script
+# reports their exit code as its own and looks like it failed.
+exit 0
