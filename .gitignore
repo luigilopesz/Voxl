@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+# .out/ holds the CMake/Ninja build tree AND vcpkg_installed AND the runtime SPIR-V
+# cache -- ~2.9 GB. All of it is reproducible with tools/build.ps1.
+/.out/
+
+# ---------------------------------------------------------------------------
+# vcpkg
+# ---------------------------------------------------------------------------
+# cmake/vcpkg.cmake clones vcpkg *into the source tree* (cmake/vcpkg.cmake:12). This is
+# also why the repo has to live at a short path such as C:\voxl2 -- from a deep root the
+# clone exceeds MAX_PATH and git aborts with "Filename too long". ~0.7 GB, and it grows:
+# vcpkg downloads its own pinned cmake/7zip/powershell into vcpkg/downloads on first use.
+# It is fully reconstructed by a configure, so it is never committed.
+/vcpkg/
+
+# ---------------------------------------------------------------------------
+# NOT ignored, deliberately
+# ---------------------------------------------------------------------------
+# deps/ is NOT ignored. deps/gvox and deps/Daxa are vcpkg *overlay ports* whose portfiles
+# say `set(SOURCE_PATH "${CMAKE_CURRENT_LIST_DIR}")` -- vcpkg builds them from these exact
+# files, in place. They are vendored first-party source now, not submodules, and one of the
+# four build fixes lives inside deps/gvox. Losing them means losing the build.
+# (Their own nested .gitignore files inherit VS templates that would drop *.lib/*.dll/bin/,
+# so they were force-added once at import; see the initial commit message.)
+#
+# vksdk/ is NOT ignored either. It is the synthesised minimal Vulkan SDK (Vulkan-Headers
+# v1.3.260 plus an import library generated from the driver's vulkan-1.dll) that makes this
+# tree build without a LunarG SDK installed. 13 MB, and the build cannot start without it.
+#
+# imgui.ini is NOT ignored (upstream ignored it, but CMakeLists.txt:107 installs it). It
+# pins the debug-overlay window geometry that the docs/BASELINE.md screenshot depends on.
+
+# ---------------------------------------------------------------------------
+# Editor / OS noise
+# ---------------------------------------------------------------------------
+.vs/
+.cache/
+compile_commands.json
+*.user
+*.dot
+Thumbs.db
+desktop.ini

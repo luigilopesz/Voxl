@@ -1,0 +1,284 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 21,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "defaults",
+            "hidden": true,
+            "binaryDir": "${sourceDir}/.out/${presetName}",
+            "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+            "generator": "Ninja Multi-Config",
+            "cacheVariables": {
+                "GVOX_ENABLE_FILE_IO": true,
+                "GVOX_ENABLE_MULTITHREADED_ADAPTERS": true,
+                "GVOX_ENABLE_THREADSAFETY": true,
+                "GVOX_ENABLE_TESTS": true,
+                "GVOX_ENABLE_ASAN": false,
+                "GVOX_ENABLE_STATIC_ANALYSIS": false,
+                "GVOX_BUILD_FOR_WEB": false,
+                "VCPKG_OVERLAY_TRIPLETS": "${sourceDir}/cmake/vcpkg_triplets"
+            }
+        },
+        {
+            "name": "clangd-support",
+            "binaryDir": "${sourceDir}/build",
+            "inherits": [
+                "defaults"
+            ],
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": true
+            }
+        },
+        {
+            "name": "defaults-windows",
+            "hidden": true,
+            "inherits": [
+                "defaults"
+            ],
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            },
+            "cacheVariables": {
+                "GVOX_TESTS_DISABLE_WINDOWS_CONSOLE": false
+            }
+        },
+        {
+            "name": "defaults-linux",
+            "hidden": true,
+            "inherits": [
+                "defaults"
+            ],
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            }
+        },
+        {
+            "name": "defaults-macos",
+            "hidden": true,
+            "inherits": [
+                "defaults"
+            ],
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Darwin"
+            }
+        },
+        {
+            "name": "emscripten-wasm32-unknown-unknown",
+            "displayName": "Emscripten wasm32",
+            "inherits": [
+                "defaults"
+            ],
+            "cacheVariables": {
+                "GVOX_ENABLE_FILE_IO": false,
+                "GVOX_ENABLE_THREADSAFETY": false,
+                "GVOX_ENABLE_TESTS": false,
+                "GVOX_BUILD_FOR_WEB": true,
+                "VCPKG_TARGET_TRIPLET": "wasm32-emscripten",
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/emscripten-llvm-unknown-unknown.cmake"
+            }
+        },
+        {
+            "name": "wasi-wasm32-unknown-unknown",
+            "displayName": "wasi wasm32",
+            "inherits": [
+                "defaults"
+            ],
+            "cacheVariables": {
+                "GVOX_ENABLE_FILE_IO": false,
+                "GVOX_ENABLE_THREADSAFETY": false,
+                "GVOX_ENABLE_TESTS": false,
+                "GVOX_BUILD_FOR_WEB": true,
+                "VCPKG_TARGET_TRIPLET": "wasm32-wasisdk",
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/wasi-llvm-unknown-unknown.cmake"
+            }
+        },
+        {
+            "name": "clang-x86_64-windows-msvc",
+            "displayName": "Clang x86_64 Windows (MSVC ABI)",
+            "inherits": [
+                "defaults-windows"
+            ],
+            "cacheVariables": {
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/clang-x86_64-windows-msvc.cmake"
+            }
+        },
+        {
+            "name": "cl-x86_64-windows-msvc",
+            "displayName": "CL.exe x86_64 Windows (MSVC ABI)",
+            "inherits": [
+                "defaults-windows"
+            ],
+            "cacheVariables": {
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/cl-x86_64-windows-msvc.cmake"
+            }
+        },
+        {
+            "name": "gcc-x86_64-linux-gnu",
+            "displayName": "G++ x86_64 Linux (GNU ABI)",
+            "inherits": [
+                "defaults-linux"
+            ],
+            "cacheVariables": {
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/gcc-x86_64-linux-gnu.cmake"
+            }
+        },
+        {
+            "name": "clang-x86_64-linux-gnu",
+            "displayName": "Clang x86_64 Linux (GNU ABI)",
+            "inherits": [
+                "defaults-linux"
+            ],
+            "cacheVariables": {
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/clang-x86_64-linux-gnu.cmake"
+            }
+        },
+        {
+            "name": "clang-aarch64-macos-gnu",
+            "displayName": "Clang AArch64 MacOS (GNU ABI?)",
+            "inherits": [
+                "defaults-macos"
+            ],
+            "cacheVariables": {
+                "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/clang-aarch64-macos-gnu.cmake"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "emscripten-wasm32-unknown-unknown-relwithdebinfo",
+            "displayName": "Emscripten wasm32 RelWithDebInfo",
+            "configurePreset": "emscripten-wasm32-unknown-unknown",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "emscripten-wasm32-unknown-unknown-release",
+            "displayName": "Emscripten wasm32 Release",
+            "configurePreset": "emscripten-wasm32-unknown-unknown",
+            "configuration": "Release"
+        },
+        {
+            "name": "emscripten-wasm32-unknown-unknown-debug",
+            "displayName": "Emscripten wasm32 Debug",
+            "configurePreset": "emscripten-wasm32-unknown-unknown",
+            "configuration": "Debug"
+        },
+        {
+            "name": "wasi-wasm32-unknown-unknown-relwithdebinfo",
+            "displayName": "wasi wasm32 RelWithDebInfo",
+            "configurePreset": "wasi-wasm32-unknown-unknown",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "wasi-wasm32-unknown-unknown-release",
+            "displayName": "wasi wasm32 Release",
+            "configurePreset": "wasi-wasm32-unknown-unknown",
+            "configuration": "Release"
+        },
+        {
+            "name": "wasi-wasm32-unknown-unknown-debug",
+            "displayName": "wasi wasm32 Debug",
+            "configurePreset": "wasi-wasm32-unknown-unknown",
+            "configuration": "Debug"
+        },
+        {
+            "name": "clang-x86_64-windows-msvc-debug",
+            "displayName": "Clang x86_64 Windows (MSVC ABI) Debug",
+            "configurePreset": "clang-x86_64-windows-msvc",
+            "configuration": "Debug"
+        },
+        {
+            "name": "clang-x86_64-windows-msvc-relwithdebinfo",
+            "displayName": "Clang x86_64 Windows (MSVC ABI) RelWithDebInfo",
+            "configurePreset": "clang-x86_64-windows-msvc",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "clang-x86_64-windows-msvc-release",
+            "displayName": "Clang x86_64 Windows (MSVC ABI) Release",
+            "configurePreset": "clang-x86_64-windows-msvc",
+            "configuration": "Release"
+        },
+        {
+            "name": "cl-x86_64-windows-msvc-debug",
+            "displayName": "CL.exe x86_64 Windows (MSVC ABI) Debug",
+            "configurePreset": "cl-x86_64-windows-msvc",
+            "configuration": "Debug"
+        },
+        {
+            "name": "cl-x86_64-windows-msvc-relwithdebinfo",
+            "displayName": "CL.exe x86_64 Windows (MSVC ABI) RelWithDebInfo",
+            "configurePreset": "cl-x86_64-windows-msvc",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "cl-x86_64-windows-msvc-release",
+            "displayName": "CL.exe x86_64 Windows (MSVC ABI) Release",
+            "configurePreset": "cl-x86_64-windows-msvc",
+            "configuration": "Release"
+        },
+        {
+            "name": "gcc-x86_64-linux-gnu-debug",
+            "displayName": "G++ x86_64 Linux (GNU ABI) Debug",
+            "configurePreset": "gcc-x86_64-linux-gnu",
+            "configuration": "Debug"
+        },
+        {
+            "name": "gcc-x86_64-linux-gnu-relwithdebinfo",
+            "displayName": "G++ x86_64 Linux (GNU ABI) RelWithDebInfo",
+            "configurePreset": "gcc-x86_64-linux-gnu",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "gcc-x86_64-linux-gnu-release",
+            "displayName": "G++ x86_64 Linux (GNU ABI) Release",
+            "configurePreset": "gcc-x86_64-linux-gnu",
+            "configuration": "Release"
+        },
+        {
+            "name": "clang-x86_64-linux-gnu-debug",
+            "displayName": "Clang x86_64 Linux (GNU ABI) Debug",
+            "configurePreset": "clang-x86_64-linux-gnu",
+            "configuration": "Debug"
+        },
+        {
+            "name": "clang-x86_64-linux-gnu-relwithdebinfo",
+            "displayName": "Clang x86_64 Linux (GNU ABI) RelWithDebInfo",
+            "configurePreset": "clang-x86_64-linux-gnu",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "clang-x86_64-linux-gnu-release",
+            "displayName": "Clang x86_64 Linux (GNU ABI) Release",
+            "configurePreset": "clang-x86_64-linux-gnu",
+            "configuration": "Release"
+        },
+        {
+            "name": "clang-aarch64-macos-gnu-debug",
+            "displayName": "Clang AArch64 MacOS (GNU ABI?) Debug",
+            "configurePreset": "clang-aarch64-macos-gnu",
+            "configuration": "Debug"
+        },
+        {
+            "name": "clang-aarch64-macos-gnu-relwithdebinfo",
+            "displayName": "Clang AArch64 MacOS (GNU ABI?) RelWithDebInfo",
+            "configurePreset": "clang-aarch64-macos-gnu",
+            "configuration": "RelWithDebInfo"
+        },
+        {
+            "name": "clang-aarch64-macos-gnu-release",
+            "displayName": "Clang AArch64 MacOS (GNU ABI?) Release",
+            "configurePreset": "clang-aarch64-macos-gnu",
+            "configuration": "Release"
+        }
+    ]
+}

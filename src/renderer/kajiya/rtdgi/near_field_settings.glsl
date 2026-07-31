@@ -1,0 +1,2 @@
+const bool USE_SPLIT_RT_NEAR_FIELD = true;
+#define SSGI_NEAR_FIELD_RADIUS 80.0

@@ -1,0 +1,16 @@
+.out*
+.vs*
+build/
+.cache/
+
+imgui.ini
+*.dot
+
+# Voxel files
+*.gvox
+*.vox
+*.vxl
+*.mca
+*.nbt
+
+assets/
