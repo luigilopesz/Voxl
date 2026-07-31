@@ -1,11 +1,14 @@
 #include "voxel_app.hpp"
 
 #include <fmt/format.h>
+#include <FreeImage.h>
 
 #include <thread>
 #include <numbers>
 #include <fstream>
 #include <unordered_map>
+
+#include <application/cli.hpp>
 
 // #include <voxels/gvox_model.inl>
 
@@ -26,7 +29,7 @@ constexpr auto round_frame_dim(daxa_u32vec2 size) {
     return result;
 }
 
-VoxelApp::VoxelApp() : AppWindow(APPNAME, {1280, 720}), ui{AppUi(AppWindow::glfw_window_ptr)} {
+VoxelApp::VoxelApp() : AppWindow(APPNAME, {AppCli::get().width, AppCli::get().height}), ui{AppUi(AppWindow::glfw_window_ptr)} {
     gpu_context.create_swapchain({
         .native_window = AppWindow::get_native_handle(),
         .native_window_platform = AppWindow::get_native_platform(),
@@ -67,18 +70,60 @@ VoxelApp::VoxelApp() : AppWindow(APPNAME, {1280, 720}), ui{AppUi(AppWindow::glfw
     record_tasks();
     gpu_context.pipeline_manager->wait();
     debug_utils::Console::add_log(fmt::format("startup: {} s\n", std::chrono::duration<float>(Clock::now() - start).count()));
+
+    // --- command-line startup state -----------------------------------------------------------
+    auto const &cli = AppCli::get();
+    if (cli.overlay >= 0) {
+        // Forced rather than toggled. show_debug_info is persisted to the settings file, so the
+        // state at launch is whatever the *previous* run left behind, and a harness that sends F3
+        // turns the overlay off exactly as often as it turns it on.
+        AppSettings::set("UI", "show_debug_info", settings::Checkbox{.value = cli.overlay == 1});
+    }
+    if (cli.unpause) {
+        ui.paused = false;
+        set_mouse_capture(true);
+    }
+    if (!cli.bench_csv.empty()) {
+        bench_csv_file.open(cli.bench_csv, std::ios::out | std::ios::trunc);
+        if (bench_csv_file.is_open()) {
+            bench_csv_file << "frame,t_s,full_ms,cpu_ms,heap_pages,heap_capacity_mb,heap_used_mb,"
+                              "heap_cap_pages,px,py,pz,yaw,pitch\n";
+        } else {
+            debug_utils::Console::add_log(fmt::format("[cli] could not open --bench-csv '{}'\n", cli.bench_csv));
+        }
+    }
+    // start is re-taken here so --exit-after and --screenshot-after are measured from the first
+    // rendered frame, not from process launch. Shader compilation is 20-40 s on a cold SPIR-V
+    // cache and 3-5 s warm; timing a 30 s run from before it would give two different runs.
+    start = Clock::now();
 }
 VoxelApp::~VoxelApp() {
     gpu_context.device.wait_idle();
     gpu_context.device.collect_garbage();
 
+    if (!screenshot_buffer.is_empty()) {
+        gpu_context.device.destroy_buffer(screenshot_buffer);
+    }
+    if (bench_csv_file.is_open()) {
+        bench_csv_file.flush();
+        bench_csv_file.close();
+    }
+
     voxel_model_loader.destroy();
 }
 
 void VoxelApp::run() {
+    auto const &cli = AppCli::get();
     while (true) {
         glfwPollEvents();
         if (glfwWindowShouldClose(AppWindow::glfw_window_ptr) != 0) {
+            break;
+        }
+        // Checked before rendering so the exit is at a frame boundary with no work in flight.
+        // Leaving the loop normally means ~VoxelApp() runs, the device is waited on, and the
+        // process returns 0 -- which is what makes an automated run distinguishable from a crash.
+        if (cli.exit_after > 0.0f &&
+            std::chrono::duration<float>(Clock::now() - start).count() >= cli.exit_after) {
             break;
         }
 
@@ -122,7 +167,12 @@ void VoxelApp::on_update() {
     }
 
     if (ui.should_upload_seed_data) {
-        auto seed = 15512089755474631791ull; // std::hash<std::string>{}(ui.settings.world_seed_str);
+        // The UI's world-seed field at ui.cpp:346 has never been wired up; the std::hash call it
+        // would feed is still commented out beside this literal upstream. --seed makes the field
+        // reachable from a script without touching that UI plumbing. Note that this seeds only
+        // g_value_noise_tex: the Voxl test scene in voxels/brushes.glsl hashes absolute world
+        // coordinates directly and is deliberately independent of it (docs/SCENE.md sec 5).
+        auto seed = AppCli::get().seed.value_or(15512089755474631791ull);
         gpu_context.update_seeded_value_noise(seed);
         ui.should_upload_seed_data = false;
     }
@@ -167,7 +217,18 @@ void VoxelApp::on_update() {
     player_perframe(player_input, gpu_input.player, voxel_world);
 
     gpu_input.fif_index = gpu_input.frame_index % (FRAMES_IN_FLIGHT + 1);
+
+    // Decided before execute() because the readback task inside the graph reads this flag.
+    if (screenshot_enabled && !screenshot_written) {
+        auto const elapsed = std::chrono::duration<float>(now - start).count();
+        screenshot_capture_this_frame = elapsed >= AppCli::get().screenshot_after;
+    }
+
     gpu_context.frame_task_graph.execute({});
+
+    if (screenshot_capture_this_frame) {
+        write_screenshot();
+    }
 
     gpu_input.resize_factor = 1.0f;
 
@@ -179,8 +240,97 @@ void VoxelApp::on_update() {
     auto t1 = Clock::now();
     ui.update(gpu_input.delta_time, std::chrono::duration<daxa_f32>(t1 - t0).count());
 
+    write_bench_row(std::chrono::duration<daxa_f32>(t1 - t0).count());
+
     ++gpu_input.frame_index;
     gpu_context.device.collect_garbage();
+}
+
+// --- --bench-csv ------------------------------------------------------------------------------
+// One row per frame. Written after ui.update() so full_ms/cpu_ms are exactly the two numbers the
+// debug overlay's graphs plot -- the point of this file is that the overlay stops being the only
+// place the engine's own timing exists, not that it grows a second, differently-measured one.
+void VoxelApp::write_bench_row(daxa_f32 cpu_delta_time) {
+    if (!bench_csv_file.is_open()) {
+        return;
+    }
+    auto const &heap = voxel_world.buffers.voxel_malloc;
+    auto const page_bytes = static_cast<double>(VOXEL_MALLOC_PAGE_SIZE_BYTES);
+    auto const used_pages = static_cast<double>(gpu_output.voxel_world.voxel_malloc_output.current_element_count);
+    bench_csv_file << gpu_input.frame_index << ','
+                   << fmt::format("{:.4f}", std::chrono::duration<float>(Clock::now() - start).count()) << ','
+                   << fmt::format("{:.4f}", gpu_input.delta_time * 1000.0f) << ','
+                   << fmt::format("{:.4f}", cpu_delta_time * 1000.0f) << ','
+                   << heap.current_element_count << ','
+                   << fmt::format("{:.2f}", static_cast<double>(heap.current_element_count) * page_bytes / 1'000'000.0) << ','
+                   << fmt::format("{:.2f}", used_pages * page_bytes / 1'000'000.0) << ','
+                   << heap.max_element_count << ','
+                   << fmt::format("{:.3f}", gpu_input.player.pos.x + static_cast<float>(gpu_input.player.player_unit_offset.x)) << ','
+                   << fmt::format("{:.3f}", gpu_input.player.pos.y + static_cast<float>(gpu_input.player.player_unit_offset.y)) << ','
+                   << fmt::format("{:.3f}", gpu_input.player.pos.z + static_cast<float>(gpu_input.player.player_unit_offset.z)) << ','
+                   << fmt::format("{:.4f}", gpu_input.player.yaw) << ','
+                   << fmt::format("{:.4f}", gpu_input.player.pitch) << '\n';
+}
+
+// --- --screenshot -----------------------------------------------------------------------------
+// Called immediately after frame_task_graph.execute(), with the readback copy already recorded
+// into that graph by the task in record_tasks(). wait_idle() is heavy-handed and would be wrong
+// in a hot loop, but this runs exactly once per process: correctness beats elegance for a
+// one-shot capture, and a fence dance here would be code nobody ever exercises twice.
+void VoxelApp::write_screenshot() {
+    screenshot_capture_this_frame = false;
+    screenshot_written = true;
+    gpu_context.device.wait_idle();
+
+    auto const width = screenshot_extent.x;
+    auto const height = screenshot_extent.y;
+    auto const *src = gpu_context.device.get_host_address_as<uint8_t>(screenshot_buffer).value();
+    if (src == nullptr) {
+        debug_utils::Console::add_log("[cli] screenshot: staging buffer is not host-visible\n");
+        return;
+    }
+    // Belt and braces after the 1080p crash: refuse rather than read past the end. A capture
+    // that does not happen is a bug report; a capture that walks off a buffer is a mystery.
+    auto const needed = static_cast<daxa_u64>(width) * height * 4;
+    auto const have = gpu_context.device.info_buffer(screenshot_buffer).value().size;
+    if (have < needed) {
+        debug_utils::Console::add_log(fmt::format(
+            "[cli] screenshot: staging buffer is {} B, need {} B for {}x{} -- skipped\n",
+            have, needed, width, height));
+        return;
+    }
+
+    // The swapchain format selector in the constructor prefers B8G8R8A8_SRGB and falls back to
+    // R8G8B8A8_SRGB, so the channel order has to be read rather than assumed -- getting it wrong
+    // produces a plausible-looking image with red and blue swapped, which is exactly the kind of
+    // defect that survives review.
+    auto const format = gpu_context.swapchain.get_format();
+    bool const is_bgra = (format == daxa::Format::B8G8R8A8_SRGB) || (format == daxa::Format::B8G8R8A8_UNORM);
+
+    FIBITMAP *bitmap = FreeImage_Allocate(static_cast<int>(width), static_cast<int>(height), 24);
+    if (bitmap == nullptr) {
+        debug_utils::Console::add_log("[cli] screenshot: FreeImage_Allocate failed\n");
+        return;
+    }
+    for (uint32_t y = 0; y < height; ++y) {
+        // FreeImage scanline 0 is the BOTTOM of the image; the swapchain's row 0 is the top.
+        auto *dst = FreeImage_GetScanLine(bitmap, static_cast<int>(height - 1 - y));
+        auto const *row = src + static_cast<size_t>(y) * width * 4;
+        for (uint32_t x = 0; x < width; ++x) {
+            auto const *px = row + static_cast<size_t>(x) * 4;
+            // FreeImage's 24-bit rows are BGR on little-endian regardless of platform.
+            dst[x * 3 + 0] = is_bgra ? px[0] : px[2];
+            dst[x * 3 + 1] = px[1];
+            dst[x * 3 + 2] = is_bgra ? px[2] : px[0];
+        }
+    }
+    auto const &path = AppCli::get().screenshot_path;
+    bool const ok = FreeImage_Save(FIF_PNG, bitmap, path.c_str(), PNG_DEFAULT) != 0;
+    FreeImage_Unload(bitmap);
+    debug_utils::Console::add_log(fmt::format("[cli] screenshot {}: {}\n", ok ? "written" : "FAILED", path));
+    // Printed to stdout as well as the in-app console: the console is only visible with the
+    // backtick key held open, and a harness needs to know the file exists before it reads it.
+    std::cout << "[cli] screenshot " << (ok ? "written" : "FAILED") << ": " << path << std::endl;
 }
 void VoxelApp::on_mouse_move(daxa_f32 x, daxa_f32 y) {
     daxa_f32vec2 const center = {static_cast<daxa_f32>(window_size.x / 2), static_cast<daxa_f32>(window_size.y / 2)};
@@ -370,6 +520,49 @@ void VoxelApp::record_tasks() {
         },
         .name = "ImGui draw",
     });
+
+    // --- --screenshot readback ------------------------------------------------------------------
+    // Recorded after "ImGui draw" so the capture includes the debug overlay, and only when
+    // --screenshot was passed. Recording it unconditionally would add a swapchain layout
+    // transition to every frame of every benchmark run for a feature almost no run uses.
+    screenshot_enabled = !AppCli::get().screenshot_path.empty();
+    if (screenshot_enabled) {
+        // Re-created here rather than in the constructor because record_tasks() also runs on
+        // every resize, and the buffer has to match the current swapchain extent.
+        if (!screenshot_buffer.is_empty()) {
+            gpu_context.device.destroy_buffer(screenshot_buffer);
+        }
+        // The swapchain, not window_size -- see the member's declaration for why.
+        auto const extent = gpu_context.swapchain.get_surface_extent();
+        screenshot_extent = {extent.x, extent.y};
+        screenshot_buffer = gpu_context.device.create_buffer({
+            .size = static_cast<daxa_u64>(screenshot_extent.x) * screenshot_extent.y * 4,
+            .allocate_info = daxa::MemoryFlagBits::HOST_ACCESS_RANDOM,
+            .name = "screenshot_readback",
+        });
+        gpu_context.frame_task_graph.add_task({
+            .attachments = {
+                daxa::inl_attachment(daxa::TaskImageAccess::TRANSFER_READ, daxa::ImageViewType::REGULAR_2D, gpu_context.task_swapchain_image),
+            },
+            .task = [this](daxa::TaskInterface const &ti) {
+                if (!screenshot_capture_this_frame) {
+                    return;
+                }
+                ti.recorder.copy_image_to_buffer({
+                    .image = gpu_context.swapchain_image,
+                    .image_layout = daxa::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    // Defaults are mip 0, layer 0, one layer -- which is the whole swapchain
+                    // image. daxa's ImageArraySlice carries no aspect field; colour is implied.
+                    .image_slice = {},
+                    .image_offset = {0, 0, 0},
+                    .image_extent = {screenshot_extent.x, screenshot_extent.y, 1},
+                    .buffer = screenshot_buffer,
+                    .buffer_offset = 0,
+                });
+            },
+            .name = "Screenshot readback",
+        });
+    }
 
     gpu_context.frame_task_graph.submit({});
     gpu_context.frame_task_graph.present({});

@@ -4,6 +4,17 @@
 
 #define UserAllocatorType VoxelMallocPageAllocator
 #define UserIndexType VoxelMalloc_PageIndex
+// Without this the bounds check in allocator.glsl's malloc() is compiled out entirely, and the
+// page allocator was the ONE instantiation that left it undefined -- the four particle
+// allocators all define it. VOXEL_MALLOC_MAX_PAGE_COUNT (voxel_malloc.inl) is a provable upper
+// bound on the pages this world can address: chunks * palette-regions-per-chunk.
+//
+// Honest limitation: this is the *world* bound, not the heap's current capacity. The CPU-side
+// cap in utilities/allocator.inl can settle the heap below it (1 955 198 pages of budget against
+// 2 097 152 of world at CHUNKS_PER_AXIS 16), and in that window a clamp to the world bound is
+// still past the end of the buffer. Closing that needs the runtime capacity in the allocator
+// struct, which changes a GPU/CPU shared layout. Recorded rather than done.
+#define UserMaxElementCount VOXEL_MALLOC_MAX_PAGE_COUNT
 #include <utilities/allocator.glsl>
 
 // See 'VoxelMalloc_PageInfo' in shared/voxel_malloc.inl

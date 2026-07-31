@@ -5,6 +5,7 @@
 #include <fmt/format.h>
 #include <sago/platform_folders.h>
 #include <nfd.h>
+#include <application/cli.hpp>
 #include <utilities/debug.hpp>
 
 #include <vector>
@@ -675,9 +676,25 @@ void AppUi::update(daxa_f32 delta_time, daxa_f32 cpu_delta_time) {
             ImGui::PlotLines("", frametimes.data(), static_cast<int>(frametimes.size()), static_cast<int>(frametime_rot_index), fmt_str.c_str(), frametime_plot_min, frametime_plot_max, ImVec2(0, 120.0f));
             ImGui::Text("min: %.2f ms, max: %.2f ms", static_cast<double>(min_frametime) * 1000, static_cast<double>(max_frametime) * 1000);
         };
+        // --expand-graphs forces both frame-time nodes open.
+        //
+        // WHY THIS IS A FLAG AND NOT A DEFAULT. The node's open/closed state lives in imgui.ini,
+        // which is a tracked file that every run rewrites, so "is the graph open?" depends on
+        // what the previous run left behind. tools/bench.ps1 worked around that by synthesising
+        // a mouse click at a hardcoded screen position -- `$x = $cw - 290 + 14` -- computed from
+        // the panel's width. The panel is ImGuiWindowFlags_AlwaysAutoResize and pinned to the
+        // right edge, so any debug string wider than the current widest row moves that target and
+        // the click lands on the world instead, silently. This replaces the whole mechanism.
+        auto const force_graphs_open = AppCli::get().expand_graphs;
+        if (force_graphs_open) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+        }
         if (ImGui::TreeNode("Full frame-time")) {
             frametime_graph(full_frametimes, frametime_rotation_index);
             ImGui::TreePop();
+        }
+        if (force_graphs_open) {
+            ImGui::SetNextItemOpen(true, ImGuiCond_Always);
         }
         if (ImGui::TreeNode("CPU-only frame-time")) {
             frametime_graph(cpu_frametimes, frametime_rotation_index);

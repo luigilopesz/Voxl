@@ -210,8 +210,40 @@ void VoxelWorld::begin_frame(daxa::Device &device, GpuInput const &gpu_input, Vo
     // needs_realloc = needs_realloc || buffers.voxel_leaf_chunk_malloc.needs_realloc();
     // needs_realloc = needs_realloc || buffers.voxel_parent_chunk_malloc.needs_realloc();
 
-    debug_utils::DebugDisplay::set_debug_string("GPU Heap", fmt::format("{} pages ({:.2f} MB)", buffers.voxel_malloc.current_element_count, static_cast<double>(buffers.voxel_malloc.current_element_count * VOXEL_MALLOC_PAGE_SIZE_BYTES) / 1'000'000.0));
-    debug_utils::DebugDisplay::set_debug_string("GPU Heap Usage", fmt::format("{:.2f} MB", static_cast<double>(gpu_output.voxel_malloc_output.current_element_count) * VOXEL_MALLOC_PAGE_SIZE_BYTES / 1'000'000));
+    // --- heap readouts ---------------------------------------------------------------------
+    // The MB figure used to be computed as
+    //     static_cast<double>(current_element_count * VOXEL_MALLOC_PAGE_SIZE_BYTES) / 1e6
+    // where both operands are 32-bit, so the multiply wrapped before the cast to double and the
+    // number silently went wrong above 4294967295 / 2112 = 2 033 601 pages. The cast now happens
+    // first. This matters more than a cosmetic bug: it is the number every later stage of this
+    // project reads to decide whether a change made the world cheaper or more expensive, and it
+    // starts lying just below the page counts a denser generator will reach.
+    auto const &heap = buffers.voxel_malloc;
+    auto const page_bytes = static_cast<double>(VOXEL_MALLOC_PAGE_SIZE_BYTES);
+    auto const capacity_mb = static_cast<double>(heap.current_element_count) * page_bytes / 1'000'000.0;
+    auto const cap_mb = static_cast<double>(heap.max_element_count) * page_bytes / 1'000'000.0;
+    auto const used_mb = static_cast<double>(gpu_output.voxel_malloc_output.current_element_count) * page_bytes / 1'000'000.0;
+
+    // Kept deliberately short. The Debug Menu auto-sizes to its widest row and is pinned to the
+    // right edge, so a verbose string here silently widens the panel over a third of the screen
+    // -- and moves the coordinates tools/run.ps1 clicks to open the frame-time graphs.
+    debug_utils::DebugDisplay::set_debug_string(
+        "GPU Heap",
+        fmt::format("{} pages ({:.0f} MB)", heap.current_element_count, capacity_mb));
+    debug_utils::DebugDisplay::set_debug_string(
+        "GPU Heap Usage",
+        fmt::format("{:.0f} MB ({:.0f}%)", used_mb,
+                    heap.current_element_count == 0 ? 0.0 : 100.0 * used_mb / capacity_mb));
+    // The line that would have told you the crash was coming. `cap` is what the VRAM budget
+    // allows; `steps` is how many further 1.5x growths still fit under it, so 0 means the next
+    // growth is already going to be trimmed or refused.
+    debug_utils::DebugDisplay::set_debug_string(
+        "GPU Heap Cap",
+        heap.growth_refusals > 0
+            ? fmt::format("{} MB, REFUSED x{}", static_cast<int>(cap_mb), heap.growth_refusals)
+            : fmt::format("{} MB, {} step{}{}", static_cast<int>(cap_mb),
+                          heap.growth_headroom_steps(), heap.growth_headroom_steps() == 1 ? "" : "s",
+                          heap.growth_throttled ? ", trimmed" : ""));
 
     if (needs_realloc) {
         auto temp_task_graph = daxa::TaskGraph({

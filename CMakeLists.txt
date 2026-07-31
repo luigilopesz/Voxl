@@ -10,6 +10,7 @@ add_executable(${PROJECT_NAME}
     "src/voxel_app.cpp"
     "src/voxels/model.cpp"
     "src/voxels/voxel_world.cpp"
+    "src/application/cli.cpp"
     "src/application/ui.cpp"
     "src/application/audio.cpp"
     "src/application/settings.cpp"

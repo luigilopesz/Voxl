@@ -3,10 +3,13 @@
 #include <bit>
 #include <fmt/format.h>
 
+#include <application/cli.hpp>
 #include <application/settings.hpp>
 #include <utilities/debug.hpp>
 #include <utilities/math.hpp>
+#include <algorithm>
 #include <cmath>
+#include <numbers>
 
 using std::clamp;
 
@@ -24,6 +27,39 @@ void player_fix_chunk_offset(Player &PLAYER) {
     PLAYER.player_unit_offset = daxa_i32vec3(0);
 #endif
 }
+
+namespace {
+    // --- scripted camera (see application/cli.hpp) ---------------------------------------------
+    // The startup pose the patrol circles around, in absolute world metres. Captured on the first
+    // player_startup() rather than read from the CLI every frame, so that --patrol without --pos
+    // orbits wherever the world's spawn happens to be.
+    vec3 g_patrol_centre{};
+    float g_patrol_z = 0.0f;
+    bool g_patrol_centre_valid = false;
+    // Accumulated from delta_time rather than read from a clock, so a stall does not teleport the
+    // camera and two runs at different frame rates still trace the same path at the same speed.
+    float g_scripted_time = 0.0f;
+
+    /// Write an absolute world position into the player's (unit offset + fraction) representation.
+    /// The overlay prints those two separately; their sum is what --pos means.
+    void set_absolute_pos(Player &PLAYER, vec3 const &absolute) {
+        PLAYER.player_unit_offset = daxa_i32vec3(
+            static_cast<int32_t>(std::floor(absolute.x)),
+            static_cast<int32_t>(std::floor(absolute.y)),
+            static_cast<int32_t>(std::floor(absolute.z)));
+        PLAYER.pos = vec3(
+            absolute.x - std::floor(absolute.x),
+            absolute.y - std::floor(absolute.y),
+            absolute.z - std::floor(absolute.z));
+    }
+
+    [[nodiscard]] auto get_absolute_pos(Player const &PLAYER) -> vec3 {
+        return vec3(
+            PLAYER.pos.x + static_cast<float>(PLAYER.player_unit_offset.x),
+            PLAYER.pos.y + static_cast<float>(PLAYER.player_unit_offset.y),
+            PLAYER.pos.z + static_cast<float>(PLAYER.player_unit_offset.z));
+    }
+} // namespace
 
 void player_startup(Player &PLAYER) {
     if (((PLAYER.flags >> 0) & 0x1) != 0) {
@@ -66,6 +102,26 @@ void player_startup(Player &PLAYER) {
     // PLAYER.yaw = 1.68;
     // PLAYER.pitch = 1.49;
 
+    // --- command-line pose override -----------------------------------------------------------
+    // Applied after the hardcoded spawn rather than instead of it, so PLAYER.flags, the settings
+    // registrations above and the fly-mode bit all still happen exactly as before. run_startup()
+    // can fire more than once (the R key, and again when a voxel model finishes loading), and
+    // re-applying the requested pose on each is the wanted behaviour: R becomes "regenerate the
+    // world and put the camera back where I asked for it".
+    auto const &cli = AppCli::get();
+    if (cli.pos.has_value()) {
+        auto const &p = *cli.pos;
+        set_absolute_pos(PLAYER, vec3(p[0], p[1], p[2]));
+    }
+    if (cli.rot.has_value()) {
+        PLAYER.yaw = (*cli.rot)[0];
+        PLAYER.pitch = (*cli.rot)[1];
+    }
+    g_patrol_centre = get_absolute_pos(PLAYER);
+    g_patrol_z = g_patrol_centre.z;
+    g_patrol_centre_valid = true;
+    g_scripted_time = 0.0f;
+
     player_fix_chunk_offset(PLAYER);
 }
 
@@ -89,6 +145,19 @@ void toggle_fly(Player &PLAYER) {
 
 void player_perframe(PlayerInput &INPUT, Player &PLAYER, VoxelWorld &voxel_world) {
     const float mouse_sens = 1.0f;
+
+    // --- scripted camera ----------------------------------------------------------------------
+    // Input is dropped *before* it can accumulate into yaw/pitch. Suppressing movement further
+    // down would not be enough: GLFW delivers a mouse-move event on the very first frame when the
+    // cursor is captured and warped to the window centre, and that single event is a several-
+    // hundred-pixel delta -- easily 0.3 rad of yaw on an otherwise "fixed" camera.
+    auto const &cli = AppCli::get();
+    const bool scripted = cli.camera_scripted();
+    if (scripted) {
+        INPUT.mouse.pos_delta = daxa_f32vec2{0.0f, 0.0f};
+        std::fill(std::begin(INPUT.actions), std::end(INPUT.actions), 0u);
+        g_scripted_time += std::min(INPUT.delta_time, 1.0f);
+    }
 
     if (INPUT.actions[GAME_ACTION_INTERACT1] != 0) {
         PLAYER.roll += INPUT.mouse.pos_delta.x * mouse_sens * INPUT.sensitivity * 0.001f;
@@ -246,6 +315,41 @@ void player_perframe(PlayerInput &INPUT, Player &PLAYER, VoxelWorld &voxel_world
         } else {
             PLAYER.pos = PLAYER.pos - offset;
         }
+    }
+
+    // --- scripted camera: assert the pose last -------------------------------------------------
+    // After the collision block above, deliberately. A locked camera must be able to sit inside
+    // solid rock (the cave shots are taken from positions the push-out at line ~247 would happily
+    // shove sideways), and a patrol path must not be deflected by a boulder. This is a capture and
+    // measurement mode, not gameplay: what was asked for is what gets rendered.
+    if (scripted) {
+        if (cli.patrol.has_value() && g_patrol_centre_valid) {
+            auto const radius = (*cli.patrol)[0];
+            auto const period = (*cli.patrol)[1];
+            auto const angle = 2.0f * std::numbers::pi_v<float> * g_scripted_time / period;
+            set_absolute_pos(PLAYER, vec3(
+                                         g_patrol_centre.x + radius * std::cos(angle),
+                                         g_patrol_centre.y + radius * std::sin(angle),
+                                         g_patrol_z));
+            // Yaw convention comes from move_forward = (+sin(yaw), +cos(yaw), 0) above: yaw is
+            // measured from +Y towards +X. The tangent of the circle at `angle` is
+            // (-sin, +cos) in (x, y), which is that same convention at yaw = -angle.
+            PLAYER.yaw = -angle;
+            if (cli.rot.has_value()) {
+                PLAYER.pitch = (*cli.rot)[1];
+            }
+        } else if (cli.pos.has_value()) {
+            auto const &p = *cli.pos;
+            set_absolute_pos(PLAYER, vec3(p[0], p[1], p[2]));
+        }
+        if (cli.rot.has_value() && !cli.patrol.has_value()) {
+            PLAYER.yaw = (*cli.rot)[0];
+            PLAYER.pitch = (*cli.rot)[1];
+        }
+        // Zeroed so the renderer's motion vectors and the physics both see a still camera; a
+        // residual velocity here shows up as smeared temporal reprojection on a locked shot.
+        PLAYER.vel = vec3(0.0f, 0.0f, 0.0f);
+        PLAYER.cam_pos_offset = vec3(0.0f, 0.0f, 0.0f);
     }
 
     player_fix_chunk_offset(PLAYER);

@@ -15,8 +15,28 @@ UserIndexType FUNC_NAME(malloc)(daxa_RWBufferPtr(UserAllocatorType) allocator) {
         // Create new page.
         result = UserIndexType(atomicAdd(deref(allocator).element_count, 1));
 #if defined(UserMaxElementCount)
-        if (result >= UserMaxElementCount) {
-            UserIndexType(atomicAdd(deref(allocator).element_count, -1));
+        // OUT-OF-RANGE HANDLING.
+        //
+        // What was here before: the counter was decremented back, and then the OUT OF RANGE
+        // `result` was returned anyway --
+        //     UserIndexType(atomicAdd(deref(allocator).element_count, -1));
+        // discarding the atomicAdd's value and leaving `result` untouched. Every caller
+        // immediately does `advance(deref(allocator).heap, result * STRIDE)` and writes, so the
+        // guard prevented the *bookkeeping* from running away while doing nothing at all about
+        // the write that actually leaves the buffer. On a device without robustBufferAccess
+        // that is arbitrary VRAM corruption; with it, the write is dropped and the caller is
+        // never told, which is how a defect this loud manages to look like a rendering glitch.
+        //
+        // Clamping to the last valid element is deliberately not "correct" either -- two
+        // regions then share a page and one of them renders wrong. It is chosen because the
+        // damage is bounded, local, and visible in exactly the place that caused it, whereas
+        // the alternative is unbounded and lands somewhere unrelated. The real fix needs a
+        // failure return the caller can act on; VoxelMalloc_malloc's fallback loop
+        // (voxels/impl/voxel_malloc.glsl:150-189) spins until it succeeds and has no such path,
+        // so giving it one is a larger change than this file.
+        if (daxa_u64(result) >= daxa_u64(UserMaxElementCount)) {
+            atomicAdd(deref(allocator).element_count, -1);
+            result = UserIndexType(daxa_u64(UserMaxElementCount) - 1);
         }
 #endif
     } else {

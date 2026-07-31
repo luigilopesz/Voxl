@@ -1,5 +1,10 @@
 #include <voxels/impl/voxel_world.inl>
 
+// Bisection switch for the chunk post-process, matching the ones at the head of
+// voxels/brushes.glsl. 1 disables generate_normal_from_geometry() entirely, so every surface
+// voxel keeps the normal its brush wrote. See the block at the bottom of ChunkEditPostProcess.
+#define VOXL_DEBUG_NO_DERIVED_NORMALS 0
+
 #if PerChunkComputeShader
 
 DAXA_DECL_PUSH_CONSTANT(PerChunkComputePush, push)
@@ -417,6 +422,13 @@ void main() {
             // if the voxel normal is the "null" normal AKA up
             // bool generate_normal = true;
             bool generate_normal = (result.normal == unpack_voxel(pack_voxel(Voxel(0, 0, vec3(0, 0, 1), vec3(0)))).normal);
+#if VOXL_DEBUG_NO_DERIVED_NORMALS
+            // Bisection switch. Set to 1 and every surface voxel keeps whatever normal the brush
+            // wrote (or +Z if it wrote none); nothing is derived from the neighbourhood. This is
+            // how the black patches on the hill were attributed -- see the comment on
+            // generate_normal_from_geometry() above.
+            generate_normal = false;
+#endif
             if (generate_normal) {
                 result.normal = generate_normal_from_geometry();
             }

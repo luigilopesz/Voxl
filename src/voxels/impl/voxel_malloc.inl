@@ -4,7 +4,20 @@
 #include <utilities/allocator.inl>
 
 #define CHUNK_SIZE 64 // A chunk = 64^3 voxels
-#define CHUNKS_PER_AXIS 32
+
+// The world is a fixed cube of CHUNKS_PER_AXIS^3 chunks that wraps around the player; there is
+// no streaming and nothing outside it exists. At LOG2_VOXEL_SIZE -4 a chunk is 4 m, so this is
+// directly the world's edge length in chunks.
+//
+// 32 (a 128 m cube) is upstream's value and it does not fit this project's brief or its card:
+//   - the voxel_chunks table is sizeof(VoxelLeafChunk) * CHUNKS_PER_AXIS^3 and is resident even
+//     for an empty world -- 8216 B * 32768 = 269.2 MB, versus 33.7 MB at 16.
+//   - the demo world at 32 settled at a 2906 MB voxel heap on a 6 GB card, one growth step from
+//     a device-lost (docs/BASELINE.md sec 4).
+// 16 gives a 64 m cube: still 1024^3 voxel slots, still 16 voxels/metre, and comfortably large
+// enough for the tree/cave/lighting test scene this iteration is for. Must stay a multiple of 8
+// because CHUNKS_DISPATCH_SIZE below divides by 8.
+#define CHUNKS_PER_AXIS 16
 #define CHUNKS_DISPATCH_SIZE (CHUNKS_PER_AXIS / 8)
 
 #define LOG2_VOXEL_SIZE (-4)
@@ -60,6 +73,22 @@
 
 #define VOXEL_MALLOC_MAX_PAGE_ALLOCATIONS_PER_FRAME (VOXEL_MALLOC_MAX_ALLOCATIONS_PER_CHUNK * MAX_CHUNK_UPDATES_PER_FRAME)
 
+// A provable upper bound on how many pages the world can ever consume, used by the allocator as
+// one half of its cap (the other half is the runtime VRAM budget; it takes the smaller).
+//
+// The bound: every palette region allocates at most one page's worth. A region is 8^3 voxels, so
+// its blob is at most 512 u32s of voxel data plus 512 palette entries -- but above
+// PALETTE_MAX_COMPRESSED_VARIANT_N (367) the region is stored raw at 512 u32s = 2048 B, and the
+// largest compressed form is 367 + ceil(9*512/32) = 511 u32s = 2044 B. A page holds
+// VOXEL_MALLOC_MAX_ALLOCATIONS_IN_PAGE_BITFIELD * VOXEL_MALLOC_BYTES_PER_PAGE_BITFIELD_BIT
+// = 24 * 88 = 2112 B, so one page always suffices for one region and pages are shared between
+// regions when their blobs are smaller. Hence: chunks * regions-per-chunk pages, worst case.
+//
+// At CHUNKS_PER_AXIS 16 that is 4096 * 512 = 2 097 152 pages (4446 MB) -- larger than the VRAM
+// budget, so VRAM is what actually binds here. It binds instead at CHUNKS_PER_AXIS 8 or smaller,
+// which is the point: growing the heap past what the world can address is pure waste.
+#define VOXEL_MALLOC_MAX_PAGE_COUNT (daxa_u64(CHUNKS_PER_AXIS) * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * PALETTES_PER_CHUNK)
+
 #define VOXEL_MALLOC_LOG2_MAX_GLOBAL_PAGE_COUNT (32 - VOXEL_MALLOC_CEIL_LOG2_MAX_ALLOCATIONS_IN_PAGE_BITFIELD)
 
 // bits
@@ -92,4 +121,4 @@ struct VoxelMalloc_ChunkLocalPageSubAllocatorState {
     VoxelMalloc_PageInfo page_allocation_infos[VOXEL_MALLOC_MAX_ALLOCATIONS_PER_CHUNK];
 };
 
-DECL_SIMPLE_ALLOCATOR(VoxelMallocPageAllocator, daxa_u32, VOXEL_MALLOC_PAGE_SIZE_U32S, VoxelMalloc_PageIndex, (VOXEL_MALLOC_MAX_PAGE_ALLOCATIONS_PER_FRAME))
+DECL_SIMPLE_ALLOCATOR(VoxelMallocPageAllocator, daxa_u32, VOXEL_MALLOC_PAGE_SIZE_U32S, VoxelMalloc_PageIndex, (VOXEL_MALLOC_MAX_PAGE_ALLOCATIONS_PER_FRAME), (VOXEL_MALLOC_MAX_PAGE_COUNT))

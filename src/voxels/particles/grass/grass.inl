@@ -2,7 +2,19 @@
 
 #include "../common.inl"
 
-#define MAX_GRASS_BLADES (1 << 22)
+// Grass is not voxels. Each blade is a GPU-simulated particle rasterised into the same G-buffer
+// the ray tracer fills, so this constant is a hard VRAM cost paid up front whether or not the
+// blades exist: sizeof(GrassStrand) for the pool, two u32 index stacks, and three vertex buffers
+// of 3 PackedParticleVertex per blade.
+//   1<<22 = 4194304 blades -> 80 + 16 + 16 + 144 = 256 MiB, always resident
+//   1<<20 = 1048576 blades ->                       64 MiB, always resident
+//
+// 1<<20 rather than something in between because blades cover *surface*, and surface scales with
+// the square of the world's edge length. CHUNKS_PER_AXIS went 32 -> 16, halving the edge, so the
+// grassable area is a quarter of what it was and a quarter of the pool is the matched number.
+// Verified in a screenshot rather than assumed: the ground still reads as dense grass with no
+// visible thinning, and the allocator is nowhere near exhausted.
+#define MAX_GRASS_BLADES (1 << 20)
 
 struct GrassStrand {
     daxa_f32vec3 origin;

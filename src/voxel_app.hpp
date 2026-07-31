@@ -13,6 +13,7 @@
 #include <utilities/gpu_context.hpp>
 
 #include <chrono>
+#include <fstream>
 #include <future>
 
 struct VoxelApp : AppWindow<VoxelApp> {
@@ -40,6 +41,29 @@ struct VoxelApp : AppWindow<VoxelApp> {
     bool needs_vram_calc = true;
 
     daxa_f32 render_res_scl{1.0f};
+
+    // --- command-line driven capture and benchmarking (see application/cli.hpp) ----------------
+    // Open only when --bench-csv was passed; one row per frame is appended from on_update().
+    std::ofstream bench_csv_file;
+    // Host-visible staging for --screenshot, sized from the SWAPCHAIN's extent rather than from
+    // window_size. Those two are not the same number: window_size is what was asked for and is
+    // only corrected by on_resize(), which early-outs when the requested and current sizes
+    // compare equal, so at startup it can differ from the surface the driver actually gave us.
+    // Sizing the buffer from one and copying with the other put a 1920x1080 run past the end of
+    // an undersized buffer and killed the process at the exact frame the capture was due.
+    daxa::BufferId screenshot_buffer;
+    daxa_u32vec2 screenshot_extent{};
+    // Set the frame the readback should be recorded on, cleared once the PNG has been written.
+    bool screenshot_capture_this_frame = false;
+    bool screenshot_written = false;
+    // Recorded once at record_tasks() time. The readback task adds a TRANSFER_READ attachment on
+    // the swapchain image, which forces an extra layout transition every single frame -- so it is
+    // only recorded into the graph when a screenshot was actually asked for, keeping benchmark
+    // runs bit-identical to runs without the feature.
+    bool screenshot_enabled = false;
+
+    void write_screenshot();
+    void write_bench_row(daxa_f32 cpu_delta_time);
 
     VoxelApp();
     VoxelApp(VoxelApp const &) = delete;
