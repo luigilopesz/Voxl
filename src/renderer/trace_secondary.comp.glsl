@@ -16,6 +16,14 @@ daxa_ImageViewIndex blue_noise_vec2 = push.uses.blue_noise_vec2;
 daxa_ImageViewIndex g_buffer_image_id = push.uses.g_buffer_image_id;
 daxa_ImageViewIndex depth_image_id = push.uses.depth_image_id;
 daxa_ImageViewIndex particles_shadow_depth_tex = push.uses.particles_shadow_depth_tex;
+daxa_ImageViewIndex step_count_image_id = push.uses.step_count_image_id;
+
+// Same encoding, scale and bottom-rows calibration ramp as the primary heatmap; see
+// trace_primary.comp.glsl. The ramp is not decoration: without it the analysis has to *assume*
+// the swapchain's transfer function, and the first version of this instrument silently decoded
+// the ramp-less shadow image against a garbage LUT and reported every pixel as capped.
+#define VOXL_STEP_VIS_SCALE 1024.0
+#define VOXL_STEP_VIS_CALIB_ROWS 4
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
@@ -43,9 +51,18 @@ void main() {
     vec3 ray_dir = sample_sun_direction(gpu_input, blue_noise, true);
 
     uint hit = 0;
+    uint shadow_step_n = 0;
+    bool shadow_traced = false;
+    bool shadow_ran_out_of_steps = false;
     if (depth != 0.0 && dot(nrm, ray_dir) > 0) {
         VoxelTraceResult trace_result = voxel_trace(VoxelTraceInfo(VOXELS_BUFFER_PTRS, ray_dir, MAX_STEPS, MAX_DIST, 0.0, true), ray_pos);
         hit = uint(trace_result.dist == MAX_DIST);
+        shadow_step_n = trace_result.step_n;
+        shadow_traced = true;
+        // A shadow ray that runs out of budget reports "reached the sun unobstructed", so the
+        // pixel is lit when it should be shadowed. The symptom is missing shadows at range,
+        // which is even harder to spot by eye than a hole in the geometry.
+        shadow_ran_out_of_steps = (shadow_step_n >= VOXL_TRACE_MAX_STEPS(MAX_STEPS));
     }
 
     {
@@ -64,6 +81,19 @@ void main() {
     }
 
     imageStore(daxa_image2D(shadow_mask), ivec2(gl_GlobalInvocationID.xy), vec4(hit, 0, 0, 0));
+    //   R  shadow-ray steps / VOXL_STEP_VIS_SCALE
+    //   G  unused (0)
+    //   B  0.00 = no shadow ray fired for this pixel (sky, or facing away from the sun)
+    //      0.50 = the ray finished on its own
+    //      1.00 = RAN OUT OF STEPS -- reported as unobstructed, so a missing shadow
+    vec3 vis;
+    if (gl_GlobalInvocationID.y + VOXL_STEP_VIS_CALIB_ROWS >= uint(output_tex_size.y)) {
+        vis = vec3(float(gl_GlobalInvocationID.x) / max(output_tex_size.x - 1.0, 1.0));
+    } else {
+        vis = vec3(float(shadow_step_n) * (1.0 / VOXL_STEP_VIS_SCALE), 0.0,
+                   shadow_ran_out_of_steps ? 1.0 : (shadow_traced ? 0.5 : 0.0));
+    }
+    imageStore(daxa_image2D(step_count_image_id), ivec2(gl_GlobalInvocationID.xy), vec4(vis, 1.0));
 }
 
 #endif

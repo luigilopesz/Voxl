@@ -80,6 +80,15 @@ void main() {
             CHUNKS(chunk_index).flags &= ~CHUNK_FLAGS_ACCEL_GENERATED;
             try_elect(terrain_work_item, update_index);
         }
+#if VOXEL_LEVEL != 0
+    }
+    // THE FAR FIELD DOES NOT TAKE EDITS, and the branch below is compiled out rather than
+    // left to fail harmlessly. Player edits happen at 6.25 cm in L0; propagating one up a
+    // level needs a downsample pass per edited region and is deferred (PERFORMANCE_PLAN.md
+    // sec 5.7 item 6). Left in, it would be worse than a no-op: the far level's globals are
+    // never given a brush_input, so brush_pos is (0,0,0) and radius 0, and holding the mouse
+    // would elect the far chunk at the world origin and run brushgen_a over it at 25 cm.
+#else
     } else {
         // Wrapped chunk index in leaf chunk space (0^3 - 31^3)
         ivec3 wrapped_chunk_i = imod3(terrain_work_item.i - imod3(terrain_work_item.chunk_offset - ivec3(chunk_n), ivec3(chunk_n)), ivec3(chunk_n));
@@ -188,6 +197,7 @@ void main() {
             try_elect(terrain_work_item, update_index);
         }
     }
+#endif
 
     CHUNKS(chunk_index).update_index = update_index;
 }
@@ -505,6 +515,30 @@ void main() {
             // if the voxel normal is the "null" normal AKA up
             // bool generate_normal = true;
             bool generate_normal = (result.normal == unpack_voxel(pack_voxel(Voxel(0, 0, vec3(0, 0, 1), vec3(0)))).normal);
+#if VOXEL_LEVEL != 0
+            // A FILTERED LEVEL MUST KEEP ITS FILTERED NORMAL. Rule (3) in brushes.glsl already
+            // records what this function does to a smooth hillside of one colour: the 5^3
+            // neighbourhood it reads crosses chunk boundaries, only MAX_CHUNK_UPDATES_PER_FRAME
+            // chunks are generated per frame, and a chunk generated before its neighbour reads
+            // that neighbour as air, derives a normal tilted into it, and is never revisited.
+            // On the near field's noisy 6.25 cm terrain that is invisible; the far field is
+            // nothing BUT smooth hillsides of one colour, and the first far-field capture
+            // (docs/images/far-field/FF01) is covered in chunk-sized black wedges because of it.
+            //
+            // The trigger is the equality test above, and it is far more sensitive than it
+            // looks: the normal is stored as an 8-bit octahedral index (pack_unpack.glsl:43),
+            // 256 directions in total, so EVERY normal within roughly 12 degrees of straight up
+            // compares equal to the default and asks to be re-derived. That is most of a
+            // distant hillside. Nudging the written normal to dodge the test would need a
+            // 12-degree lie.
+            //
+            // It is also simply unnecessary here. brushgen_far_field() computes a normal by
+            // central difference of the low-passed height field over the voxel's own footprint
+            // -- that is the block's true average orientation, which is exactly what a filtered
+            // level wants and strictly better than anything a neighbourhood scan can recover
+            // after the fact.
+            generate_normal = false;
+#endif
 #if VOXL_DEBUG_NO_DERIVED_NORMALS
             // Bisection switch. Set to 1 and every surface voxel keeps whatever normal the brush
             // wrote (or +Z if it wrote none); nothing is derived from the neighbourhood. This is
@@ -1020,8 +1054,19 @@ void main() {
         daxa_RWBufferPtr(uint) blob_u32s;
         voxel_malloc_address_to_u32_ptr(daxa_BufferPtr(VoxelMallocPageAllocator)(as_address(voxel_malloc_page_allocator)), blob_ptr, blob_u32s);
         deref(advance(blob_u32s, PALETTE_ACCELERATION_STRUCTURE_SIZE_U32S + palette_region_voxel_index)) = compression_result[palette_region_voxel_index];
+#if VOXEL_LEVEL == 0
         deref(advance(chunk_update_heap, frame_index * MAX_CHUNK_UPDATES_PER_FRAME_VOXEL_COUNT + output_offset + palette_region_voxel_index)) = compression_result[palette_region_voxel_index];
+#endif
     }
+    // THE CPU MIRROR IS L0's ALONE. These two writes feed VoxelWorld::begin_frame, which keeps
+    // a CPU copy of the voxel world for VoxelWorld::sample() -- i.e. for player collision. The
+    // player never stands on the far field, so the far level does not need a mirror; compiling
+    // the writes out lets it share L0's chunk_updates and chunk_update_heap instead of needing
+    // its own, which at MAX_CHUNK_UPDATES_PER_FRAME 128 would be another 268 MB of host-visible
+    // memory. It has to be compiled out rather than bound elsewhere: with both levels writing
+    // the same slots, the mirror would take L1 chunk indices as if they were L0's and collision
+    // would silently go wrong somewhere the player can walk.
+#if VOXEL_LEVEL == 0
     if (palette_region_voxel_index == 0) {
         CpuChunkUpdateInfo chunk_update_info;
         chunk_update_info.chunk_index = chunk_index;
@@ -1036,6 +1081,7 @@ void main() {
         }
         deref(advance(chunk_updates, frame_index * MAX_CHUNK_UPDATES_PER_FRAME + temp_chunk_index)).palette_headers[palette_region_index] = palette_header;
     }
+#endif
 
     if (palette_size > 1 && palette_region_voxel_index < 1) {
         // write accel structure

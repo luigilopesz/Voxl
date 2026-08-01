@@ -11,6 +11,7 @@ DAXA_TH_IMAGE_INDEX(COMPUTE_SHADER_SAMPLED, REGULAR_3D, blue_noise_vec2)
 DAXA_TH_IMAGE_INDEX(COMPUTE_SHADER_SAMPLED, REGULAR_2D, g_buffer_image_id)
 DAXA_TH_IMAGE_INDEX(COMPUTE_SHADER_SAMPLED, REGULAR_2D, depth_image_id)
 DAXA_TH_IMAGE_INDEX(COMPUTE_SHADER_SAMPLED, REGULAR_2D, particles_shadow_depth_tex)
+DAXA_TH_IMAGE_INDEX(COMPUTE_SHADER_STORAGE_WRITE_ONLY, REGULAR_2D, step_count_image_id)
 DAXA_DECL_TASK_HEAD_END
 struct TraceSecondaryComputePush {
     DAXA_TH_BLOB(TraceSecondaryCompute, uses)
@@ -31,6 +32,16 @@ inline auto trace_shadows(GpuContext &gpu_context, GbufferDepth &gbuffer_depth, 
 
     auto render_shadows = AppSettings::get<settings::Checkbox>("Graphics", "Render Shadows").value;
 
+    // Companion to "voxel step count": the sun-shadow ray is the other one-per-pixel trace in
+    // the frame, it starts on a surface rather than at the camera, and it is aimed at the sun
+    // -- so in a large world it is the trace most likely to run out of step budget. Same
+    // encoding as the primary heatmap (see trace_primary.comp.glsl).
+    auto shadow_step_count_image = gpu_context.frame_task_graph.create_transient_image({
+        .format = daxa::Format::R8G8B8A8_UNORM,
+        .size = {gpu_context.render_resolution.x, gpu_context.render_resolution.y, 1},
+        .name = "shadow_step_count_image",
+    });
+
     if (render_shadows) {
         gpu_context.add(ComputeTask<TraceSecondaryCompute::Task, TraceSecondaryComputePush, NoTaskInfo>{
             .source = daxa::ShaderFile{"trace_secondary.comp.glsl"},
@@ -42,6 +53,7 @@ inline auto trace_shadows(GpuContext &gpu_context, GbufferDepth &gbuffer_depth, 
                 daxa::TaskViewVariant{std::pair{TraceSecondaryCompute::AT.g_buffer_image_id, gbuffer_depth.gbuffer}},
                 daxa::TaskViewVariant{std::pair{TraceSecondaryCompute::AT.depth_image_id, gbuffer_depth.depth.current()}},
                 daxa::TaskViewVariant{std::pair{TraceSecondaryCompute::AT.particles_shadow_depth_tex, particles_shadow_depth_image}},
+                daxa::TaskViewVariant{std::pair{TraceSecondaryCompute::AT.step_count_image_id, shadow_step_count_image}},
             },
             .callback_ = [](daxa::TaskInterface const &ti, daxa::ComputePipeline &pipeline, TraceSecondaryComputePush &push, NoTaskInfo const &) {
                 auto const image_info = ti.device.info_image(ti.get(TraceSecondaryCompute::AT.g_buffer_image_id).ids[0]).value();
@@ -52,10 +64,11 @@ inline auto trace_shadows(GpuContext &gpu_context, GbufferDepth &gbuffer_depth, 
             },
         });
     } else {
-        clear_task_images(gpu_context.frame_task_graph, std::array<daxa::TaskImageView, 1>{shadow_mask}, std::array<daxa::ClearValue, 1>{std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
+        clear_task_images(gpu_context.frame_task_graph, std::array<daxa::TaskImageView, 2>{shadow_mask, shadow_step_count_image}, std::array<daxa::ClearValue, 2>{std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}, std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}});
     }
 
     debug_utils::DebugDisplay::add_pass({.name = "trace shadow bitmap", .task_image_id = shadow_mask, .type = DEBUG_IMAGE_TYPE_DEFAULT_UINT});
+    debug_utils::DebugDisplay::add_pass({.name = "shadow step count", .task_image_id = shadow_step_count_image, .type = DEBUG_IMAGE_TYPE_DEFAULT});
 
     return daxa::TaskImageView{shadow_mask};
 }

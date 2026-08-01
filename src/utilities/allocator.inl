@@ -90,6 +90,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 
 // daxa_dvc_get_vk_physical_device() lives in the C API, and daxa/c/types.h is what pulls in
@@ -176,6 +177,29 @@ namespace gpu_heap_budget {
 
     /// Bytes the growable heap is allowed to occupy at any instant, mid-realloc included.
     inline auto compute(daxa::Device &device) -> daxa_u64 {
+        // TEST OVERRIDE -- VOXL_HEAP_BUDGET_MB.
+        //
+        // WHY IT EXISTS. Everything below is a degradation policy that, on the shipped world,
+        // CANNOT BE REACHED, at any CHUNKS_PER_AXIS. Measured across 16/32/48/64: the heap
+        // settles at 393216 pages (830 MB) against a 1955198-page (4145 MB) cap, with zero
+        // refusals, because the island's content does not grow when the world box does. Worse,
+        // the heap's INITIAL capacity is (FRAMES_IN_FLIGHT+1) * PALETTES_PER_CHUNK *
+        // MAX_CHUNK_UPDATES_PER_FRAME = 131072 pages = 278 MB, and the island only ever consumes
+        // about 6100 of those, so the very first allocation is already 21x what the world needs.
+        //
+        // A degradation policy nobody can provoke is a policy nobody has checked, and this one
+        // was added in response to a crash and had never once run in anger. This makes it
+        // reachable on demand: docs/SCALE_LIMITS.md sec 6 is what it is for, and it distinguishes
+        // "GROWTH REFUSED" (the safety margin can no longer be guaranteed) from actual heap
+        // exhaustion, which are not the same event and have very different consequences.
+        //
+        // Read once at startup. Unset, the behaviour is byte-for-byte what it was before.
+        if (auto const *over = std::getenv("VOXL_HEAP_BUDGET_MB"); over != nullptr && *over != '\0') {
+            auto const mb = std::strtoull(over, nullptr, 10);
+            if (mb > 0) {
+                return mb * MiB;
+            }
+        }
         auto const total = device_local_bytes(device);
         if (total == 0) {
             return FALLBACK_BUDGET_BYTES;

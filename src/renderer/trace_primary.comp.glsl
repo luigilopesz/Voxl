@@ -3,6 +3,22 @@
 #include <renderer/kajiya/inc/camera.glsl>
 #include <voxels/voxels.glsl>
 
+// --- Step-count instrument ------------------------------------------------------------------
+//
+// VoxelTraceResult.step_n used to be computed and thrown away here, and the prepass consumer
+// below read a `.y` channel the prepass never wrote. Both are wired up now, because the
+// question "does MAX_STEPS bind?" is otherwise unanswerable except by inference -- and a ray
+// that exhausts its budget is reported as a MISS and shaded as sky, so the symptom is a hole
+// in distant geometry, which looks exactly like correct sky.
+//
+// Everything is normalised by VOXL_STEP_VIS_SCALE rather than by max_steps, so heatmaps taken
+// at different step budgets are directly comparable. 1024 = twice the shipped MAX_STEPS.
+#define VOXL_STEP_VIS_SCALE 1024.0
+// Rows at the bottom of the heatmap that carry a known 0..1 ramp instead of data. The image
+// reaches the PNG through an sRGB swapchain; the ramp lets the analysis *measure* that
+// transfer and invert it rather than assume it. Excluded from every histogram.
+#define VOXL_STEP_VIS_CALIB_ROWS 4
+
 #if TraceDepthPrepassComputeShader
 
 DAXA_DECL_PUSH_CONSTANT(TraceDepthPrepassComputePush, push)
@@ -28,11 +44,19 @@ void main() {
 #endif
 
     float depth = length(ray_pos - cam_pos);
+#if ENABLE_DEPTH_PREPASS
+    float steps = float(trace_result.step_n);
+#else
+    float steps = 0.0;
+#endif
 
     if (any(greaterThanEqual(gl_GlobalInvocationID.xy, (uvec2(output_tex_size.xy)) / PREPASS_SCL))) {
         return;
     }
-    imageStore(daxa_image2D(render_depth_prepass_image), ivec2(gl_GlobalInvocationID.xy), vec4(depth, 0, 0, 0));
+    // .y is the step count the consumer in TracePrimaryComputeShader has always read and
+    // nothing has ever written. It is raw here; the /4 the consumer used to apply was a
+    // leftover from an upstream packing that no longer exists.
+    imageStore(daxa_image2D(render_depth_prepass_image), ivec2(gl_GlobalInvocationID.xy), vec4(depth, steps, 0, 0));
 }
 #undef INPUT
 
@@ -50,6 +74,7 @@ daxa_ImageViewIndex g_buffer_image_id = push.uses.g_buffer_image_id;
 daxa_ImageViewIndex velocity_image_id = push.uses.velocity_image_id;
 daxa_ImageViewIndex vs_normal_image_id = push.uses.vs_normal_image_id;
 daxa_ImageViewIndex depth_image_id = push.uses.depth_image_id;
+daxa_ImageViewIndex step_count_image_id = push.uses.step_count_image_id;
 
 #include <renderer/atmosphere/sky.glsl>
 
@@ -81,7 +106,7 @@ void main() {
             float loaded_depth = prepass_data.x - VOXEL_SIZE;
             prepass_depth = max(min(prepass_depth, loaded_depth), 0);
             if (prepass_depth == loaded_depth || prepass_depth == max_depth) {
-                prepass_steps = prepass_data.y / 4.0;
+                prepass_steps = prepass_data.y;
             }
         }
     }
@@ -91,6 +116,11 @@ void main() {
 
     VoxelTraceResult trace_result = voxel_trace(VoxelTraceInfo(VOXELS_BUFFER_PTRS, ray_dir, MAX_STEPS, MAX_DIST, 0.0, true), ray_pos);
     uint step_n = trace_result.step_n;
+    // voxel_trace's loop runs `for (step_n = 0; step_n < max_steps; ++step_n)`, so step_n only
+    // equals the budget when the loop was exhausted -- a ray that left the world box or found a
+    // surface stops short. voxel_trace may override the budget itself (VOXL_MAX_STEPS in
+    // voxels/impl/trace.glsl), so read it back from the result rather than assuming MAX_STEPS.
+    bool ran_out_of_steps = (step_n >= VOXL_TRACE_MAX_STEPS(MAX_STEPS));
 
     uvec4 output_value = uvec4(0);
 
@@ -158,6 +188,27 @@ void main() {
     imageStore(daxa_image2D(velocity_image_id), ivec2(gl_GlobalInvocationID.xy), vec4(vs_velocity, 0));
     imageStore(daxa_image2D(vs_normal_image_id), ivec2(gl_GlobalInvocationID.xy), vec4(vs_nrm * 0.5 + 0.5, 0));
     imageStore(daxa_image2D(depth_image_id), ivec2(gl_GlobalInvocationID.xy), vec4(depth, 0, 0, 0));
+
+    // --- the step heatmap -------------------------------------------------------------------
+    //   R  main-trace steps / VOXL_STEP_VIS_SCALE
+    //   G  depth-prepass steps for this pixel's prepass texel, same scale
+    //   B  0.00 = clean miss (left the world box; genuinely sky)
+    //      0.50 = hit a surface
+    //      1.00 = RAN OUT OF STEPS. Reported as a miss and shaded as sky, but there may be
+    //             geometry behind it. Every such pixel is a hole.
+    // The bottom VOXL_STEP_VIS_CALIB_ROWS rows carry a 0..1 ramp instead, so the analysis can
+    // measure the swapchain's transfer function out of the PNG rather than assuming sRGB.
+    vec3 vis;
+    if (gl_GlobalInvocationID.y + VOXL_STEP_VIS_CALIB_ROWS >= uint(output_tex_size.y)) {
+        float ramp = float(gl_GlobalInvocationID.x) / max(output_tex_size.x - 1.0, 1.0);
+        vis = vec3(ramp);
+    } else {
+        vis = vec3(
+            float(step_n) * (1.0 / VOXL_STEP_VIS_SCALE),
+            prepass_steps * (1.0 / VOXL_STEP_VIS_SCALE),
+            ran_out_of_steps ? 1.0 : (trace_result.dist == MAX_DIST ? 0.0 : 0.5));
+    }
+    imageStore(daxa_image2D(step_count_image_id), ivec2(gl_GlobalInvocationID.xy), vec4(vis, 1.0));
 }
 #undef INPUT
 

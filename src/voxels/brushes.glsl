@@ -682,6 +682,84 @@ vec3 voxl_cave_nrm(vec3 s) {
     return (l > 1e-6) ? (-g / l) : vec3(0.0, 0.0, 1.0);
 }
 
+// ============================================================================
+// VEGETATION DENSITY KNOBS                          docs/DENSITY_LIMITS.md
+// ============================================================================
+//
+// Everything below this banner and above "-- rock, soil and cave walls --" is
+// vegetation. These knobs are the only things a density sweep changes; the
+// shader is compiled at runtime, so rewriting one of these lines and relaunching
+// costs a SPIR-V recompile and no C++ rebuild.
+//
+// THE DEFAULTS REPRODUCE THE SCENE AS DOCUMENTED IN docs/SCENE.md EXACTLY.
+// VOXL_VEG_FOREST 0 and VOXL_VEG_FERN 0 leave one conifer, ~50 blades/m^2 and
+// ~0.6 flowers/m^2, which is what every number in docs/BASELINE.md was taken on.
+//
+// WHY VEGETATION AND NOT TERRAIN IS THE MEMORY QUESTION. The palette compressor
+// allocates *nothing* for an 8^3 region whose voxels are bit-identical
+// (voxel_world.comp.glsl:908-915), which is why a solid island costs 13 MB of
+// heap. Foliage is the exact opposite: needles are stochastic 2-3 voxel clumps
+// in five colours interleaved with air, so every region a canopy touches is
+// maximally non-uniform and allocates. A tree is the most expensive cubic metre
+// in this world and grass -- being particles, not voxels -- is the cheapest.
+// The sweep exists to put numbers on both.
+
+// --- trees -------------------------------------------------------------------
+// FOREST 0 is the single authored hero conifer at VOXL_TREE_XY and nothing else.
+// FOREST 1 keeps that tree and ADDS a lattice stand around it, so the series is
+// nested: every denser point contains every sparser one.
+//
+// Qualification is decided on the UNJITTERED cell centre and uses nothing but
+// three distances, so the stem count is exactly computable on the CPU without
+// replicating a GLSL hash. Jitter then moves the trunk up to +/-35% of a cell.
+//   stems = #{ cells c : |cc-ISLAND_C| < FOREST_R,  |cc| > CLEAR_R,
+//                        |cc-HILL_C| > HILL_KEEPOUT,  hash(c) < TREE_PROB }
+//   stems/ha ~= 10000 * TREE_PROB / TREE_SPACING^2
+#define VOXL_VEG_FOREST 0
+#define VOXL_VEG_TREE_SPACING 6.0
+#define VOXL_VEG_TREE_PROB 1.0
+// Where the stand is allowed to grow. FOREST_R 17 keeps trunks 1.5 m inside the
+// point where solid terrain ends (~18.5 m from the island centre); CLEAR_R keeps
+// the spawn pad open so the vista pose is not standing inside a trunk;
+// HILL_KEEPOUT covers both the bare rock of the hill and the cave mouth, which
+// sits 7.4 m from the hill centre.
+#define VOXL_VEG_FOREST_R 17.0
+#define VOXL_VEG_CLEAR_R 4.5
+#define VOXL_VEG_HILL_KEEPOUT 9.0
+// Per-tree size spread. A stand of identical trees reads as wallpaper; this costs
+// two hashes and a 2x2 rotate.
+#define VOXL_VEG_TREE_SCL_MIN 0.72
+#define VOXL_VEG_TREE_SCL_MAX 1.28
+
+// --- undergrowth: ferns ------------------------------------------------------
+// Ferns are REAL VOXELS, not particles. That is the point of having them: they
+// are the cheapest way to ask "what does non-uniform volume at ankle height
+// cost", which is the question grass cannot answer because grass never touches
+// the voxel heap.
+#define VOXL_VEG_FERN 0
+#define VOXL_VEG_FERN_SPACING 2.2
+#define VOXL_VEG_FERN_PROB 0.55
+
+// --- grass skin, grass strands and flowers -----------------------------------
+// SKIN_FRAC is the fraction of surface voxels that get the green skin at all;
+// the rest stay bare soil. GRASS_FRAC and FLOWER_FRAC are fractions OF THOSE,
+// drawn from an independent hash so the two are separable and either can be
+// taken to 1.0. Densities per square metre, at 256 surface voxels/m^2:
+//     blades/m^2  = 256 * SKIN_FRAC * GRASS_FRAC
+//     flowers/m^2 = 256 * SKIN_FRAC * FLOWER_FRAC
+// The defaults give 49.8 and 0.588, matching docs/SCENE.md 4.5 to three figures.
+#define VOXL_VEG_SKIN_FRAC 0.82
+#define VOXL_VEG_GRASS_FRAC 0.2372
+#define VOXL_VEG_FLOWER_FRAC 0.0028
+
+// --- grass palette -----------------------------------------------------------
+// 0 restores the five-green ramp the scene shipped with. 1 is the wider palette
+// added 2026-07-31; see the note above voxl_ground_cover for what it changes.
+// Shipped as 1. Measured A/B at the spawn (docs/DENSITY_LIMITS.md sec 7):
+// 7.155 ms / 13.19 MB against 6.933 ms / 13.80 MB, both inside the run-to-run
+// noise floor, so the wider palette is free.
+#define VOXL_VEG_GRASS_PALETTE 1
+
 // -- the conifer --------------------------------------------------------------
 //
 // At 16 voxels/m a 6.6 m spruce is 106 voxels tall, so there is room for real
@@ -754,20 +832,32 @@ VoxlTree voxl_conifer(vec3 p) {
     return t;
 }
 
+// One conifer standing at `txy`, `scl` times the authored size, turned `rot`
+// radians about its own trunk, with its needle palette rotated by `tint`.
 // Returns true if it claimed the voxel.
-bool voxl_tree_voxel(in out Voxel v, vec3 s) {
+//
+// scl and rot are what make a lattice stand read as a forest rather than as
+// wallpaper, and they are nearly free: the SDF is evaluated in the tree's own
+// frame, so scaling is one divide of p and rotating is a 2x2 multiply. The
+// bark and needle hashes key on `voxel_pos`, i.e. absolute world metres, so two
+// trees of the same size never share a clump pattern either.
+bool voxl_tree_at(in out Voxel v, vec3 s, vec2 txy, float scl, float rot, float tint) {
     // Reject on the bounding cylinder BEFORE evaluating the ground height: this
     // function is called for every air voxel in the scene and voxl_ground_h() is
     // four value-noise lookups. Radius is the longest branch (1.95 * 1.14) plus
     // the needle envelope.
-    vec2 dxy = s.xy - VOXL_TREE_XY;
-    if (dot(dxy, dxy) > 2.62 * 2.62) {
+    vec2 dxy = s.xy - txy;
+    float rad = 2.62 * scl;
+    if (dot(dxy, dxy) > rad * rad) {
         return false;
     }
-    vec3 p = vec3(dxy, s.z - voxl_ground_h(VOXL_TREE_XY));
-    if (p.z < -1.0 || p.z > VOXL_TREE_H + 0.5) {
+    float pz = s.z - voxl_ground_h(txy);
+    if (pz < -1.0 * scl || pz > (VOXL_TREE_H + 0.5) * scl) {
         return false;
     }
+    float ca = cos(rot);
+    float sa = sin(rot);
+    vec3 p = vec3(dxy.x * ca - dxy.y * sa, dxy.x * sa + dxy.y * ca, pz) * (1.0 / scl);
 
     VoxlTree t = voxl_conifer(p);
 
@@ -802,8 +892,10 @@ bool voxl_tree_voxel(in out Voxel v, vec3 s) {
     }
 
     // Five greens. Biasing the *choice* by height costs no extra palette entries
-    // and still gives the crown its lighter new growth.
-    float ci = clamp(voxl_cell_rand(voxel_pos, 7.0, 9.7) - 0.24 * (p.z / VOXL_TREE_H - 0.45), 0.0, 0.999);
+    // and still gives the crown its lighter new growth. `tint` biases the same
+    // choice per TREE, so one stand contains yellower and bluer individuals
+    // without adding a single colour to the palette.
+    float ci = clamp(voxl_cell_rand(voxel_pos, 7.0, 9.7) - 0.24 * (p.z / VOXL_TREE_H - 0.45) + tint, 0.0, 0.999);
     v.material_type = 1;
     v.roughness = 0.95;
     if (ci < 0.16) {
@@ -818,6 +910,148 @@ bool voxl_tree_voxel(in out Voxel v, vec3 s) {
         v.color = voxl_col(vec3(74.0, 130.0, 100.0), 0.54); // cool blue-green
     }
     return true;
+}
+
+// Every conifer in the scene. The hero tree is always present and always
+// identical, so VOXL_VEG_FOREST 0 is bit-for-bit the scene docs/SCENE.md
+// describes; the lattice is added on top of it.
+//
+// COST STRUCTURE, because it is what the generation-time column measures. This
+// runs for every air voxel inside the island. With FOREST off it is one dot
+// product. With FOREST on it is (2R+1)^2 cells, each costing two hashes and a
+// dot product, where R = ceil(2.62 * SCL_MAX / SPACING). At 6 m spacing R is 1
+// and that is 9 cells; at 2 m spacing R is 2 and it is 25. Only cells whose
+// trunk cylinder actually contains the voxel go on to evaluate voxl_ground_h()
+// and the whorl loop, and at any sane density that is zero or one of them.
+bool voxl_tree_voxel(in out Voxel v, vec3 s) {
+    if (voxl_tree_at(v, s, VOXL_TREE_XY, 1.0, 0.0, 0.0)) {
+        return true;
+    }
+
+#if VOXL_VEG_FOREST
+    const float sp = VOXL_VEG_TREE_SPACING;
+    int R = int(2.62 * VOXL_VEG_TREE_SCL_MAX / sp) + 1;
+    vec2 c0 = floor(s.xy * (1.0 / sp));
+    for (int dy = -R; dy <= R; ++dy) {
+        for (int dx = -R; dx <= R; ++dx) {
+            vec2 cell = c0 + vec2(float(dx), float(dy));
+            // Qualify on the cell CENTRE, never on the jittered trunk: it makes
+            // the stem count a pure function of the three radii below, so the
+            // sweep can state a tree count instead of estimating one.
+            vec2 cc = (cell + 0.5) * sp;
+            if (dot(cc - VOXL_ISLAND_C, cc - VOXL_ISLAND_C) > VOXL_VEG_FOREST_R * VOXL_VEG_FOREST_R ||
+                dot(cc, cc) < VOXL_VEG_CLEAR_R * VOXL_VEG_CLEAR_R ||
+                dot(cc - VOXL_HILL_C, cc - VOXL_HILL_C) < VOXL_VEG_HILL_KEEPOUT * VOXL_VEG_HILL_KEEPOUT) {
+                continue;
+            }
+            if (voxl_hash3(vec3(cell, 211.0)) >= VOXL_VEG_TREE_PROB) {
+                continue;
+            }
+            vec2 jit = vec2(voxl_hash3(vec3(cell, 223.0)), voxl_hash3(vec3(cell, 227.0))) - 0.5;
+            float hs = voxl_hash3(vec3(cell, 229.0));
+            float scl = mix(VOXL_VEG_TREE_SCL_MIN, VOXL_VEG_TREE_SCL_MAX, hs);
+            if (voxl_tree_at(v, s, cc + jit * (sp * 0.70), scl,
+                             voxl_hash3(vec3(cell, 233.0)) * 6.2832,
+                             (voxl_hash3(vec3(cell, 239.0)) - 0.5) * 0.34)) {
+                return true;
+            }
+        }
+    }
+#endif
+    return false;
+}
+
+// -- undergrowth: ferns --------------------------------------------------------
+//
+// WHY THIS EXISTS. Grass and flowers are rasterised particles: they never touch
+// the voxel heap, never appear in a trace, and cost frame time only in the
+// particle sim and raster passes. That makes them useless for answering the
+// question the density sweep is actually about, which is what non-uniform
+// *volume* costs. A fern is the smallest honest test: 0.5-0.8 m of stochastic
+// green interleaved with air, at ankle height, over the whole lawn -- the exact
+// shape of thing the palette compressor cannot help with.
+//
+// Seven to eleven fronds, each a two-segment arc (rising then drooping) whose
+// distance is normalised by a taper, then filled stochastically on 1/9 m cells
+// so a frond reads as pinnae rather than as a green wire. Same trick as the
+// conifer needles, one size down.
+bool voxl_fern_voxel(in out Voxel v, vec3 s) {
+#if VOXL_VEG_FERN
+    const float sp = VOXL_VEG_FERN_SPACING;
+    int R = (0.62 > sp) ? 2 : 1;
+    vec2 c0 = floor(s.xy * (1.0 / sp));
+    for (int dy = -R; dy <= R; ++dy) {
+        for (int dx = -R; dx <= R; ++dx) {
+            vec2 cell = c0 + vec2(float(dx), float(dy));
+            if (voxl_hash3(vec3(cell, 307.0)) >= VOXL_VEG_FERN_PROB) {
+                continue;
+            }
+            vec2 jit = vec2(voxl_hash3(vec3(cell, 311.0)), voxl_hash3(vec3(cell, 313.0))) - 0.5;
+            vec2 fq = (cell + 0.5) * sp + jit * (sp * 0.72);
+            float scl = 0.78 + 0.52 * voxl_hash3(vec3(cell, 317.0));
+            float rad = 0.62 * scl;
+            vec2 dq = s.xy - fq;
+            if (dot(dq, dq) > rad * rad) {
+                continue;
+            }
+            float fh = voxl_ground_h(fq);
+            float pz = s.z - fh;
+            if (pz < -0.02 || pz > 0.80 * scl) {
+                continue;
+            }
+            // Not on bare rock, and not in the cutting the tunnel carves. Both
+            // tested at the fern's own position so it is never half-culled.
+            if (voxl_bare(vec3(fq, fh)) > 0.5 || voxl_cave_sd(vec3(fq, fh + 0.15)) < 0.35) {
+                continue;
+            }
+
+            vec3 p = vec3(dq, pz) * (1.0 / scl);
+            int n = 7 + int(voxl_hash3(vec3(cell, 331.0)) * 4.99);
+            float a0 = voxl_hash3(vec3(cell, 337.0)) * 6.2832;
+            float env = 1e5;
+            for (int j = 0; j < 11; ++j) {
+                if (j >= n) {
+                    break;
+                }
+                float a = a0 + 6.2832 * float(j) / float(n);
+                float fl = 0.34 + 0.22 * voxl_hash3(vec3(cell, float(j) + 41.0));
+                vec2 d2 = vec2(cos(a), sin(a));
+                vec3 knee = vec3(d2 * (fl * 0.55), 0.52 + 0.10 * voxl_hash3(vec3(cell, float(j) + 53.0)));
+                vec3 tip = vec3(d2 * (fl * 1.55), 0.30);
+                // Taper: 0.085 m of pinnae at the knee falling to nothing at the
+                // tip, expressed as a normalised distance so the fill below is a
+                // plain probability.
+                env = min(env, sd_capsule(p, vec3(0.0, 0.0, 0.02), knee, 0.0) * (1.0 / 0.075));
+                env = min(env, sd_capsule(p, knee, tip, 0.0) * (1.0 / 0.062));
+            }
+            float e = 1.0 - env;
+            if (e <= 0.0) {
+                continue;
+            }
+            // Never reaches 1, so light gets through the clump -- the same reason
+            // the canopy has gaps.
+            if (voxl_cell_rand(voxel_pos, 9.0, 401.0) >= 0.26 + 0.58 * e * e) {
+                continue;
+            }
+            float ci = clamp(voxl_cell_rand(voxel_pos, 9.0, 409.0) - 0.30 * (p.z - 0.35) +
+                                 (voxl_hash3(vec3(cell, 347.0)) - 0.5) * 0.40,
+                             0.0, 0.999);
+            v.material_type = 1;
+            v.roughness = 0.96;
+            if (ci < 0.22) {
+                v.color = voxl_col(vec3(134.0, 172.0, 84.0), 0.54);
+            } else if (ci < 0.52) {
+                v.color = voxl_col(vec3(96.0, 148.0, 72.0), 0.52);
+            } else if (ci < 0.80) {
+                v.color = voxl_col(vec3(64.0, 118.0, 60.0), 0.50);
+            } else {
+                v.color = voxl_col(vec3(48.0, 92.0, 56.0), 0.48);
+            }
+            return true;
+        }
+    }
+#endif
+    return false;
 }
 
 // -- the light in the cave ----------------------------------------------------
@@ -1058,8 +1292,8 @@ void voxl_ground_cover(in out Voxel v, vec3 s, vec3 nrm, float bare) {
     // climbs its skirt and stops partway up, which is what leaves the rocky bluff
     // reading as rock rather than as a mud cone.
     float r2 = good_rand(voxel_pos.xy);
-    if (nrm.z <= 0.50 || bare > 0.5 || r2 >= 0.82) {
-        return; // steep, rocky, or one of the 18% of cells left as bare soil
+    if (nrm.z <= 0.50 || bare > 0.5 || r2 >= VOXL_VEG_SKIN_FRAC) {
+        return; // steep, rocky, or one of the (1 - SKIN_FRAC) left as bare soil
     }
 
     v.material_type = 1;
@@ -1070,10 +1304,48 @@ void voxl_ground_cover(in out Voxel v, vec3 s, vec3 nrm, float bare) {
     // handful of distinct values after octahedral packing.
     v.normal = nrm;
 
-    // Five greens, chosen per voxel but *biased* by a 22 m noise field, so the
-    // lawn has large soft patches of yellower and cooler grass without a single
-    // extra palette entry: the patch varies which colour is picked, not the colour.
+    // WHY THIS PALETTE IS WIDER THAN IT LOOKS, and why widening it was free.
+    // The lawn shipped as five greens spanning 118..64 red and 178..132 green --
+    // one hue, one saturation, five brightnesses -- and at viewing distance that
+    // integrates to a single flat mint. The reference carries many greens at once
+    // because real ground cover is several species: yellow-green fescue, blue-grey
+    // sheep's fescue, olive clover, rust where it is dying back.
+    //
+    // The fix is not more colours per voxel, it is more SEPARATION between them,
+    // and the two noise fields that pick them. `ci` is the species field: a 22 m
+    // fbm chooses which end of the ramp a patch draws from. `hue` is a second,
+    // finer 6.5 m field that shifts warm-to-cool INDEPENDENTLY, so a dry patch can
+    // be warm or cool and the two do not move together in stripes.
+    //
+    // It costs nothing measurable. pack_rgb() keeps 6 bits per channel, so all
+    // eleven entries below were already representable; a palette region still
+    // sees a handful of discrete values, which is what rule (2) needs. The only
+    // thing that changes is WHICH discrete value. Measured A/B in
+    // docs/DENSITY_LIMITS.md 7: heap usage and frame time both move less than
+    // the run-to-run noise floor.
     float ci = clamp(good_rand(voxel_pos.yx + 3.7) * 0.80 + (fbm2(voxel_pos.xy * 0.045) - 0.5) * 0.70, 0.0, 0.999);
+#if VOXL_VEG_GRASS_PALETTE
+    float hue = fbm2(voxel_pos.xy * 0.154 + 61.0) - 0.5; // +-0.5, 6.5 m wavelength
+    if (ci < 0.13) {
+        v.color = (hue > 0.06) ? voxl_col(vec3(150.0, 176.0, 74.0), 0.50)  // parched, warm
+                               : voxl_col(vec3(122.0, 172.0, 96.0), 0.50); // pale spring
+    } else if (ci < 0.34) {
+        v.color = (hue > 0.0) ? voxl_col(vec3(118.0, 178.0, 78.0), 0.48)  // dry, yellow-green
+                              : voxl_col(vec3(96.0, 166.0, 104.0), 0.50); // cool meadow
+    } else if (ci < 0.58) {
+        v.color = (hue > -0.04) ? voxl_col(vec3(104.0, 176.0, 84.0), 0.50)
+                                : voxl_col(vec3(78.0, 150.0, 96.0), 0.50); // blue-green
+    } else if (ci < 0.80) {
+        v.color = (hue > 0.02) ? voxl_col(vec3(88.0, 160.0, 74.0), 0.50)
+                               : voxl_col(vec3(66.0, 138.0, 84.0), 0.50);
+    } else if (ci < 0.93) {
+        v.color = voxl_col(vec3(74.0, 148.0, 68.0), 0.50);
+    } else {
+        v.color = (hue > 0.10) ? voxl_col(vec3(122.0, 128.0, 62.0), 0.46)  // rust, dying back
+                               : voxl_col(vec3(56.0, 118.0, 78.0), 0.52);  // deep, in the shade
+    }
+#else
+    // The shipped five-green ramp, kept as the A/B control for the palette change.
     if (ci < 0.18) {
         v.color = voxl_col(vec3(118.0, 178.0, 78.0), 0.48); // dry, yellow-green
     } else if (ci < 0.42) {
@@ -1085,27 +1357,34 @@ void voxl_ground_cover(in out Voxel v, vec3 s, vec3 nrm, float bare) {
     } else {
         v.color = voxl_col(vec3(64.0, 132.0, 72.0), 0.52); // cool, in the shade
     }
+#endif
 
-    if (r2 >= 0.24) {
-        return; // coloured, but no particle on this voxel
-    }
+    // The particle decision draws from its OWN hash, not from r2. Reusing r2 --
+    // which the shipped code did -- capped grass at the 0.24 slice left over
+    // after the skin test and made grass and flower density move together. With
+    // an independent draw each can be taken to the full 256 voxels/m^2 and the
+    // two axes are separable, which is what a density sweep needs.
+    float rp = good_rand(voxel_pos.xy + 17.31);
 
-    if (r2 < 0.2372) {
-        // 256 surface voxels/m^2 * 0.82 * 0.2372 = ~50 blades/m^2. Over the ~900
-        // m^2 of lawn on the 37 m island that is ~44k strands, and ~250k on the
-        // 71 m one -- against a MAX_GRASS_BLADES of 1<<20 = 1.05 M
-        // (particles/grass/grass.inl), which is itself sized to the world.
+    if (rp < VOXL_VEG_GRASS_FRAC) {
+        // 256 surface voxels/m^2 * SKIN_FRAC * GRASS_FRAC blades/m^2; at the
+        // defaults, ~50. Over the ~900 m^2 of lawn on the 37 m island that is
+        // ~44k strands against a MAX_GRASS_BLADES of 1<<20 = 1.05 M
+        // (particles/grass/grass.inl).
         // Headroom matters here because a chunk regenerated by world wrapping
         // spawns a *second* strand on a voxel that already has one: the sim only
         // frees a strand when its spawner voxel changes (sim.comp.glsl:44-51), and
         // a deterministic generator regenerates it identically. Inherited
         // behaviour, not introduced here, and bounded by the pool rather than by
-        // VRAM -- but it is why these numbers are two orders under the cap.
+        // VRAM -- and docs/DENSITY_LIMITS.md measures exactly where that bound is.
         spawn_grass(v);
         return;
     }
+    if (rp >= VOXL_VEG_GRASS_FRAC + VOXL_VEG_FLOWER_FRAC) {
+        return; // coloured, but no particle on this voxel
+    }
 
-    // 256 * 0.82 * 0.0028 = ~0.6 flowers/m^2, against MAX_FLOWERS 65536
+    // 256 * SKIN_FRAC * FLOWER_FRAC = ~0.6 flowers/m^2, against MAX_FLOWERS 65536
     // (flower/flower.inl:12). This was 1.8/m^2 in the first pass and it was far too
     // many: a flower is ~0.4 m tall and the camera stands 1.7 m up, so at 0.6/m^2
     // they read as scattered colour and at 1.8 they read as a solid carpet with no
@@ -1200,6 +1479,13 @@ void brushgen_voxl_scene(in out Voxel voxel) {
     if (VOXL_DEBUG_NO_PROPS == 0 && s.z > h - 0.6 && s.z < h + 1.3 && voxl_props(voxel, s)) {
         return;
     }
+    // Undergrowth. The band is generous on both sides because a fern's own ground
+    // height is sampled at the fern's centre, not at this voxel, and the two can
+    // differ by a few voxels on rolling ground. `h` is only a cheap gate; the fern
+    // does its own exact test. Folds away entirely when VOXL_VEG_FERN is 0.
+    if (s.z > h - 0.35 && s.z < h + 1.15 && voxl_fern_voxel(voxel, s)) {
+        return;
+    }
 
     // The grass skin: exactly the one air voxel above the top solid voxel.
     if (s.z >= h && s.z < h + VOXEL_SIZE) {
@@ -1217,7 +1503,21 @@ void brushgen_planet(in out Voxel voxel) {
 
 #define GEN_MODEL 0
 
+// The far field's generator. Placed here because it needs voxl_col(), fbm2(), VOXL_ORIGIN and
+// VOXL_ISLAND_C, all of which are above, and nothing below.
+#include <voxels/far_field_gen.glsl>
+
 void brushgen_world(in out Voxel voxel) {
+#if VOXEL_LEVEL == 1
+    // Compiled at 25 cm voxels against the far chunk table, for the far volume only. It shares
+    // the near ground's noise octaves but not one line of its content: no cave, no props, no
+    // tree, and CRUCIALLY NO PARTICLE SPAWNS. MAX_GRASS_BLADES is 1 048 576, which
+    // WORLD_SCALE.md sec 4.3 shows is exactly the surface-voxel count of one fully grassed 64 m
+    // world -- the particle budget is precisely one L0 volume and it is already saturated, so a
+    // coarse level that spawned into it would take grass away from under the player's feet.
+    brushgen_far_field(voxel);
+    return;
+#endif
     if (false) { // Mandelbulb world
         vec3 mandelbulb_color;
         if (mandelbulb((voxel_pos / 64 - 1) * 1, mandelbulb_color)) {

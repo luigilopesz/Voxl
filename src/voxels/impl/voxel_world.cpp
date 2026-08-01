@@ -1,5 +1,39 @@
 #include "voxel_world.inl"
 #include <fmt/format.h>
+#include <chrono>
+
+// ---------------------------------------------------------------------------------------------
+// World-scale instrumentation.
+// ---------------------------------------------------------------------------------------------
+// Added for docs/SCALE_LIMITS.md. Three quantities decide how large this world can be and until
+// now none of them was printed anywhere:
+//
+//   1. THE CHUNK TABLE, which is resident whether or not the world contains a single voxel.
+//      sizeof(VoxelLeafChunk) * CHUNKS_PER_AXIS^3 in VRAM, plus sizeof(CpuVoxelChunk) *
+//      CHUNKS_PER_AXIS^3 in *system* RAM -- the CPU mirror is 8192 B/chunk and nobody had
+//      noticed it scales identically.
+//   2. WORLD GENERATION TIME. Every chunk starts with CHUNK_FLAGS_ACCEL_GENERATED clear, so at
+//      startup all CHUNKS_PER_AXIS^3 of them are elected, at most MAX_CHUNK_UPDATES_PER_FRAME
+//      per frame. Generation is therefore O(CHUNKS_PER_AXIS^3 / 128) FRAMES, not seconds of
+//      compute -- a hard floor that no GPU speed can move.
+//   3. Whether generation ever finishes at all.
+//
+// Counters are function-local statics rather than members because VoxelWorld is declared in
+// voxels/impl/voxel_world.inl, which this work does not own. There is exactly one VoxelWorld.
+namespace {
+    using scale_clock = std::chrono::steady_clock;
+
+    struct WorldGenProgress {
+        scale_clock::time_point first_frame{};
+        bool started = false;
+        uint64_t cumulative_updates = 0; // chunk regenerations seen, including re-visits
+        uint64_t distinct_chunks = 0;    // chunks generated at least once
+        uint64_t frames = 0;
+        bool complete_logged = false;
+        std::vector<bool> seen; // one bit per chunk in the table
+    };
+    WorldGenProgress g_worldgen;
+} // namespace
 
 static uint32_t calc_chunk_index(glm::uvec3 chunk_i, glm::ivec3 offset) {
     // Modulate the chunk index to be wrapped around relative to the chunk offset provided.
@@ -90,6 +124,72 @@ bool VoxelWorld::sample(daxa_f32vec3 pos, daxa_i32vec3 player_unit_offset) {
     return material_type != 0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// WHAT A SPARSE CHUNK TABLE WOULD ACTUALLY COST.
+// ---------------------------------------------------------------------------------------------
+// The dense table charges sizeof(VoxelLeafChunk) = 8216 B for a chunk of pure air, and
+// CpuVoxelChunk charges 8192 B again in host RAM. 99.76% of that is two 512-entry
+// per-palette-region arrays:
+//   u64           page_allocation_infos[512]  4096 B -- never touched unless a region allocates
+//   PaletteHeader palette_headers[512]        4096 B -- a uniform region stores its voxel inline
+// So the question is not "how big is the table" but "how many chunks need any of it". This walks
+// the CPU mirror once, when generation completes, and classifies every chunk:
+//   uniform      -- all 512 regions uniform AND all the same value. One word would do.
+//   header-only  -- all 512 regions uniform, values differ. Needs palette_headers and never
+//                   touches page_allocation_infos, so 4096 B of the 8216 is dead.
+//   paletted     -- at least one region with variant_n > 1. Needs the whole record.
+// "pooled" is what a three-tier layout would occupy: a dense directory of CHUNKS_PER_AXIS^3
+// eight-byte entries, plus a body only for the chunks that need one.
+//
+// MEASURED at CHUNKS_PER_AXIS 64, whole island generated (docs/SCALE_LIMITS.md sec 3.3):
+//   262144 chunks | uniform 261297 (99.7%) | paletted 847 (0.3%)
+//   dense table 2153.8 MB -> pooled equivalent 9.1 MB, 237.8x smaller
+static void log_table_census(std::vector<CpuVoxelChunk> const &chunks) {
+    auto const n = static_cast<uint64_t>(chunks.size());
+    if (n == 0) {
+        return;
+    }
+    uint64_t uniform = 0;
+    uint64_t header_only = 0;
+    uint64_t paletted = 0;
+    uint64_t paletted_regions = 0;
+    for (auto const &c : chunks) {
+        bool any_paletted = false;
+        bool all_same = true;
+        auto const *first = c.palette_chunks[0].blob_ptr;
+        for (auto const &r : c.palette_chunks) {
+            if (r.variant_n > 1) {
+                ++paletted_regions;
+                any_paletted = true;
+            } else if (r.blob_ptr != first) {
+                all_same = false;
+            }
+        }
+        if (any_paletted) {
+            ++paletted;
+        } else if (all_same) {
+            ++uniform;
+        } else {
+            ++header_only;
+        }
+    }
+    auto const regions = n * uint64_t{PALETTES_PER_CHUNK};
+    auto const dense = static_cast<uint64_t>(sizeof(VoxelLeafChunk)) * n;
+    auto const pooled = 8ULL * n + static_cast<uint64_t>(sizeof(VoxelLeafChunk)) * paletted + 4096ULL * header_only;
+    debug_utils::Console::add_log(fmt::format(
+        "[scale] table census: {} chunks | uniform {} ({:.1f}%) | header-only {} ({:.1f}%) | "
+        "paletted {} ({:.1f}%) | paletted regions {} of {} ({:.2f}%)\n",
+        n, uniform, 100.0 * double(uniform) / double(n),
+        header_only, 100.0 * double(header_only) / double(n),
+        paletted, 100.0 * double(paletted) / double(n),
+        paletted_regions, regions, 100.0 * double(paletted_regions) / double(regions)));
+    debug_utils::Console::add_log(fmt::format(
+        "[scale] dense table {:.1f} MB -> pooled equivalent {:.1f} MB ({:.1f}x smaller); "
+        "directory alone {:.2f} MB\n",
+        double(dense) / 1'000'000.0, double(pooled) / 1'000'000.0,
+        double(dense) / std::max<double>(1.0, double(pooled)), double(8ULL * n) / 1'000'000.0));
+}
+
 void VoxelWorld::init_gpu_malloc(GpuContext &gpu_context) {
     if (!gpu_malloc_initialized) {
         gpu_malloc_initialized = true;
@@ -118,11 +218,59 @@ void VoxelWorld::record_startup(GpuContext &gpu_context) {
 
     auto chunk_n = (CHUNKS_PER_AXIS);
     chunk_n = chunk_n * chunk_n * chunk_n;
-    buffers.voxel_chunks = gpu_context.find_or_add_temporal_buffer({
-        .size = sizeof(VoxelLeafChunk) * chunk_n,
-        .name = "voxel_chunks",
-    });
-    voxel_chunks.resize(chunk_n);
+
+    // THE ONE NUMBER THIS PROJECT KEPT HAVING TO DERIVE BY HAND. Printed before the allocation
+    // rather than after, so that a run which dies inside create_buffer() still tells you how big
+    // the buffer it was asking for was. 64-bit throughout: at CHUNKS_PER_AXIS 128 the product is
+    // 17.2 GB and a 32-bit intermediate would wrap to a plausible-looking small number.
+    auto const table_bytes = static_cast<uint64_t>(sizeof(VoxelLeafChunk)) * static_cast<uint64_t>(chunk_n);
+    auto const cpu_mirror_bytes = static_cast<uint64_t>(sizeof(CpuVoxelChunk)) * static_cast<uint64_t>(chunk_n);
+    debug_utils::Console::add_log(fmt::format(
+        "[scale] CHUNKS_PER_AXIS {} -> {} chunks, world {:.0f} m cube, view radius {:.0f} m\n",
+        CHUNKS_PER_AXIS, chunk_n,
+        double(CHUNKS_PER_AXIS) * double(CHUNK_WORLDSPACE_SIZE),
+        double(CHUNKS_PER_AXIS) * double(CHUNK_WORLDSPACE_SIZE) * 0.5));
+    debug_utils::Console::add_log(fmt::format(
+        "[scale] chunk table: {} B/chunk x {} = {:.1f} MB VRAM, resident when empty; "
+        "CPU mirror {} B/chunk = {:.1f} MB host RAM\n",
+        sizeof(VoxelLeafChunk), chunk_n, double(table_bytes) / 1'000'000.0,
+        sizeof(CpuVoxelChunk), double(cpu_mirror_bytes) / 1'000'000.0));
+    // Generation is rate-limited by MAX_CHUNK_UPDATES_PER_FRAME and nothing else, so the floor is
+    // arithmetic and can be stated before a single frame has run.
+    debug_utils::Console::add_log(fmt::format(
+        "[scale] world generation floor: {} chunks / {} per frame = {} frames minimum\n",
+        chunk_n, MAX_CHUNK_UPDATES_PER_FRAME,
+        (chunk_n + MAX_CHUNK_UPDATES_PER_FRAME - 1) / MAX_CHUNK_UPDATES_PER_FRAME));
+
+    // Make a failed chunk-table allocation SAY SO. Daxa turns VK_ERROR_OUT_OF_DEVICE_MEMORY into
+    // an exception, nothing in this engine catches one, and the observable behaviour of asking for
+    // a table larger than the card is a silent 0x80000003 with an empty stderr and an empty log.
+    //
+    // MEASURED, and read the caveat: at CHUNKS_PER_AXIS 128 (a 17.2 GB table) THIS DOES NOT FIRE.
+    // Daxa aborts on a failed create_buffer rather than throwing, so there is nothing to catch and
+    // the process dies at 0x80000003 regardless. The size line printed above it is the only
+    // diagnostic there is. Kept because it costs nothing and does catch the host-side failure.
+    try {
+        buffers.voxel_chunks = gpu_context.find_or_add_temporal_buffer({
+            .size = sizeof(VoxelLeafChunk) * chunk_n,
+            .name = "voxel_chunks",
+        });
+    } catch (std::exception const &e) {
+        debug_utils::Console::add_log(fmt::format(
+            "[scale] FATAL: could not allocate the {:.1f} MB chunk table ({} chunks): {}\n",
+            double(table_bytes) / 1'000'000.0, chunk_n, e.what()));
+        throw;
+    }
+    try {
+        voxel_chunks.resize(chunk_n);
+    } catch (std::exception const &e) {
+        debug_utils::Console::add_log(fmt::format(
+            "[scale] FATAL: could not allocate the {:.1f} MB CPU mirror ({} chunks): {}\n",
+            double(cpu_mirror_bytes) / 1'000'000.0, chunk_n, e.what()));
+        throw;
+    }
+    g_worldgen = {};
+    g_worldgen.seen.assign(static_cast<size_t>(chunk_n), false);
 
     init_gpu_malloc(gpu_context);
 
@@ -184,6 +332,11 @@ void VoxelWorld::record_startup(GpuContext &gpu_context) {
         },
         .name = "Initialize",
     });
+
+    // The far field's table and globals, and their startup clear. Must be before the startup
+    // compute below, which expands VOXELS_BUFFER_USES_ASSIGN and so now binds them.
+    // docs/FAR_FIELD.md.
+    far_field_record_startup(gpu_context, buffers);
 
     gpu_context.add(ComputeTask<VoxelWorldStartupCompute::Task, VoxelWorldStartupComputePush, NoTaskInfo>{
         .source = daxa::ShaderFile{"voxels/impl/startup.comp.glsl"},
@@ -288,12 +441,29 @@ void VoxelWorld::begin_frame(daxa::Device &device, GpuInput const &gpu_input, Vo
         auto const *chunk_updates = device.get_host_address_as<ChunkUpdate>(buffers.chunk_updates.resource_id).value() + offset * MAX_CHUNK_UPDATES_PER_FRAME;
         auto copied_bytes = 0u;
 
+        // --- world-generation progress ------------------------------------------------------
+        // Every chunk in the table is elected exactly once at startup (its ACCEL_GENERATED flag
+        // starts clear), so counting DISTINCT chunk indices seen here measures precisely when the
+        // world has finished generating. Counting all updates instead would never terminate: the
+        // wrapping volume re-generates the trailing face for as long as the player moves.
+        if (!g_worldgen.started) {
+            g_worldgen.started = true;
+            g_worldgen.first_frame = scale_clock::now();
+        }
+        ++g_worldgen.frames;
+
         for (uint32_t chunk_update_i = 0; chunk_update_i < MAX_CHUNK_UPDATES_PER_FRAME; ++chunk_update_i) {
             if (chunk_updates[chunk_update_i].info.flags != 1) {
                 // copied_bytes += sizeof(uint32_t);
                 continue;
             }
             auto chunk_update = chunk_updates[chunk_update_i];
+            ++g_worldgen.cumulative_updates;
+            if (chunk_update.info.chunk_index < g_worldgen.seen.size() &&
+                !g_worldgen.seen[chunk_update.info.chunk_index]) {
+                g_worldgen.seen[chunk_update.info.chunk_index] = true;
+                ++g_worldgen.distinct_chunks;
+            }
             copied_bytes += sizeof(chunk_update);
             auto &chunk = voxel_chunks[chunk_update.info.chunk_index];
             for (uint32_t palette_region_i = 0; palette_region_i < PALETTES_PER_CHUNK; ++palette_region_i) {
@@ -326,6 +496,32 @@ void VoxelWorld::begin_frame(daxa::Device &device, GpuInput const &gpu_input, Vo
         // if (copied_bytes > 0) {
         //     debug_utils::Console::add_log(fmt::format("{} MB copied", double(copied_bytes) / 1'000'000.0));
         // }
+
+        if (!g_worldgen.complete_logged && g_worldgen.distinct_chunks >= g_worldgen.seen.size() &&
+            !g_worldgen.seen.empty()) {
+            g_worldgen.complete_logged = true;
+            log_table_census(voxel_chunks);
+            auto const secs = std::chrono::duration<double>(scale_clock::now() - g_worldgen.first_frame).count();
+            debug_utils::Console::add_log(fmt::format(
+                "[scale] WORLD GENERATED: {} chunks in {} frames, {:.2f} s ({:.0f} chunks/frame avg)\n",
+                g_worldgen.distinct_chunks, g_worldgen.frames, secs,
+                double(g_worldgen.cumulative_updates) / double(g_worldgen.frames)));
+        }
+        // Progress, so a run that never finishes generating is diagnosable rather than just slow.
+        // Once every 256 frames: at 128 chunks/frame that is one line per 32768 chunks.
+        if (!g_worldgen.complete_logged && (g_worldgen.frames % 256) == 0) {
+            auto const secs = std::chrono::duration<double>(scale_clock::now() - g_worldgen.first_frame).count();
+            debug_utils::Console::add_log(fmt::format(
+                "[scale] generating: {}/{} chunks ({:.1f}%), frame {}, t={:.2f} s\n",
+                g_worldgen.distinct_chunks, g_worldgen.seen.size(),
+                100.0 * double(g_worldgen.distinct_chunks) / double(g_worldgen.seen.size()),
+                g_worldgen.frames, secs));
+        }
+        debug_utils::DebugDisplay::set_debug_string(
+            "World Gen",
+            g_worldgen.complete_logged
+                ? fmt::format("{} chunks done", g_worldgen.seen.size())
+                : fmt::format("{}/{}", g_worldgen.distinct_chunks, g_worldgen.seen.size()));
     }
 }
 
@@ -474,4 +670,9 @@ void VoxelWorld::record_frame(GpuContext &gpu_context, daxa::TaskBufferView task
             });
         },
     });
+
+    // The far field's own generation chain, recorded LAST and on purpose: it reuses this
+    // function's temp_voxel_chunks transient, and the task graph orders the two chains on that
+    // shared resource in recording order. docs/FAR_FIELD.md.
+    far_field_record_frame(gpu_context, buffers, task_gvox_model_buffer, task_temp_voxel_chunks_buffer, particles);
 }
