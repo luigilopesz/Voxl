@@ -12,6 +12,7 @@ add_executable(${PROJECT_NAME}
     "src/voxels/voxel_world.cpp"
     "src/application/cli.cpp"
     "src/application/ui.cpp"
+    "src/application/ui_tools.cpp"
     "src/application/audio.cpp"
     "src/application/settings.cpp"
     "src/application/player.cpp"

@@ -21,13 +21,42 @@ using namespace std::chrono_literals;
 
 #include <iostream>
 
-constexpr auto round_frame_dim(daxa_u32vec2 size) {
-    auto result = size;
-    // constexpr auto over_estimation = daxa_u32vec2{32, 32};
-    // auto result = (size + daxa_u32vec2{over_estimation.x - 1u, over_estimation.y - 1u}) / over_estimation * over_estimation;
-    // not necessary, since it rounds up!
-    // result = {std::max(result.x, over_estimation.x), std::max(result.y, over_estimation.y)};
-    return result;
+// F4 -- round the render-target extent up to a multiple of 8. See PERFORMANCE_PLAN.md section 6.1.
+//
+// This was a no-op: the body was commented out under the comment "not necessary, since it rounds
+// up!". That claim is false. The caller computes the extent as
+// `static_cast<daxa_u32>(window_size.x * render_res_scl)`, which TRUNCATES -- at 1280 x 720 and
+// Render Res Scale 0.6667 it yields 853 x 480, and 853 is odd.
+//
+// Two things then go wrong, and both are silent:
+//   * Every compute shader in this renderer but seven is 8x8x1, so an extent that is not a
+//     multiple of 8 leaves a partial workgroup on the right and bottom edges.
+//   * Several passes derive half-resolution extents as (x + 1) / 2 -- the depth prepass, SSAO and
+//     the ReSTIR diffuse candidate trace. At 853 that is 427, and 427 * 2 = 854 != 853, so the
+//     half-res buffer and the full-res buffer it is meant to pair with disagree by a pixel.
+// `Render Res Scale = 0.6667` intermittently failed to apply in 4 of 11 runs and never at
+// 0.40/0.50/0.70/0.75/1.25/1.50/2.00 -- the only tested scale producing an odd extent.
+//
+// Rounding UP is safe and is what the renderer already expects: the render images are allocated
+// at `rounded_frame_dim` while the shaders address the `frame_dim` sub-rectangle, and
+// postprocessing.raster.glsl:104 rescales the g-buffer UVs by `frame_dim / rounded_frame_dim`
+// precisely to absorb the difference. Rounding down would instead sample outside the rendered
+// region. 8 rather than upstream's 32 is the smallest value that satisfies both constraints
+// above, and costs at most 7 columns and 7 rows of extra pixels (~1.6% at 0.6667) instead of 31.
+//
+// The arithmetic is written out per-component on purpose. `daxa_u32vec2` is a plain C struct
+// (daxa/c/core.h, _DAXA_DECL_VEC2_TYPE) with no operator overloads, so the vector-valued
+// expression left commented out upstream would not have compiled had anyone uncommented it --
+// which is the likeliest reason it was commented out and then rationalised in the comment.
+constexpr auto round_frame_dim(daxa_u32vec2 size) -> daxa_u32vec2 {
+    constexpr daxa_u32 GRANULARITY = 8;
+    auto round_up = [](daxa_u32 v) -> daxa_u32 {
+        // Never round to zero: a minimised window gives a 0 extent, and a 0-sized image or an
+        // empty dispatch is a validation error rather than a cheap frame.
+        auto rounded = (v + (GRANULARITY - 1u)) / GRANULARITY * GRANULARITY;
+        return rounded < GRANULARITY ? GRANULARITY : rounded;
+    };
+    return daxa_u32vec2{round_up(size.x), round_up(size.y)};
 }
 
 VoxelApp::VoxelApp() : AppWindow(APPNAME, {AppCli::get().width, AppCli::get().height}), ui{AppUi(AppWindow::glfw_window_ptr)} {
@@ -84,6 +113,11 @@ VoxelApp::VoxelApp() : AppWindow(APPNAME, {AppCli::get().width, AppCli::get().he
         ui.paused = false;
         set_mouse_capture(true);
     }
+    // --- editing tools (application/ui_tools.hpp) ----------------------------------------------
+    // Registers the tool HUD as an ImGui context hook, and the "UI"/"show_tool_hud" setting that
+    // turns it off for capture work. Has to run after AppUi's constructor, which is what creates
+    // the ImGui context and loads the two fonts.
+    tools.install_hud(ui.menu_font, ui.mono_font);
     if (!cli.bench_csv.empty()) {
         bench_csv_file.open(cli.bench_csv, std::ios::out | std::ios::trunc);
         if (bench_csv_file.is_open()) {
@@ -194,6 +228,44 @@ void VoxelApp::on_update() {
 
     gpu_input.flags &= ~GAME_FLAG_BITS_PAUSED;
     gpu_input.flags |= GAME_FLAG_BITS_PAUSED * static_cast<daxa_u32>(ui.paused);
+
+    // --- scripted editing (--edit) -------------------------------------------------------------
+    // Drives the tool belt and the brush buttons from the command line. BEFORE tools.perframe(),
+    // because that is what publishes the belt into gpu_input.brush_selection -- selecting here
+    // means the HUD in the resulting screenshot names the tool that actually ran, which is the
+    // difference between a capture that proves something and one that merely looks right.
+    //
+    // WHY THE ACTION IS HELD FOR A WINDOW OF TIME rather than set for a single frame. The edit is
+    // consumed by two compute passes a frame apart (chunk election, then the edit itself), and
+    // the one-shot gate in voxel_world.comp.glsl allows BRUSH_ONE_SHOT_FRAMES of slack for
+    // exactly that reason. A one-frame press is also unrepresentative: no human clicks for 11 ms.
+    if (!AppCli::get().edits.empty()) {
+        auto const elapsed = std::chrono::duration<float>(now - start).count();
+        bool primary = false;
+        bool secondary = false;
+        for (auto const &edit : AppCli::get().edits) {
+            if (elapsed < edit.at_s || elapsed >= edit.at_s + edit.hold_s) {
+                continue;
+            }
+            // Last writer wins if two scripted strokes overlap. Overlapping strokes are a script
+            // bug rather than a feature, but silently applying one of them beats applying a
+            // half-blended pair of radii that never appeared in any argument.
+            tools.select(edit.brush_id);
+            tools.set_radius(edit.radius);
+            (edit.secondary ? secondary : primary) = true;
+        }
+        // Written every frame, not only while a stroke is active: the buttons must go back DOWN
+        // between strokes or brush_state.is_editing never clears, and the one-shot gate --
+        // which fires on the is_editing 0->1 edge -- would arm once and never again.
+        gpu_input.actions[GAME_ACTION_BRUSH_A] = primary ? 1U : 0U;
+        gpu_input.actions[GAME_ACTION_BRUSH_B] = secondary ? 1U : 0U;
+    }
+
+    // --- editing tools (application/ui_tools.hpp) ----------------------------------------------
+    // Publishes the selected brush and radius into gpu_input.brush_selection, and decides whether
+    // the HUD is up this frame. Before frame_task_graph.execute() below, which is what uploads
+    // gpu_input, and before ui.update(), whose NewFrame() is what calls the HUD back.
+    tools.perframe(!ui.paused, gpu_input);
 
     gpu_input.flags &= ~GAME_FLAG_BITS_NEEDS_PHYS_UPDATE;
 
@@ -362,6 +434,14 @@ void VoxelApp::on_mouse_scroll(daxa_f32 dx, daxa_f32 dy) {
     }
 
     gpu_input.mouse.scroll_delta = daxa_f32vec2{gpu_input.mouse.scroll_delta.x + dx, gpu_input.mouse.scroll_delta.y + dy};
+
+    // --- editing tools (application/ui_tools.hpp) ----------------------------------------------
+    // The wheel changes tool; Alt and the wheel changes brush size. GLFW's scroll callback carries
+    // no modifier mask, hence the direct key query -- and Alt rather than Ctrl or Shift because
+    // those two are bound to crouch and sprint, and a brush-size gesture that also ducks the
+    // player moves the camera while you are trying to aim the brush.
+    tools.on_scroll(dy, glfwGetKey(glfw_window_ptr, GLFW_KEY_LEFT_ALT) == GLFW_PRESS ||
+                            glfwGetKey(glfw_window_ptr, GLFW_KEY_RIGHT_ALT) == GLFW_PRESS);
 }
 void VoxelApp::on_mouse_button(daxa_i32 button_id, daxa_i32 action) {
     auto &io = ImGui::GetIO();
@@ -404,6 +484,14 @@ void VoxelApp::on_key(daxa_i32 key_id, daxa_i32 action) {
     if (key_id == GLFW_KEY_R && action == GLFW_PRESS) {
         ui.should_run_startup = true;
         start = Clock::now();
+    }
+
+    // --- editing tools (application/ui_tools.hpp) ----------------------------------------------
+    // The number row selects a tool and [ ] size it. Consulted before the keybind table below, but
+    // it claims no key that table uses: the digits and brackets are unbound in
+    // AppSettings::reset_default(), so nothing here overrides a movement or action binding.
+    if (tools.on_key(key_id, action, ui.paused)) {
+        return;
     }
 
     if (!ui.paused) {
@@ -452,6 +540,26 @@ void VoxelApp::record_tasks() {
     gpu_input.frame_dim.y = static_cast<daxa_u32>(static_cast<daxa_f32>(window_size.y) * render_res_scl);
     gpu_input.rounded_frame_dim = round_frame_dim(gpu_input.frame_dim);
     gpu_input.output_resolution = window_size;
+
+    // AIM THE PICKING RAY AT THE CROSSHAIR, not at the corner of the frame.
+    //
+    // gpu_input.mouse.pos is expressed in frame_dim (render-resolution) space and was written in
+    // exactly one place: VoxelApp::on_mouse_move. Until the player physically moved the mouse it
+    // therefore held (0, 0) -- the TOP-LEFT PIXEL -- and perframe.comp.glsl builds the brush's
+    // picking ray from it. Every edit made before the first mouse motion landed wherever the
+    // frame's corner pointed, which is usually sky, and the clamp in brushes.inl then put it at
+    // BRUSH_PICK_MAX_M along that corner ray. It is not a harness-only problem: it is reachable
+    // from a cold start by clicking before moving the mouse, and it is what made a scripted
+    // capture of an add brush bury the camera in stone.
+    //
+    // The crosshair is the centre, and while the game is unpaused the cursor is captured and
+    // warped back to the centre after every motion event, so the centre is also the value the
+    // very next real mouse event will produce. Doing it here rather than in the constructor
+    // covers the resize and render-scale-change cases too, since frame_dim changes under it.
+    gpu_input.mouse.pos = daxa_f32vec2{
+        static_cast<daxa_f32>(gpu_input.frame_dim.x) * 0.5f,
+        static_cast<daxa_f32>(gpu_input.frame_dim.y) * 0.5f,
+    };
 
     gpu_context.frame_task_graph = daxa::TaskGraph({
         .device = gpu_context.device,

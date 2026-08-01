@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 // ---------------------------------------------------------------------------------------------
 // Command-line control for the engine.
@@ -31,15 +32,67 @@
 //
 // Nothing here changes behaviour unless a flag is passed. With no arguments the engine starts
 // exactly as upstream did.
+
+/// F3 -- one requested change to a registered AppSettings entry.
+///
+/// WHY A STRING RATHER THAN A TYPED VALUE. The settings registry is populated by
+/// `AppSettings::add()` calls scattered across voxel_app.cpp and six renderer headers, all of
+/// which run *after* the CLI is parsed, so at parse time neither the setting's type nor (for a
+/// combo box) its list of legal option names is known yet. Overrides are therefore recorded
+/// verbatim and interpreted in `AppUi::update()` once the registry is complete -- which also
+/// means the value is validated against the type the engine actually registered rather than
+/// against this file's assumption about it.
+struct SettingOverride {
+    std::string category; ///< e.g. "Graphics"
+    std::string id;       ///< e.g. "Render Res Scale"
+    std::string value;    ///< uninterpreted; parsed against the registered type at apply time
+    std::string origin;   ///< the flag that produced this, so a diagnostic can name it
+};
+
+/// --edit -- one scripted brush stroke, applied without any synthetic input.
+///
+/// WHY THIS EXISTS, and why it is worth a CLI flag. Verifying the editing system means showing a
+/// before and an after of the same world from the same pose, for eleven brushes. Driving that
+/// with synthetic mouse and keyboard events -- the only way to do it before this -- failed in
+/// three separate ways during this project, and every one of them produced a *plausible*
+/// screenshot rather than an error:
+///   * `SetForegroundWindow` is refused to a background process, so keystrokes are silently
+///     dropped and the capture shows the DEFAULT tool having done nothing;
+///   * `Process.MainWindowHandle` returns the console window for this /subsystem:console build,
+///     so input goes to the wrong window;
+///   * `GetForegroundWindow()` is 0 on this desktop, which drops `keybd_event` while
+///     `mouse_event` still lands -- i.e. the click happens with the wrong brush selected.
+/// A dropped keystroke is indistinguishable from a brush that does nothing, which is precisely
+/// the thing under test. This flag removes the input layer from the experiment: the stroke is
+/// applied by the same code path the mouse drives, one frame at a time, at a scripted time.
+struct ScriptedEdit {
+    float at_s = 0.0f;     ///< seconds from the first frame at which to press
+    float hold_s = 0.25f;  ///< how long to hold. Longer than one frame: see the note in voxel_app.
+    uint32_t brush_id = 0; ///< BRUSH_ID_*, resolved from a name at parse time
+    float radius = 2.0f;   ///< metres, clamped to BRUSH_RADIUS_MIN/MAX by the shader
+    bool secondary = false;///< press the secondary (right) button instead of the primary
+    std::string origin;    ///< the argument text, so a diagnostic can quote it back
+};
+
 struct AppCli {
     // --pos X,Y,Z -- player position in ABSOLUTE world metres, i.e. exactly the sum the debug
     // overlay shows as `Player Unit Offset` + `Player Pos`. The camera sits 0.2 m below this
     // (application/player.cpp, `cam_pos`), which matters when framing a shot to the voxel.
     std::optional<std::array<float, 3>> pos;
 
-    // --rot YAW,PITCH in radians, matching the overlay's `Player Rot (Y/P/R)`. Pitch is measured
-    // from +Z down, so 1.571 is level, smaller looks up, larger looks down. Roll is not exposed
-    // because nothing in this project needs it and it would be one more thing to get wrong.
+    // --rot YAW,PITCH in radians, matching the overlay's `Player Rot (Y/P/R)`. 1.571 (pi/2) is
+    // level; SMALLER LOOKS DOWN and LARGER LOOKS UP.
+    //
+    // This comment used to say the opposite, and the sign error is easy to make because "pitch
+    // measured from +Z" sounds like it should grow downward. It does not: player.cpp:92 sets the
+    // startup pitch to M_PI * 0.349 = 1.0964, and docs/SCENE.md documents that startup view as 27
+    // degrees BELOW the horizon -- and 1.5708 - 1.0964 = 0.4744 rad = 27.2 degrees. player.cpp:166
+    // agrees: it SUBTRACTS the mouse dy, and pushing the mouse forward looks up.
+    //
+    // The cost of getting it backwards is not an error, it is a plausible-looking capture of the
+    // wrong thing: a scripted prop placement aimed 27 degrees the wrong way stuck a campfire to
+    // the tunnel CEILING and photographed it, which reads as "the brush is broken" rather than
+    // "the camera is upside down". Roll is not exposed; nothing here needs it.
     std::optional<std::array<float, 2>> rot;
 
     // --patrol RADIUS,PERIOD -- fly a closed horizontal circle of RADIUS metres about --pos (or
@@ -95,6 +148,26 @@ struct AppCli {
     // nudge is not reproducible. Pass --no-lock-camera to fly around from a given start pose.
     bool lock_camera = false;
     bool lock_camera_explicit = false;
+
+    // F3 -- quality settings requested on the command line, in the order given.
+    //
+    // WHY THIS EXISTS. Before it, no quality setting was reachable from the command line at all:
+    // every harness in this project reached into
+    // %APPDATA%\GabeVoxelGame\user_settings.json and patched it by hand between runs. That is
+    // the same shared file that trap 1 in PERFORMANCE_PLAN.md section 2.5 is about, so the only
+    // way to configure a measurement was also the thing corrupting measurements. With these,
+    // a sweep is a loop over argument lists and the settings file is never touched.
+    //
+    // Applied in AppUi::update() on the first frame -- see the comment there for why that is the
+    // only point at which the settings registry is complete.
+    std::vector<SettingOverride> setting_overrides;
+
+    // --edit T,BRUSH,RADIUS[,HOLD][,rmb] -- repeatable. See ScriptedEdit above.
+    std::vector<ScriptedEdit> edits;
+
+    /// True when any --edit was given. The scripted-edit path unpauses the game and takes over
+    /// the tool belt, so it must not engage merely because the vector is empty.
+    [[nodiscard]] auto edits_scripted() const -> bool { return !edits.empty(); }
 
     // Set by --help. main() returns immediately on it -- a --help that starts a Vulkan context
     // and 30 s of shader compilation is not a help screen.

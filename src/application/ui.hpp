@@ -9,6 +9,7 @@ struct ImFont;
 #include <filesystem>
 #include <thread>
 #include <mutex>
+#include <string>
 #include <fmt/format.h>
 
 #define INVALID_GAME_ACTION (-1)
@@ -64,8 +65,33 @@ struct AppUi {
     void toggle_debug();
     void toggle_console();
 
+    /// F2. One line naming every effective entry in a settings category, e.g.
+    /// `Render Res Scale=0.6667 | TAA Method=Kajiya TAA | global_illumination=on`.
+    ///
+    /// Static because it reads the process-wide settings registry rather than any AppUi state,
+    /// which also lets code outside the UI (the bench-CSV writer) ask for it. Only meaningful
+    /// once every AppSettings::add() has run -- that is, from the first frame onwards.
+    static auto settings_summary(SettingCategoryId const &category_id) -> std::string;
+
+    /// True once the Graphics settings have differed from their first-frame values at any point
+    /// during the run. The whole reason F2 exists: a run whose configuration moved underneath it
+    /// is not a measurement, and this makes that visible rather than silent.
+    [[nodiscard]] auto settings_changed_mid_run() const -> bool { return settings_moved; }
+
   private:
     void settings_ui();
     void settings_controls_ui();
     void settings_passes_ui();
+
+    /// F3. Applies AppCli::setting_overrides. Called once, on the first update() -- see the
+    /// comment at the definition for why it cannot happen any earlier.
+    void apply_cli_setting_overrides();
+    /// F2. Records the first-frame Graphics summary, writes the bench-CSV sidecar, and watches
+    /// for the settings moving afterwards.
+    void track_settings_provenance();
+
+    bool cli_overrides_applied = false;
+    bool settings_baseline_taken = false;
+    std::string startup_graphics_summary;
+    bool settings_moved = false;
 };

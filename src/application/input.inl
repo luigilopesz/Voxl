@@ -37,6 +37,16 @@ struct MouseInput {
     daxa_f32vec2 scroll_delta;
 };
 
+// --- editing tools ----------------------------------------------------------------------------
+// The tool the player has selected crosses to the GPU as a `BrushSelection`, declared with the
+// rest of the brush contract in voxels/brushes.inl (which this file already pulls in via
+// voxels/voxels.inl -> voxels/impl/voxels.inl). Everything else about the tool belt -- ordering,
+// key bindings, labels, the HUD -- is presentation and stays host-side in application/ui_tools.
+//
+// Only two numbers cross: which brush, and how big. The *secondary* brush is not sent, because
+// brushes.inl derives it with BRUSH_SECONDARY_ID(); sending it too would be a second copy of that
+// rule, free to disagree with the first.
+
 struct IrcacheCascadeConstants {
     daxa_i32vec4 origin;
     daxa_i32vec4 voxels_scrolled_this_frame;
@@ -92,6 +102,10 @@ struct GpuInput {
     BrushSettings world_brush_settings;
     BrushSettings brush_a_settings;
     BrushSettings brush_b_settings;
+    // Filled every frame by ToolBelt::perframe(). Read by perframe.comp.glsl behind
+    // BRUSH_SELECTION_FROM_CPU; with that at 0 the shader drives its own selection and ignores
+    // this, so the member is harmless either way but the HUD is only truthful at 1.
+    BrushSelection brush_selection;
     Player player;
     MouseInput mouse;
     daxa_u32 actions[GAME_ACTION_LAST + 1];

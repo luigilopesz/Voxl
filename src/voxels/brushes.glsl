@@ -1303,62 +1303,109 @@ void brushgen_world(in out Voxel voxel) {
     }
 }
 
+// =============================================================================
+// THE USER BRUSHES
+//
+// Everything below runs once per voxel of every chunk the edit touches, so the
+// costs here are multiplied by 64^3 per chunk and by up to
+// BRUSH_MAX_CHUNK_SPAN^3 = 125 chunks. That is the reason for the cheap
+// bounding rejects in the tree brushes, and the reason `radius` is bounded at
+// all -- see the arithmetic in brushes.inl.
+//
+// THE STROKE. Every ball-shaped tool is a CAPSULE from prev_pos to pos, not a
+// sphere at pos. That is what makes a dragged tool paint a continuous stroke
+// instead of a dotted line at whatever the frame rate happens to be. Both
+// endpoints carry their own integer-metre offset because the world origin
+// moves with the player, so they have to be summed before they can be
+// compared. brush_p0()/brush_p1() do that once and are used everywhere.
+//
+// THE RADIUS. Every tool used to hardcode 32.0 * VOXEL_SIZE (2 m). They all
+// take brush_input.radius now, and 2 m is its default, so the shipped feel at
+// the default setting is unchanged.
+// =============================================================================
+
+vec3 brush_p0() { return brush_input.pos + brush_input.pos_offset; }
+vec3 brush_p1() { return brush_input.prev_pos + brush_input.prev_pos_offset; }
+
+// Signed distance to the swept stroke of the current tool.
+float brush_stroke_sd(vec3 p) {
+    return sd_capsule(p, brush_p0(), brush_p1(), brush_input.radius);
+}
+
+// The surface skin of an edit, in metres. Voxels this close to the cut get
+// their normal reset to the "null" normal (+Z), which is the signal the
+// chunk post-process reads as "derive one from the geometry"
+// (voxel_world.comp.glsl:424). The alternative -- an analytic sphere normal --
+// is wrong wherever the ball meets existing terrain, which is most of an edit.
+#define BRUSH_SKIN (2.5 * VOXEL_SIZE)
+
 void brush_remove_grass(in out Voxel voxel) {
-    float sd = sd_capsule(voxel_pos, brush_input.pos + brush_input.pos_offset, brush_input.prev_pos + brush_input.prev_pos_offset, 32.0 * VOXEL_SIZE);
+    float sd = brush_stroke_sd(voxel_pos);
     float diff = length(voxel.color - pow(vec3(85, 166, 78) / 255.0 * 0.5, vec3(2.2)));
 
     if (sd < 0 && voxel.material_type == 1 && diff < 0.025) {
         voxel.color = vec3(0, 0, 0);
         voxel.material_type = 0;
     }
-    if (sd < 2.5 * VOXEL_SIZE) {
+    if (sd < BRUSH_SKIN) {
         voxel.normal = vec3(0, 0, 1);
     }
 }
 
 void brush_remove_ball(in out Voxel voxel) {
-    float sd = sd_capsule(voxel_pos, brush_input.pos + brush_input.pos_offset, brush_input.prev_pos + brush_input.prev_pos_offset, 32.0 * VOXEL_SIZE);
+    float sd = brush_stroke_sd(voxel_pos);
     if (sd < 0) {
         voxel.color = vec3(0, 0, 0);
         voxel.material_type = 0;
     }
-    if (sd < 2.5 * VOXEL_SIZE) {
+    if (sd < BRUSH_SKIN) {
         voxel.normal = vec3(0, 0, 1);
     }
 }
 
-void brushgen_a(in out Voxel voxel) {
-    PackedVoxel voxel_data = sample_voxel_chunk(voxel_malloc_page_allocator, voxel_chunk_ptr, inchunk_voxel_i);
-    Voxel prev_voxel = unpack_voxel(voxel_data);
-
-    voxel.color = prev_voxel.color;
-    voxel.material_type = prev_voxel.material_type;
-    voxel.normal = prev_voxel.normal;
-    voxel.roughness = prev_voxel.roughness;
-
-    // brush_remove_grass(voxel);
-    brush_remove_ball(voxel);
+// The missing half of the tool set. brush_remove_ball had no counterpart, so
+// the engine could subtract terrain but never add any.
+//
+// The colour is the test scene's bedrock -- voxl_rock_material()'s final case,
+// vec3(122,120,116) at k=0.62 -- rather than a fresh one, so filling a hole
+// reads as the same stone it was cut from instead of as a patch. Roughness
+// matches for the same reason. Keeping it to ONE colour with no per-voxel
+// jitter is also what keeps a filled region's 8^3 palette blocks bit-uniform,
+// which costs zero heap pages (see rule (2) in this file's header): a 2 m ball
+// of stone is 33 500 voxels and it is worth not paying for them.
+void brush_add_ball(in out Voxel voxel) {
+    float sd = brush_stroke_sd(voxel_pos);
+    if (sd < 0) {
+        voxel.material_type = 1;
+        voxel.roughness = 0.90;
+        voxel.color = voxl_col(vec3(122.0, 120.0, 116.0), 0.62);
+    }
+    if (sd < BRUSH_SKIN) {
+        voxel.normal = vec3(0, 0, 1);
+    }
 }
 
 void brush_grass_ball(in out Voxel voxel) {
-    float sd = sd_capsule(voxel_pos, brush_input.pos + brush_input.pos_offset, brush_input.prev_pos + brush_input.prev_pos_offset, 32.0 * VOXEL_SIZE);
-    vec3 nrm = normalize(voxel_pos - (brush_input.pos + brush_input.pos_offset));
+    float sd = brush_stroke_sd(voxel_pos);
+    vec3 nrm = normalize(voxel_pos - brush_p0());
     if (sd < 0) {
         voxel.material_type = 1;
         voxel.color = vec3(0.95, 0.95, 0.95);
         voxel.roughness = 0.9;
     } else {
-        float grass_val = sd_capsule(voxel_pos - vec3(0, 0, VOXEL_SIZE), brush_input.pos + brush_input.pos_offset, brush_input.prev_pos + brush_input.prev_pos_offset, 32.0 * VOXEL_SIZE);
+        // One voxel down: the shell of air directly above the ball, which is where
+        // a grass strand can stand.
+        float grass_val = brush_stroke_sd(voxel_pos - vec3(0, 0, VOXEL_SIZE));
         if (grass_val < 0.0) {
             try_spawn_grass(voxel, nrm);
         }
     }
-    if (sd < 2.5 * VOXEL_SIZE) {
+    if (sd < BRUSH_SKIN) {
         voxel.normal = vec3(0, 0, 1);
     }
 }
 void brush_flowers(in out Voxel voxel) {
-    float sd = sd_capsule(voxel_pos, brush_input.pos + brush_input.pos_offset, brush_input.prev_pos + brush_input.prev_pos_offset, 32.0 * VOXEL_SIZE);
+    float sd = brush_stroke_sd(voxel_pos);
     PackedVoxel temp_voxel_data = sample_voxel_chunk(VOXELS_BUFFER_PTRS, chunk_n, voxel_pos + vec3(0, 0, VOXEL_SIZE), vec3(0));
     Voxel above_voxel = unpack_voxel(temp_voxel_data);
     if (sd < 0 && voxel.material_type != 0 && above_voxel.material_type == 0) {
@@ -1373,29 +1420,53 @@ void brush_flowers(in out Voxel voxel) {
     }
 }
 void brush_light_ball(in out Voxel voxel) {
-    float sd = sd_capsule(voxel_pos, brush_input.pos + brush_input.pos_offset, brush_input.prev_pos + brush_input.prev_pos_offset, 32.0 * VOXEL_SIZE);
-    vec3 nrm = normalize(voxel_pos - (brush_input.pos + brush_input.pos_offset));
+    float sd = brush_stroke_sd(voxel_pos);
     if (sd < 0) {
         voxel.material_type = 3;
         voxel.color = vec3(0.95, 0.15, 0.05);
         voxel.roughness = 0.9;
     }
-    if (sd < 2.5 * VOXEL_SIZE) {
+    if (sd < BRUSH_SKIN) {
         voxel.normal = vec3(0, 0, 1);
     }
 }
+
+// -- the placed props ---------------------------------------------------------
+//
+// Lantern, fire and torch are built from boxes and cones at absolute voxel
+// sizes rather than from the stroke capsule, so "radius" cannot mean the same
+// thing for them as it does for a ball. It scales them instead: `brush_prop_scl()`
+// is 1.0 at the default 2 m radius, so a lantern placed with the tool untouched
+// is exactly the lantern that was hardcoded before, and turning the wheel up
+// makes a bonfire out of a campfire.
+//
+// The scale is clamped: these shapes are authored in voxels and a prop scaled
+// below ~0.4 collapses into a single grey pixel, while one scaled past 4 leaves
+// the box the chunk-election shader reserved for it and gets clipped at a chunk
+// boundary.
+float brush_prop_scl() {
+    return clamp(brush_input.radius / BRUSH_RADIUS_DEFAULT, 0.4, 4.0);
+}
+
 void brush_lantern(in out Voxel voxel) {
     float sd_housing = FLT_MAX;
     float sd_flame = FLT_MAX;
 
-    vec3 lantern_c = brush_input.pos + brush_input.pos_offset;
+    vec3 lantern_c = brush_p0();
+    float s = brush_prop_scl();
+    // Divide the sample point by the scale rather than multiplying every extent:
+    // one operation, and the distances stay a true SDF once multiplied back.
+    vec3 p = (voxel_pos - lantern_c) / s;
 
-    sd_housing = sd_union(sd_housing, sd_box_frame(voxel_pos - lantern_c - vec3(0, 0, 0.4), vec3((VOXEL_SIZE * 4).xx, 0.4), VOXEL_SIZE));
-    sd_housing = sd_union(sd_housing, sd_box(voxel_pos - lantern_c, vec3((VOXEL_SIZE * 3).xx, VOXEL_SIZE)));
-    sd_housing = sd_union(sd_housing, sd_box(voxel_pos - lantern_c - vec3(0, 0, 0.8), vec3((VOXEL_SIZE * 3).xx, VOXEL_SIZE)));
-    sd_housing = sd_union(sd_housing, sd_box(voxel_pos - lantern_c - vec3(0, 0, 0.8 + VOXEL_SIZE * 1), vec3((VOXEL_SIZE * 1).xx, VOXEL_SIZE)));
+    sd_housing = sd_union(sd_housing, sd_box_frame(p - vec3(0, 0, 0.4), vec3((VOXEL_SIZE * 4).xx, 0.4), VOXEL_SIZE));
+    sd_housing = sd_union(sd_housing, sd_box(p, vec3((VOXEL_SIZE * 3).xx, VOXEL_SIZE)));
+    sd_housing = sd_union(sd_housing, sd_box(p - vec3(0, 0, 0.8), vec3((VOXEL_SIZE * 3).xx, VOXEL_SIZE)));
+    sd_housing = sd_union(sd_housing, sd_box(p - vec3(0, 0, 0.8 + VOXEL_SIZE * 1), vec3((VOXEL_SIZE * 1).xx, VOXEL_SIZE)));
 
-    sd_flame = sd_union(sd_flame, sd_box(voxel_pos - lantern_c - vec3(0, 0, 0.4), vec3((VOXEL_SIZE * 3).xx, 0.4)));
+    sd_flame = sd_union(sd_flame, sd_box(p - vec3(0, 0, 0.4), vec3((VOXEL_SIZE * 3).xx, 0.4)));
+
+    sd_housing *= s;
+    sd_flame *= s;
 
     if (sd_housing < 0) {
         voxel.material_type = 1;
@@ -1413,12 +1484,17 @@ void brush_fire(in out Voxel voxel) {
     float sd_base = FLT_MAX;
     float sd_flame = FLT_MAX;
 
-    vec3 lantern_c = brush_input.pos + brush_input.pos_offset;
+    vec3 lantern_c = brush_p0();
+    float s = brush_prop_scl();
+    vec3 p = (voxel_pos - lantern_c) / s;
 
-    sd_base = sd_union(sd_base, sd_box(voxel_pos - lantern_c, vec3((VOXEL_SIZE * 3).xx, VOXEL_SIZE)));
+    sd_base = sd_union(sd_base, sd_box(p, vec3((VOXEL_SIZE * 3).xx, VOXEL_SIZE)));
 
-    sd_flame = sd_union(sd_flame, sd_round_cone(voxel_pos - (lantern_c + vec3((VOXEL_SIZE * -0.5).xx, 0.2)), VOXEL_SIZE * 4, VOXEL_SIZE * 2, 0.4));
+    sd_flame = sd_union(sd_flame, sd_round_cone(p - vec3((VOXEL_SIZE * -0.5).xx, 0.2), VOXEL_SIZE * 4, VOXEL_SIZE * 2, 0.4));
     float flame_rand = good_rand(voxel_pos);
+
+    sd_base *= s;
+    sd_flame *= s;
 
     if (sd_base < 0) {
         voxel.material_type = 1;
@@ -1439,13 +1515,18 @@ void brush_torch(in out Voxel voxel) {
     float sd_base = FLT_MAX;
     float sd_flame = FLT_MAX;
 
-    vec3 lantern_c = brush_input.pos + brush_input.pos_offset;
+    vec3 lantern_c = brush_p0();
+    float s = brush_prop_scl();
+    vec3 p = (voxel_pos - lantern_c) / s;
 
-    sd_base = sd_union(sd_base, sd_box(voxel_pos - (lantern_c + vec3(0, 0, 1.0)), vec3((VOXEL_SIZE * 2.5).xx, VOXEL_SIZE)));
-    sd_base = sd_union(sd_base, sd_box(voxel_pos - (lantern_c + vec3(0, 0, 0.5)), vec3((VOXEL_SIZE * 1.5).xx, 0.5)));
+    sd_base = sd_union(sd_base, sd_box(p - vec3(0, 0, 1.0), vec3((VOXEL_SIZE * 2.5).xx, VOXEL_SIZE)));
+    sd_base = sd_union(sd_base, sd_box(p - vec3(0, 0, 0.5), vec3((VOXEL_SIZE * 1.5).xx, 0.5)));
 
-    sd_flame = sd_union(sd_flame, sd_round_cone(voxel_pos - (lantern_c + vec3(0, 0, 1.0 + VOXEL_SIZE * 2)), VOXEL_SIZE * 2.0, VOXEL_SIZE * 0.5, 0.2));
+    sd_flame = sd_union(sd_flame, sd_round_cone(p - vec3(0, 0, 1.0 + VOXEL_SIZE * 2), VOXEL_SIZE * 2.0, VOXEL_SIZE * 0.5, 0.2));
     float flame_rand = good_rand(voxel_pos);
+
+    sd_base *= s;
+    sd_flame *= s;
 
     if (sd_base < 0) {
         voxel.material_type = 1;
@@ -1517,11 +1598,58 @@ TreeSDFNrm sd_maple_tree(in vec3 p, in vec3 seed) {
     return val;
 }
 
-void brush_maple_tree(in out Voxel voxel) {
-    vec3 tree_pos = brush_input.pos + brush_input.pos_offset;
+// -- the trees ----------------------------------------------------------------
+//
+// Both tree SDFs are authored in their own model space with a fixed size:
+// sd_maple_tree() is about 17.5 m tall and 7.7 m across, sd_spruce_tree() about
+// 5.0 m by 1.6 m. `radius` is taken as the CROWN RADIUS and the height follows
+// at BRUSH_TREE_HEIGHT_PER_RADIUS times it, which is close enough to both
+// models' own proportions that one uniform scale does the job.
+//
+// TWO THINGS TO KNOW BEFORE TOUCHING THESE.
+//
+// (a) THE BOUNDING REJECT IS NOT AN OPTIMISATION, IT IS THE DIFFERENCE BETWEEN
+//     A PLACEMENT AND A STALL. sd_maple_tree() evaluates about 200 capsules and
+//     spheres. This function runs once per voxel of every elected chunk, and a
+//     tree can elect the full BRUSH_MAX_CHUNK_SPAN^3 = 125 chunks: 125 * 64^3 =
+//     32.7 million invocations. Ten cheap comparisons in front of it turn a
+//     multi-hundred-millisecond hitch into the measurement in the report.
+//
+// (b) brush_spruce_tree() USED brush_input.pos WITHOUT pos_offset, which put the
+//     tree at the wrong place by the whole player unit offset -- 183 m from the
+//     spawn in this scene. It was unreachable (the call was commented out) so
+//     nothing had ever exercised it. Fixed here; both use brush_p0().
+float brush_tree_radius() { return min(brush_input.radius, BRUSH_TREE_RADIUS_MAX); }
 
+// Cheap conservative reject. `lat` is the crown radius and `up` the height, both
+// world metres; a little slack on each so the reject can never clip the SDF's
+// own surface.
+bool brush_tree_reject(vec3 anchor, float lat, float up) {
+    vec3 d = voxel_pos - anchor;
+    if (d.z < -BRUSH_TREE_DOWN_M || d.z > up + 1.0) {
+        return true;
+    }
+    float r = lat + 0.5;
+    return dot(d.xy, d.xy) > r * r;
+}
+
+#define BRUSH_MAPLE_MODEL_H 17.5
+
+void brush_maple_tree(in out Voxel voxel) {
+    vec3 tree_pos = brush_p0();
+    float tree_r = brush_tree_radius();
+    float tree_h = tree_r * BRUSH_TREE_HEIGHT_PER_RADIUS;
+
+    if (brush_tree_reject(tree_pos, tree_r, tree_h)) {
+        return;
+    }
+
+    // Model-space scale: multiply the sample point to shrink the world tree.
+    // The +/-15% jitter is what is left of the original `1.5 - rand * 0.5`, kept
+    // so two trees placed side by side are not identical, now that the size
+    // itself is the player's choice rather than a random one.
     float tree_size = good_rand(tree_pos);
-    float space_scl = 1.5 - tree_size * 0.5;
+    float space_scl = (BRUSH_MAPLE_MODEL_H / tree_h) * (1.15 - tree_size * 0.3);
     TreeSDFNrm tree = sd_maple_tree((voxel_pos - tree_pos) * space_scl, tree_pos);
     tree.wood /= space_scl;
     tree.leaves /= space_scl;
@@ -1550,8 +1678,21 @@ void brush_maple_tree(in out Voxel voxel) {
     }
 }
 
+#define BRUSH_SPRUCE_MODEL_H 5.0
+
 void brush_spruce_tree(in out Voxel voxel) {
-    TreeSDF tree = sd_spruce_tree(voxel_pos - brush_input.pos, brush_input.pos);
+    vec3 tree_pos = brush_p0();
+    float tree_r = brush_tree_radius();
+    float tree_h = tree_r * BRUSH_TREE_HEIGHT_PER_RADIUS;
+
+    if (brush_tree_reject(tree_pos, tree_r, tree_h)) {
+        return;
+    }
+
+    float space_scl = BRUSH_SPRUCE_MODEL_H / tree_h;
+    TreeSDF tree = sd_spruce_tree((voxel_pos - tree_pos) * space_scl, tree_pos);
+    tree.wood /= space_scl;
+    tree.leaves /= space_scl;
 
     if (tree.wood < 0) {
         voxel.material_type = 1;
@@ -1566,7 +1707,53 @@ void brush_spruce_tree(in out Voxel voxel) {
     }
 }
 
-void brushgen_b(in out Voxel voxel) {
+// =============================================================================
+// DISPATCH
+//
+// This is the whole of what used to be hardcoded: brushgen_a always removed a
+// ball, brushgen_b always made a fire, and the other nine brushes sat commented
+// out. Both now switch on brush_input.brush_id, which the CPU (or, until the
+// tool UI lands, perframe.comp.glsl) selects -- see brushes.inl for the
+// enumeration and for who writes it.
+//
+// The two flags survive unchanged: BRUSH_FLAGS_USER_BRUSH_A and _B are still
+// independent bindings and still map to two mouse buttons. What changed is what
+// they *do*. Primary applies the selected tool; secondary applies its inverse,
+// which BRUSH_SECONDARY_ID() defines as "remove terrain" for everything except
+// remove-terrain itself, where it is "add terrain". A player therefore always
+// has build-on-one-button and erase-on-the-other, whatever tool is selected.
+//
+// EVERY BRUSH READS THE PREVIOUS VOXEL FIRST. An edit is a modification of the
+// world, not a regeneration of it: the chunk is re-run from scratch, so
+// anything the brush does not touch has to be copied forward from the heap or
+// it is erased. That heap read is also the floor on what an edit costs -- it
+// happens for all 64^3 voxels of every elected chunk whether the brush writes
+// anything or not.
+// =============================================================================
+
+// `brush_id` is int, not uint, purely so the case labels below (which are plain
+// integer #defines shared with C++) need no cast to match the selector type.
+void brush_dispatch(in out Voxel voxel, int brush_id) {
+    switch (brush_id) {
+    case BRUSH_ID_REMOVE_BALL: brush_remove_ball(voxel); break;
+    case BRUSH_ID_ADD_BALL: brush_add_ball(voxel); break;
+    case BRUSH_ID_GRASS_BALL: brush_grass_ball(voxel); break;
+    case BRUSH_ID_REMOVE_GRASS: brush_remove_grass(voxel); break;
+    case BRUSH_ID_FLOWERS: brush_flowers(voxel); break;
+    case BRUSH_ID_LIGHT_BALL: brush_light_ball(voxel); break;
+    case BRUSH_ID_LANTERN: brush_lantern(voxel); break;
+    case BRUSH_ID_FIRE: brush_fire(voxel); break;
+    case BRUSH_ID_TORCH: brush_torch(voxel); break;
+    case BRUSH_ID_MAPLE_TREE: brush_maple_tree(voxel); break;
+    case BRUSH_ID_SPRUCE_TREE: brush_spruce_tree(voxel); break;
+    // A brush_id the shader does not know is a bug on the CPU side, and doing
+    // nothing is the only safe response: the alternative is silently editing the
+    // world with the wrong tool.
+    default: break;
+    }
+}
+
+void brush_load_prev(in out Voxel voxel) {
     PackedVoxel voxel_data = sample_voxel_chunk(voxel_malloc_page_allocator, voxel_chunk_ptr, inchunk_voxel_i);
     Voxel prev_voxel = unpack_voxel(voxel_data);
 
@@ -1574,15 +1761,16 @@ void brushgen_b(in out Voxel voxel) {
     voxel.material_type = prev_voxel.material_type;
     voxel.normal = prev_voxel.normal;
     voxel.roughness = prev_voxel.roughness;
+}
 
-    // brush_grass_ball(voxel);
-    // brush_flowers(voxel);
+// Primary button: the selected tool.
+void brushgen_a(in out Voxel voxel) {
+    brush_load_prev(voxel);
+    brush_dispatch(voxel, int(brush_input.brush_id));
+}
 
-    // brush_light_ball(voxel);
-    // brush_lantern(voxel);
-    brush_fire(voxel);
-    // brush_torch(voxel);
-
-    // brush_maple_tree(voxel);
-    // brush_spruce_tree(voxel);
+// Secondary button: the inverse of the selected tool.
+void brushgen_b(in out Voxel voxel) {
+    brush_load_prev(voxel);
+    brush_dispatch(voxel, BRUSH_SECONDARY_ID(int(brush_input.brush_id)));
 }

@@ -2,6 +2,7 @@
 
 #include <application/window.hpp>
 #include <application/ui.hpp>
+#include <application/ui_tools.hpp>
 #include <application/audio.hpp>
 #include <application/player.hpp>
 
@@ -25,6 +26,9 @@ struct VoxelApp : AppWindow<VoxelApp> {
     GpuContext gpu_context;
 
     AppUi ui;
+    // The editing tool belt: selection, brush radius and the in-play HUD. Declared after `ui`
+    // because install_hud() needs AppUi's ImGui context and fonts to already exist.
+    ToolBelt tools;
     AppAudio audio;
     daxa::ImGuiRenderer imgui_renderer;
     Renderer renderer;

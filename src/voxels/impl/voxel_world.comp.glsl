@@ -85,22 +85,105 @@ void main() {
         ivec3 wrapped_chunk_i = imod3(terrain_work_item.i - imod3(terrain_work_item.chunk_offset - ivec3(chunk_n), ivec3(chunk_n)), ivec3(chunk_n));
         // Leaf chunk position in world space
         ivec3 world_chunk = terrain_work_item.chunk_offset + wrapped_chunk_i - ivec3(chunk_n / 2);
-        vec3 world_chunk_center = vec3(world_chunk << (6 + LOG2_VOXEL_SIZE)) + (32 * VOXEL_SIZE);
+        // (world_chunk_center was only ever read by the hand-fitted brush-B test that the
+        // box below replaces, so it is gone with it.)
 
         terrain_work_item.brush_input = VOXEL_WORLD.brush_input;
 
-        ivec3 brush_chunk = (ivec3(floor(VOXEL_WORLD.brush_input.pos)) + VOXEL_WORLD.brush_input.pos_offset) >> (6 + LOG2_VOXEL_SIZE);
-        bool is_near_brush = all(greaterThanEqual(world_chunk, brush_chunk - 1)) && all(lessThanEqual(world_chunk, brush_chunk + 1));
-
+        // ---- which chunks an edit regenerates -------------------------------------------
+        //
+        // This used to be a fixed 3x3x3 of chunks around the one the brush point sits in,
+        // plus a second hand-fitted test for brush B shaped like the tree it was hardcoded
+        // to place. That was exactly right for a 2 m ball and wrong for anything else: a
+        // larger tool was silently clipped at the chunk boundary, and prev_pos was ignored
+        // entirely, so a dragged stroke only regenerated chunks near where it *ended*.
+        //
+        // It is now the axis-aligned bounding box of the swept capsule, inflated by the
+        // radius -- so it follows the tool the player actually selected, and A BRUSH THAT
+        // STRADDLES A CHUNK BOUNDARY ELECTS BOTH CHUNKS BY CONSTRUCTION. It is a box over
+        // both endpoints, not a neighbourhood of one point, which is the property that
+        // makes that true rather than accidental.
+        //
+        // The box CANNOT overflow the budget. try_elect() drops work past
+        // MAX_CHUNK_UPDATES_PER_FRAME silently -- an over-large edit does not fail loudly,
+        // it half-applies -- so the two inputs are bounded upstream instead:
+        // brushes.inl clamps radius to BRUSH_RADIUS_MAX (8 m), and perframe.comp.glsl
+        // shortens the stroke so 2*radius + stroke <= BRUSH_MAX_SPAN_M (16 m). 16 m of
+        // 4 m chunks is at most BRUSH_MAX_CHUNK_SPAN = 5 per axis, and 5^3 = 125 <= 128.
         vec3 world_brush_pos = VOXEL_WORLD.brush_input.pos + VOXEL_WORLD.brush_input.pos_offset;
-        bool is_near_brush_a = is_near_brush;
-        bool is_near_brush_b = length(world_brush_pos.xy - world_chunk_center.xy) < 4 && abs(world_brush_pos.z + 6 - world_chunk_center.z) < 10;
-        is_near_brush_b = is_near_brush_b || (length(world_brush_pos + vec3(0, 0, 9) - world_chunk_center) < 10);
+        vec3 world_brush_prev = VOXEL_WORLD.brush_input.prev_pos + VOXEL_WORLD.brush_input.prev_pos_offset;
+        float brush_r = VOXEL_WORLD.brush_input.radius;
+        int brush_id = int(VOXEL_WORLD.brush_input.brush_id);
 
-        if (is_near_brush_a && deref(gpu_input).actions[GAME_ACTION_BRUSH_A] != 0) {
+        vec3 stroke_lo = min(world_brush_pos, world_brush_prev);
+        vec3 stroke_hi = max(world_brush_pos, world_brush_prev);
+
+        // The secondary button is always a plain ball of the current radius
+        // (BRUSH_SECONDARY_ID in brushes.inl), so its box is the simple one and never
+        // needs the per-tool cases below.
+        vec3 ball_lo = stroke_lo - vec3(brush_r);
+        vec3 ball_hi = stroke_hi + vec3(brush_r);
+
+        // The primary button's box depends on the tool. Only the trees differ: they are
+        // anchored at their base and grow upward, so their box is not centred on the brush
+        // point. Keep this in step with brush_tree_reject() in brushes.glsl -- that
+        // function decides what the edit shader actually draws, and if this box is smaller
+        // the tree gets a flat top at a chunk boundary.
+        vec3 tool_lo = ball_lo;
+        vec3 tool_hi = ball_hi;
+        if (brush_id == BRUSH_ID_MAPLE_TREE || brush_id == BRUSH_ID_SPRUCE_TREE) {
+            float tree_r = min(brush_r, BRUSH_TREE_RADIUS_MAX);
+            float tree_h = tree_r * BRUSH_TREE_HEIGHT_PER_RADIUS;
+            tool_lo = vec3(stroke_lo.xy - vec2(tree_r + 0.5), stroke_lo.z - BRUSH_TREE_DOWN_M);
+            tool_hi = vec3(stroke_hi.xy + vec2(tree_r + 0.5), stroke_hi.z + tree_h + 1.0);
+        }
+
+        // floor(world / 4) rather than the old `>> (6 + LOG2_VOXEL_SIZE)` on a truncated
+        // integer metre: the shift is only correct for whole metres, and the brush point is
+        // not one. They agree for positive coordinates and disagree by a chunk for negative
+        // ones, which is most of this scene.
+        ivec3 tool_lo_chunk = ivec3(floor(tool_lo / CHUNK_WORLDSPACE_SIZE));
+        ivec3 tool_hi_chunk = ivec3(floor(tool_hi / CHUNK_WORLDSPACE_SIZE));
+        ivec3 ball_lo_chunk = ivec3(floor(ball_lo / CHUNK_WORLDSPACE_SIZE));
+        ivec3 ball_hi_chunk = ivec3(floor(ball_hi / CHUNK_WORLDSPACE_SIZE));
+
+        // Belt and braces on the bound argued above. Anchored on the chunk holding the
+        // brush point so that clipping, if the invariant is ever broken by an edit
+        // elsewhere, loses the far edge of the tool rather than the part under the cursor.
+        ivec3 anchor_chunk = ivec3(floor(world_brush_pos / CHUNK_WORLDSPACE_SIZE));
+        const int SPAN = BRUSH_MAX_CHUNK_SPAN - 1;
+        tool_lo_chunk = max(tool_lo_chunk, anchor_chunk - SPAN);
+        tool_hi_chunk = min(tool_hi_chunk, tool_lo_chunk + SPAN);
+        ball_lo_chunk = max(ball_lo_chunk, anchor_chunk - SPAN);
+        ball_hi_chunk = min(ball_hi_chunk, ball_lo_chunk + SPAN);
+
+        bool is_near_brush_a = all(greaterThanEqual(world_chunk, tool_lo_chunk)) && all(lessThanEqual(world_chunk, tool_hi_chunk));
+        bool is_near_brush_b = all(greaterThanEqual(world_chunk, ball_lo_chunk)) && all(lessThanEqual(world_chunk, ball_hi_chunk));
+
+        // One-shot tools (trees, placed props) fire at the START of a press and not again
+        // while it is held; see BRUSH_ONE_SHOT_MASK. Everything else paints for as long as
+        // the button is down, which is what the capsule between prev_pos and pos exists for.
+        // The secondary is always a ball and always paints.
+        //
+        // WHY A WINDOW OF BRUSH_ONE_SHOT_FRAMES AND NOT EXACTLY ONE FRAME. The inherited code
+        // gated brush B on `initial_frame == frame_index`, and measured on this machine that
+        // fires zero times: nothing was ever placed. A single-frame gate has no slack at all,
+        // and it only has to lose one frame -- an election that overflows
+        // MAX_CHUNK_UPDATES_PER_FRAME, a frame in which the player crossed a chunk boundary and
+        // the branch above took priority, or the input arriving a frame after the state that
+        // stamped it -- for the placement to vanish with no feedback. Repeating for a few
+        // frames costs nothing because these brushes are IDEMPOTENT: every one of them is a
+        // pure function of a brush point that is frozen for the duration of the press, so
+        // applying it four times writes the same voxels four times. spawn_tree_particle() is
+        // the one side effect and it is already guarded on the voxel having been air.
+        uint frames_held = deref(gpu_input).frame_index - deref(voxel_globals).brush_state.initial_frame;
+        bool a_fires = deref(gpu_input).actions[GAME_ACTION_BRUSH_A] != 0 &&
+                       (frames_held < BRUSH_ONE_SHOT_FRAMES || !BRUSH_ID_IS_ONE_SHOT(brush_id));
+
+        if (is_near_brush_a && a_fires) {
             terrain_work_item.brush_flags = BRUSH_FLAGS_USER_BRUSH_A;
             try_elect(terrain_work_item, update_index);
-        } else if (is_near_brush_b && deref(gpu_input).actions[GAME_ACTION_BRUSH_B] != 0 && deref(voxel_globals).brush_state.initial_frame == deref(gpu_input).frame_index) {
+        } else if (is_near_brush_b && deref(gpu_input).actions[GAME_ACTION_BRUSH_B] != 0) {
             terrain_work_item.brush_flags = BRUSH_FLAGS_USER_BRUSH_B;
             try_elect(terrain_work_item, update_index);
         }

@@ -10,6 +10,11 @@
 
 #include <vector>
 #include <iostream>
+#include <cstdlib>
+#include <cctype>
+#include <charconv>
+#include <fstream>
+#include <string_view>
 
 using namespace std::literals;
 
@@ -82,9 +87,34 @@ inline auto get_button_string(daxa_i32 glfw_key_id) -> char const * {
     }
 }
 
+namespace {
+    // F1 -- the measurement-hygiene fix. See docs/design/PERFORMANCE_PLAN.md section 2.5 trap 1.
+    //
+    // sago::getDataHome() resolves through the Win32 known-folder API, NOT the %APPDATA%
+    // environment variable, so setting %APPDATA% for a child process does nothing. Every build
+    // of this engine on this machine -- C:\voxl2, C:\voxl2_prof, C:\voxl2rs, C:\voxl2_ws --
+    // therefore reads and writes the one file %APPDATA%\GabeVoxelGame\user_settings.json, and
+    // the settings UI rewrites it on every change (this file, `settings_ui()` and the autosave
+    // in `update()`). With several agents driving the engine at once, one run silently acquires
+    // another's "Render Res Scale", "global_illumination" or "Update Sky" mid-experiment.
+    //
+    // That is not a hypothetical: one profiled run read 5.06 ms instead of 11.34 because a
+    // sibling had left global_illumination = false, and another agent's headline result came out
+    // with the sign reversed. Three agents lost a day each to it.
+    //
+    // VOXL_DATA_DIR points this process at its own directory, so a harness can give every run a
+    // private settings file. Unset, the behaviour is byte-for-byte what it was before.
+    auto resolve_data_directory() -> std::filesystem::path {
+        if (auto const *over = std::getenv("VOXL_DATA_DIR"); over != nullptr && *over != '\0') {
+            return std::filesystem::path{over};
+        }
+        return std::filesystem::path(sago::getDataHome()) / "GabeVoxelGame";
+    }
+} // namespace
+
 AppUi::AppUi(GLFWwindow *glfw_window_ptr)
     : glfw_window_ptr{glfw_window_ptr},
-      data_directory{std::filesystem::path(sago::getDataHome()) / "GabeVoxelGame"} {
+      data_directory{resolve_data_directory()} {
     ImGui::CreateContext();
     auto &style = ImGui::GetStyle();
     auto &io = ImGui::GetIO();
@@ -166,8 +196,14 @@ AppUi::AppUi(GLFWwindow *glfw_window_ptr)
     style.FramePadding = {4.0f, 3.0f};
 
     if (!std::filesystem::exists(data_directory)) {
-        std::filesystem::create_directory(data_directory);
+        // create_directories, not create_directory: a VOXL_DATA_DIR handed over by a harness is
+        // typically a nested per-run path (C:\voxl2\.runs\sweep\p3) whose parents do not exist
+        // yet, and create_directory fails rather than creating them.
+        std::filesystem::create_directories(data_directory);
     }
+    // Logged unconditionally so a capture can always be traced back to the settings file it
+    // actually used -- the whole point of F1 is that this is no longer assumed to be one place.
+    debug_utils::Console::add_log(fmt::format("[settings] data directory: {}\n", data_directory.string()));
 
     if (std::filesystem::exists(data_directory / "user_settings.json")) {
         settings.load(data_directory / "user_settings.json");
@@ -600,7 +636,259 @@ static auto compare_gpu_resource_infos(const void *lhs, const void *rhs) -> int 
     return static_cast<daxa_i32>(static_cast<daxa_i64>(a->size) - static_cast<daxa_i64>(b->size));
 }
 
+// --- F2 / F3: settings provenance and command-line overrides ---------------------------------
+namespace {
+    /// Accepts the spellings a shell script is likely to produce. Deliberately strict about
+    /// anything else: a benchmark that reads "--gi maybe" as false would produce a plausible
+    /// frame time from the wrong renderer, which is the exact failure mode F2 exists to catch.
+    auto parse_bool_value(std::string_view text, bool &out) -> bool {
+        auto lowered = std::string{text};
+        for (auto &c : lowered) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (lowered == "1" || lowered == "on" || lowered == "true" || lowered == "yes") {
+            out = true;
+            return true;
+        }
+        if (lowered == "0" || lowered == "off" || lowered == "false" || lowered == "no") {
+            out = false;
+            return true;
+        }
+        return false;
+    }
+
+    /// Strip everything but letters and digits and lowercase the rest, so "FSR 2.2" and "fsr22"
+    /// compare equal. Lets --taa take a human spelling instead of an index whose meaning depends
+    /// on the order the options happen to be registered in.
+    auto normalise_option(std::string_view text) -> std::string {
+        auto out = std::string{};
+        for (auto c : text) {
+            if (std::isalnum(static_cast<unsigned char>(c)) != 0) {
+                out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            }
+        }
+        return out;
+    }
+
+    /// Resolve a combo-box value: either a plain index, or a unique prefix of one of the option
+    /// names once normalised ("kajiya" -> "Kajiya TAA", "fsr2" -> "FSR 2.2").
+    auto parse_combo_value(std::string_view text, std::vector<std::string> const &options, int32_t &out) -> bool {
+        int32_t index = 0;
+        auto const *first = text.data();
+        auto const *last = text.data() + text.size();
+        if (auto result = std::from_chars(first, last, index); result.ec == std::errc{} && result.ptr == last) {
+            if (options.empty() || (index >= 0 && index < static_cast<int32_t>(options.size()))) {
+                out = index;
+                return true;
+            }
+            return false;
+        }
+        auto needle = normalise_option(text);
+        if (needle.empty()) {
+            return false;
+        }
+        int32_t match = -1;
+        for (size_t i = 0; i < options.size(); ++i) {
+            if (normalise_option(options[i]).rfind(needle, 0) == 0) {
+                if (match >= 0) {
+                    return false; // ambiguous; make the caller say which one
+                }
+                match = static_cast<int32_t>(i);
+            }
+        }
+        if (match < 0) {
+            return false;
+        }
+        out = match;
+        return true;
+    }
+
+    /// Render one setting's current value for humans. Combo boxes print the option name rather
+    /// than the index, because an index in a CSV header ages badly the moment an option is added.
+    auto format_setting_value(SettingEntry const &entry) -> std::string {
+        return std::visit(
+            overloaded{
+                [](settings::InputFloat const &x) { return fmt::format("{:g}", x.value); },
+                [](settings::InputFloat3 const &x) { return fmt::format("{:g},{:g},{:g}", x.value.x, x.value.y, x.value.z); },
+                [](settings::SliderFloat const &x) { return fmt::format("{:g}", x.value); },
+                [](settings::Checkbox const &x) { return std::string{x.value ? "on" : "off"}; },
+                [&entry](settings::ComboBox const &x) {
+                    auto const &options = entry.config.options;
+                    if (x.value >= 0 && x.value < static_cast<int32_t>(options.size())) {
+                        return fmt::format("{}", options[static_cast<size_t>(x.value)]);
+                    }
+                    return fmt::format("{}", x.value);
+                },
+            },
+            entry.data);
+    }
+} // namespace
+
+auto AppUi::settings_summary(SettingCategoryId const &category_id) -> std::string {
+    if (AppSettings::s_instance == nullptr) {
+        return {};
+    }
+    auto const &categories = AppSettings::s_instance->categories;
+    auto category_iter = categories.find(category_id);
+    if (category_iter == categories.end()) {
+        return {};
+    }
+    auto out = std::string{};
+    // std::map iterates in key order, so the summary is stable between runs and two headers can
+    // be diffed directly. That is the only reason this is worth writing down at all.
+    for (auto const &[id, entry] : category_iter->second) {
+        if (!out.empty()) {
+            out += " | ";
+        }
+        out += fmt::format("{}={}", id, format_setting_value(entry));
+    }
+    return out;
+}
+
+// WHY THE FIRST update() AND NOT THE CONSTRUCTOR. The settings registry is built by
+// AppSettings::add() calls spread across VoxelApp's constructor and six renderer headers, every
+// one of which runs after AppUi is constructed. Applying an override any earlier would either
+// find no entry at all or be overwritten when the entry is registered. The first update() is the
+// earliest point at which the registry is complete, and it is still before any measurement
+// window a harness would use -- the convergence wait is seconds and this is frame one.
+void AppUi::apply_cli_setting_overrides() {
+    for (auto const &override_entry : AppCli::get().setting_overrides) {
+        auto entry = AppSettings::get(override_entry.category, override_entry.id);
+        // A default-constructed SettingEntry means the id was never registered. Report it rather
+        // than ignoring it: --reflections against a build without F7 must not look like it worked.
+        auto const &categories = AppSettings::s_instance->categories;
+        auto category_iter = categories.find(override_entry.category);
+        auto known = category_iter != categories.end() &&
+                     category_iter->second.find(override_entry.id) != category_iter->second.end();
+        if (!known) {
+            debug_utils::Console::add_log(
+                fmt::format("[cli] {}: no setting '{}/{}' in this build -- ignored\n",
+                            override_entry.origin, override_entry.category, override_entry.id));
+            std::cerr << fmt::format("[cli] {}: no setting '{}/{}' in this build -- ignored\n",
+                                     override_entry.origin, override_entry.category, override_entry.id);
+            continue;
+        }
+
+        auto ok = std::visit(
+            overloaded{
+                [&](settings::InputFloat &x) {
+                    float v = 0.0f;
+                    auto const *first = override_entry.value.data();
+                    auto const *last = first + override_entry.value.size();
+                    auto r = std::from_chars(first, last, v);
+                    if (r.ec != std::errc{} || r.ptr != last) {
+                        return false;
+                    }
+                    x.value = v;
+                    return true;
+                },
+                [&](settings::InputFloat3 &) { return false; },
+                [&](settings::SliderFloat &x) {
+                    float v = 0.0f;
+                    auto const *first = override_entry.value.data();
+                    auto const *last = first + override_entry.value.size();
+                    auto r = std::from_chars(first, last, v);
+                    if (r.ec != std::errc{} || r.ptr != last) {
+                        return false;
+                    }
+                    // Clamped to the registered range rather than rejected: the slider's own
+                    // bounds are the authority on what the renderer can actually do, and a
+                    // silently out-of-range render scale would allocate absurd render targets.
+                    if (v < x.min || v > x.max) {
+                        debug_utils::Console::add_log(
+                            fmt::format("[cli] {}: {} clamped to [{:g}, {:g}]\n",
+                                        override_entry.origin, v, x.min, x.max));
+                        v = v < x.min ? x.min : x.max;
+                    }
+                    x.value = v;
+                    return true;
+                },
+                [&](settings::Checkbox &x) { return parse_bool_value(override_entry.value, x.value); },
+                [&](settings::ComboBox &x) { return parse_combo_value(override_entry.value, entry.config.options, x.value); },
+            },
+            entry.data);
+
+        if (!ok) {
+            debug_utils::Console::add_log(
+                fmt::format("[cli] {}: cannot read '{}' as a value for {}/{} -- ignored\n",
+                            override_entry.origin, override_entry.value, override_entry.category, override_entry.id));
+            std::cerr << fmt::format("[cli] {}: cannot read '{}' as a value for {}/{} -- ignored\n",
+                                     override_entry.origin, override_entry.value, override_entry.category, override_entry.id);
+            continue;
+        }
+
+        AppSettings::set(override_entry.category, override_entry.id, entry.data);
+        // Exactly what settings_entry_ui() does when the user moves the control by hand: anything
+        // the task graph is built from needs the graph re-recorded, which VoxelApp::on_update()
+        // picks up. Without this, --render-scale would change the number and not the picture.
+        if (entry.config.task_graph_depends) {
+            should_record_task_graph = true;
+        }
+        debug_utils::Console::add_log(
+            fmt::format("[cli] {}/{} = {}\n", override_entry.category, override_entry.id,
+                        format_setting_value(AppSettings::get(override_entry.category, override_entry.id))));
+    }
+
+    // These overrides are a property of THIS run, not a preference. Saving them would write them
+    // into user_settings.json and silently contaminate the next run launched with no flags --
+    // which is trap 1 all over again, this time self-inflicted. Only suppressed when there was
+    // actually something to suppress, so a plain run keeps upstream's autosave behaviour exactly.
+    if (!AppCli::get().setting_overrides.empty()) {
+        needs_saving = false;
+    }
+}
+
+// F2. Snapshot the effective Graphics settings on the first frame, drop them next to the bench
+// CSV, and keep checking them afterwards.
+void AppUi::track_settings_provenance() {
+    auto current = settings_summary("Graphics");
+    // Latched on an explicit flag rather than on the summary being empty: if the registry were
+    // ever empty on the first frame, an emptiness test would never latch and would rewrite the
+    // sidecar every frame for the whole run.
+    if (!settings_baseline_taken) {
+        settings_baseline_taken = true;
+        startup_graphics_summary = current;
+        debug_utils::Console::add_log(fmt::format("[settings] Graphics: {}\n", current));
+
+        // The sidecar exists because the CSV's own header is written by VoxelApp's constructor,
+        // which runs BEFORE the overrides above are applied -- so anything written there would
+        // record the pre-override configuration and be actively misleading. Writing the effective
+        // settings from here, at the first frame, is the earliest honest moment. See the
+        // integration note: the header line itself belongs in VoxelApp::write_bench_row().
+        auto const &bench_csv = AppCli::get().bench_csv;
+        if (!bench_csv.empty()) {
+            auto sidecar = std::filesystem::path{bench_csv};
+            sidecar += ".settings.txt";
+            auto f = std::ofstream(sidecar);
+            if (f.is_open()) {
+                f << "# effective settings for " << bench_csv << "\n";
+                f << "data_directory=" << data_directory.string() << "\n";
+                for (auto const &[category_id, category] : AppSettings::s_instance->categories) {
+                    f << category_id << ": " << settings_summary(category_id) << "\n";
+                }
+            }
+        }
+        return;
+    }
+    if (!settings_moved && current != startup_graphics_summary) {
+        // Loud, once. A run that reconfigured itself halfway through is not a data point, and the
+        // whole cost of finding that out should be paid here rather than in somebody's analysis.
+        settings_moved = true;
+        debug_utils::Console::add_log(
+            fmt::format("[settings] WARNING: Graphics settings changed mid-run\n  was: {}\n  now: {}\n",
+                        startup_graphics_summary, current));
+        std::cerr << fmt::format("[settings] WARNING: Graphics settings changed mid-run\n  was: {}\n  now: {}\n",
+                                 startup_graphics_summary, current);
+    }
+}
+
 void AppUi::update(daxa_f32 delta_time, daxa_f32 cpu_delta_time) {
+    if (!cli_overrides_applied) {
+        cli_overrides_applied = true;
+        apply_cli_setting_overrides();
+    }
+    track_settings_provenance();
+
     cpu_frametimes[frametime_rotation_index] = cpu_delta_time;
     full_frametimes[frametime_rotation_index] = delta_time;
     frametime_rotation_index = (frametime_rotation_index + 1) % full_frametimes.size();
@@ -702,6 +990,32 @@ void AppUi::update(daxa_f32 delta_time, daxa_f32 cpu_delta_time) {
         }
         for (auto const &[id, value] : debug_utils::DebugDisplay::s_instance->debug_strings) {
             ImGui::Text("%s: %s", id.c_str(), value.c_str());
+        }
+        // F2. The effective Graphics settings, in the overlay, so a screenshot carries the
+        // configuration that produced it. Every capture in docs/images/ was previously a picture
+        // of an unknown configuration -- with the settings file shared between four builds
+        // (trap 1), "it was the default" was not something a screenshot could establish.
+        if (settings_moved) {
+            // Red and outside the tree node: this must be impossible to miss in a screenshot,
+            // because every number in the run it labels is void.
+            ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "SETTINGS CHANGED MID-RUN -- timings void");
+        }
+        // Open by default. The entire value of putting the settings here is that a screenshot
+        // carries the configuration that produced it, and a collapsed node carries nothing --
+        // ImGui does not persist tree state to imgui.ini, so it would be closed in every capture.
+        // ImGuiCond_Once rather than Always so it can still be collapsed by hand when the overlay
+        // is being used interactively; --expand-graphs pins it open for scripted captures.
+        ImGui::SetNextItemOpen(true, force_graphs_open ? ImGuiCond_Always : ImGuiCond_Once);
+        if (ImGui::TreeNode("Graphics (effective)")) {
+            if (AppSettings::s_instance != nullptr) {
+                auto const &categories = AppSettings::s_instance->categories;
+                if (auto iter = categories.find("Graphics"); iter != categories.end()) {
+                    for (auto const &[id, entry] : iter->second) {
+                        ImGui::Text("%s: %s", id.c_str(), format_setting_value(entry).c_str());
+                    }
+                }
+            }
+            ImGui::TreePop();
         }
         if (ImGui::TreeNode("GPU Resources")) {
             static ImGuiTableFlags const flags =
